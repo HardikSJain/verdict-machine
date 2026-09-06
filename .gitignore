@@ -1,0 +1,11 @@
+/bin/
+/algo
+/data/
+.env
+.env.*
+!.env.example
+*.zip
+.venv/
+__pycache__/
+.DS_Store
+coverage.out

@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:18
+    container_name: verdict-postgres
+    environment:
+      POSTGRES_USER: verdict
+      POSTGRES_PASSWORD: verdict
+      POSTGRES_DB: verdict
+    ports:
+      - "5433:5432"
+    volumes:
+      - verdict-pgdata:/var/lib/postgresql
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U verdict -d verdict"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+volumes:
+  verdict-pgdata:
