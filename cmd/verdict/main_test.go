@@ -14,5 +14,5 @@ func TestVersionCommandPrintsVersion(t *testing.T) {
 	root.SetArgs([]string{"version"})
 
 	require.NoError(t, root.Execute())
-	require.Equal(t, "algo 0.0.0-dev\n", out.String())
+	require.Equal(t, "verdict 0.0.0-dev\n", out.String())
 }

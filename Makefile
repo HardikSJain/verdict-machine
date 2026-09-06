@@ -4,7 +4,7 @@ TEST_DB_URL ?= postgres://verdict:verdict@localhost:5433/verdict_test?sslmode=di
 .PHONY: build test test-short db-up db-down migrate eod2-sync
 
 build:
-	go build -o bin/algo ./cmd/algo
+	go build -o bin/verdict ./cmd/verdict
 
 test: ## integration + unit; needs `make db-up`
 	VERDICT_TEST_DATABASE_URL=$(TEST_DB_URL) go test ./...
@@ -21,7 +21,7 @@ db-down:
 	docker compose down
 
 migrate:
-	go run ./cmd/algo migrate --database-url "$(DB_URL)"
+	go run ./cmd/verdict migrate --database-url "$(DB_URL)"
 
 eod2-sync:
 	./scripts/eod2-sync.sh

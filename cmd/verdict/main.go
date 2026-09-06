@@ -1,4 +1,4 @@
-// Command algo is the Verdict Machine binary: ingest, backtest, evening, replay, verify.
+// Command verdict is the Verdict Machine binary: ingest, backtest, evening, replay, verify.
 package main
 
 import (
@@ -13,7 +13,7 @@ var version = "0.0.0-dev"
 
 func newRootCmd() *cobra.Command {
 	root := &cobra.Command{
-		Use:           "algo",
+		Use:           "verdict",
 		Short:         "Verdict Machine: a daily-bar NSE strategy lab that earns autonomy",
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -27,7 +27,7 @@ func newVersionCmd() *cobra.Command {
 		Use:   "version",
 		Short: "Print the build version",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, err := fmt.Fprintln(cmd.OutOrStdout(), "algo "+version)
+			_, err := fmt.Fprintln(cmd.OutOrStdout(), "verdict "+version)
 			return err
 		},
 	}

@@ -121,7 +121,7 @@ so a fresh-context Claude subagent ran the cold read from a structured summary o
   delivery data for 2000+ symbols since 1995, ISIN tracking across renames, and a holiday
   calendar. Run it as a cron producer, ingest its CSVs; the main system's language is
   irrelevant to it. Point-in-time index membership is the gap eod2 does not fill.
-- **Weekend build:** Go, single binary on cron, layout `cmd/algo` plus
+- **Weekend build:** Go, single binary on cron, layout `cmd/verdict` plus
   `internal/{market,cost,engine,ledger,broker,strategy}`; first three modules market, cost
   (with a golden test reproducing one real contract note to the paisa), then engine plus
   one deliberately dumb strategy. Skip Telegram, Kite Connect, dashboard, CI, and any
@@ -159,7 +159,7 @@ story would be theirs rather than the builder's. Revisited only if the engine br
 
 ## Recommended Approach
 
-Working name: **verdict machine**; binary `algo`. Its own repository, MIT, public from the
+Working name: **verdict machine**; binary `verdict`. Its own repository, MIT, public from the
 first commit, with the forward-test hashes in a second public repo.
 
 ### Runtime shape
@@ -176,7 +176,7 @@ the token. Retries for a late bhavcopy fall out of (a) for free.
 ### Package layout
 
 ```
-cmd/algo/                  subcommands, config loading, config hash
+cmd/verdict/                  subcommands, config loading, config hash
 internal/market/           bars, read-time adjustment as-of date, PIT universe, holidays
 internal/cost/             dated statutory charge schedule, slippage model
 internal/engine/           Clock, Bar, Strategy, Portfolio, next-open fills (≤ ~500 lines)
