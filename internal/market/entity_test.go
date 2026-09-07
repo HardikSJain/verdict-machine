@@ -408,6 +408,13 @@ func TestEntityLabelWithSentinelValidFrom(t *testing.T) {
 	// eod2 bar is physically the SUCCESSOR's row.
 	insertBarDirect(t, pool, succ, market.SourceEod2, pre, 41.10)
 
+	// t0 pins the ingested_at axis on the far side of the link: every bar and
+	// every symbols row above it is already in, and the link row below it is
+	// not. The reads repeated at t0 at the end of this test must therefore
+	// answer exactly what they answered before the link was written. See the
+	// block down there for why that matters more than it looks.
+	t0 := time.Now()
+	time.Sleep(10 * time.Millisecond)
 	linkRow(t, pool, succ, pred, boundary)
 
 	preBars, err := store.BarsForDate(ctx, market.SourceBhavcopy, pre, time.Now())
@@ -454,6 +461,76 @@ func TestEntityLabelWithSentinelValidFrom(t *testing.T) {
 	require.Equal(t, pred, late.Members[0].EntityID)
 	require.NotNil(t, late.Members[0].LastBreak)
 	require.Equal(t, boundary, *late.Members[0].LastBreak)
+
+	// --- The ingested_at pin, on the read path itself. ---
+	//
+	// Every assertion above is pinned at time.Now() and so says nothing about
+	// the `ingested_at <= <pin>` bound each of the read path's three
+	// symbol_links laterals carries -- entityMapCTE's, entityMemberCTE's
+	// boundary lateral, and UniverseAsOf's entity_break. Deleting all three
+	// left this suite green, which is to say the project's defining promise
+	// -- a query pinned before a link was written must not see that link --
+	// was unfalsifiable. Each block below names the one bound it stands on
+	// and dies if that bound alone is removed.
+
+	// entityMapCTE. With its bound gone the map at t0 already resolves
+	// succ -> pred, so this eod2 row -- physically the successor's, on a
+	// pre-boundary session -- comes back under an entity that did not exist
+	// at the pin.
+	eodAtT0, err := store.BarsForDate(ctx, market.SourceEod2, pre, t0)
+	require.NoError(t, err)
+	require.Len(t, eodAtT0, 1)
+	require.Equal(t, succ, eodAtT0[0].SymbolID, "the row is physically the successor's at every pin")
+	require.Equal(t, succ, eodAtT0[0].EntityID,
+		"pinned before the link was ingested the successor is still its own entity; entity_map's ingested_at bound is the only thing that says so")
+	require.Equal(t, "INE081A01020", eodAtT0[0].ISIN,
+		"and it is therefore labelled as itself -- the pre-link answer, replayed after the link exists")
+
+	// The same bound, plus UniverseAsOf's entity_break lateral, through the
+	// read M1 actually calls. Compare with `late` above: identical arguments
+	// but for the pin, and every answer differs.
+	lateAtT0, err := store.UniverseAsOf(ctx, market.SourceBhavcopy, post, 1, 10, t0)
+	require.NoError(t, err)
+	require.Len(t, lateAtT0.Members, 1)
+	require.Equal(t, succ, lateAtT0.Members[0].EntityID,
+		"entity_map again: at t0 the successor is its own entity, so the universe names it and not the chain root")
+	require.Nil(t, lateAtT0.Members[0].LastBreak,
+		"entity_break's ingested_at bound: a boundary carried by a link row that did not exist at the pin cannot be reported at that pin")
+
+	// entityMemberCTE's boundary lateral is the third bound, and it takes a
+	// symbol carrying MORE THAN ONE link row to observe on its own: with the
+	// map's own bound in place every entity at a pre-link pin is a singleton,
+	// and a singleton's member is settled before any boundary is read. The
+	// resolution rule is ORDER BY ingested_at DESC LIMIT 1 for exactly this
+	// reason -- a later row supersedes an earlier one -- so the smallest
+	// honest fixture is a corrected boundary: the first row said 2022-07-29,
+	// a second row moves it to 2023-04-03.
+	//
+	// t1 sits between the two, and 2022-10-31 sits between the two boundaries.
+	// Resolved at t1 the successor's boundary has passed, so the successor is
+	// the member in force and the label is INE081A01020. Resolved at now()
+	// instead -- which is what dropping the bound does -- the corrected
+	// boundary is still in the future of that session, the successor drops out
+	// of the running, and the predecessor's label comes back for a query the
+	// correction postdates.
+	corrected := market.Day(2023, 4, 3)
+	t1 := time.Now()
+	time.Sleep(10 * time.Millisecond)
+	linkRow(t, pool, succ, pred, corrected)
+
+	atT1, err := store.BarsForDate(ctx, market.SourceBhavcopy, post, t1)
+	require.NoError(t, err)
+	require.Len(t, atT1, 1)
+	require.Equal(t, pred, atT1[0].EntityID, "the link itself is in force at t1; only the boundary moved")
+	require.Equal(t, "INE081A01020", atT1[0].ISIN,
+		"entity_member's ingested_at bound: the member in force on 2022-10-31 is decided by the boundary the store knew at t1, not by the correction written after it")
+
+	atNow, err := store.BarsForDate(ctx, market.SourceBhavcopy, post, time.Now())
+	require.NoError(t, err)
+	require.Len(t, atNow, 1)
+	require.Equal(t, pred, atNow[0].EntityID)
+	require.Equal(t, "INE081A01012", atNow[0].ISIN,
+		"and at now() the corrected boundary is in that session's future, so the predecessor is the member -- the two pins genuinely disagree, which is what makes the assertion above load-bearing")
 }
 
 // TestEntityBoundariesAndInvariantsOnAWellFormedEntity covers the two store
