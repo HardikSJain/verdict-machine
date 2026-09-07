@@ -119,7 +119,9 @@ const windowCTE = `
 // DaysPresent is a semantic change from the per-symbol version and old and
 // new values are not guaranteed to match. When an entity's members overlap on
 // a session -- which is only possible through a wrong link -- this returns an
-// error rather than a ranking; see the member_rows check below.
+// error rather than a ranking; see the member_rows check below. That check is
+// made over the WHOLE ranking and not over the top n: an entity the caller's
+// own n cut off is exactly the one nobody would ever notice.
 //
 // When the store holds fewer than lookbackDays sessions the window silently
 // shortens to what is there -- the 80% presence rule scales with it too -- so
@@ -199,13 +201,40 @@ func (s *Store) UniverseAsOf(ctx context.Context, source string, asOf time.Time,
 			) k ON true
 			WHERE k.boundary IS NOT NULL AND k.boundary <= $2
 			GROUP BY m.entity_id
+		), overlap AS (
+			-- The overlap alarm, evaluated HERE -- over the whole ranking,
+			-- before LIMIT $6 -- rather than read off the rows that survive
+			-- it. The latest CTE is DISTINCT ON (symbol_id, date), so within one
+			-- entity member_rows > days_present is precisely "two members of
+			-- one entity traded the same session": two genuinely different
+			-- companies merged by a bad link, in a store that cannot delete.
+			--
+			-- Evaluated after the LIMIT it would be silent for exactly the
+			-- entities a caller cannot see. A top-500 call over a ~2,100-entity
+			-- ranking checks 500 and ignores 1,600, so a wrong link at rank 501
+			-- returns a clean-looking universe and no test could fail on it
+			-- either -- which defeats what design 4.4 calls "the louder alarm on the
+			-- read that is actually made". It has to be louder than the
+			-- caller's own n.
+			--
+			-- One row at most, so it cross-joins onto every returned row --
+			-- including the members-less w row -- without touching the
+			-- ranking or its order. ORDER BY entity_id makes the entity it
+			-- names deterministic when several overlap.
+			SELECT entity_id, member_rows, days_present
+			FROM ranked
+			WHERE member_rows > days_present
+			ORDER BY entity_id
+			LIMIT 1
 		)
 		SELECT w.sessions, r.entity_id, el.symbol_id, el.isin, el.ticker,
-		       r.median_turnover, r.days_present, r.member_rows, r.fragments, eb.last_break
+		       r.median_turnover, r.days_present, r.fragments, eb.last_break,
+		       o.entity_id, o.member_rows, o.days_present
 		FROM (SELECT count(*)::int AS sessions FROM days) w
 		LEFT JOIN ranked r ON true
 		LEFT JOIN entity_label el ON el.entity_id = r.entity_id
 		LEFT JOIN entity_break eb ON eb.entity_id = r.entity_id
+		LEFT JOIN overlap o ON true
 		ORDER BY r.median_turnover DESC NULLS LAST, el.ticker
 		LIMIT $6`, source, asOf, since, asOfIngest, lookbackDays, n, requireLastSession)
 	if err != nil {
@@ -220,29 +249,38 @@ func (s *Store) UniverseAsOf(ctx context.Context, source string, asOf time.Time,
 		var entityID, symbolID *int64
 		var isin, ticker *string
 		var median *float64
-		var daysPresent, memberRows, fragments *int
+		var daysPresent, fragments *int
 		var lastBreak *time.Time
+		// The overlap alarm. It does not describe THIS row: the `overlap` CTE
+		// evaluates member_rows > days_present over the whole ranking, before
+		// LIMIT $6, and repeats its one row on every row that comes back.
+		var overlapEntity *int64
+		var overlapRows, overlapDays *int
 		if err := rows.Scan(&u.Sessions, &entityID, &symbolID, &isin, &ticker, &median,
-			&daysPresent, &memberRows, &fragments, &lastBreak); err != nil {
+			&daysPresent, &fragments, &lastBreak,
+			&overlapEntity, &overlapRows, &overlapDays); err != nil {
 			return Universe{}, err
 		}
-		if entityID == nil {
-			continue
-		}
-		// `latest` is DISTINCT ON (symbol_id, date), so within one entity
-		// member_rows > days_present says two members traded the same
-		// session: two genuinely different companies merged by a bad link,
-		// in a store that cannot delete. Absorbed silently it would return a
-		// median over two companies' turnovers and inflate the entity past
-		// the 80% gate, with no error anywhere. This is the only overlap
-		// detector on the read M1 actually calls -- BarsForDate has zero
-		// non-test callers -- so it is the one that has to fire.
-		if *memberRows > *daysPresent {
+		// Checked first, before the nil-entity skip and before a single
+		// member is accumulated. Within one entity member_rows > days_present
+		// says two members traded the same session: two genuinely different
+		// companies merged by a bad link, in a store that cannot delete.
+		// Absorbed silently it would return a median over two companies'
+		// turnovers and inflate the entity past the 80% gate, with no error
+		// anywhere. This is the only overlap detector on the read M1 actually
+		// calls -- BarsForDate has zero non-test callers -- so it is the one
+		// that has to fire, and it has to fire for an entity the caller's own
+		// n cut off. A universe holding a merged entity anywhere in its
+		// ranking is not a universe.
+		if overlapEntity != nil {
 			return Universe{}, fmt.Errorf(
 				"universe: entity %d has %d member rows over %d distinct sessions in the %d-session %s window "+
 					"ending %s; two members of one entity traded the same session, so the link joining them "+
 					"merges two different companies -- run `verdict entities check` before trusting this universe",
-				*entityID, *memberRows, *daysPresent, u.Sessions, source, asOf.Format("2006-01-02"))
+				*overlapEntity, *overlapRows, *overlapDays, u.Sessions, source, asOf.Format("2006-01-02"))
+		}
+		if entityID == nil {
+			continue
 		}
 		if symbolID == nil || isin == nil || ticker == nil {
 			return Universe{}, fmt.Errorf(

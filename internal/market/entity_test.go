@@ -363,6 +363,38 @@ func TestUniverseAsOf_DaysPresentCountsSessionsNotRows_AndErrorsOnOverlap(t *tes
 	require.ErrorContains(t, err, "11 member rows", "count(*) is kept beside count(DISTINCT date) precisely so this number exists")
 	require.ErrorContains(t, err, "10 distinct sessions", "the session is counted ONCE; a row count would read 11 and inflate past the 80% gate")
 	require.ErrorContains(t, err, "2024-01-11", "the error must name the window")
+
+	// Phase 3 -- the same overlap, ranked OUTSIDE the caller's top-n.
+	//
+	// The alarm is worth nothing if it only inspects the rows a caller asked
+	// to see. BIGCO out-turns ACME ten to one, so at n = 1 the LIMIT keeps
+	// BIGCO and drops ACME -- and ACME is the merged entity. Evaluated on the
+	// returned rows the read comes back clean: one member, member_rows equal
+	// to days_present, no error, no signal anywhere that a link in this store
+	// merges two companies. On the live shape that is the normal case, not
+	// the corner one: a top-500 call ranks about 2,100 entities and would
+	// inspect under a quarter of them.
+	var big []market.Bar
+	for _, d := range win {
+		big = append(big, barAt("INE0BIGCO1012", "BIGCO", d, 5000))
+	}
+	_, err = store.InsertBars(ctx, market.SourceBhavcopy, big)
+	require.NoError(t, err)
+
+	top1, err := store.UniverseAsOf(ctx, market.SourceBhavcopy, win[9], 10, 1, time.Now())
+	require.Error(t, err,
+		"the overlap alarm must be evaluated over the whole ranking, before LIMIT n; an entity the caller's own n cut off is exactly the one nobody would ever notice")
+	require.Empty(t, top1.Members, "a universe that cannot be trusted returns nothing, not its first page")
+	require.ErrorContains(t, err, fmt.Sprint(badIDs["INE0ACME01012"]),
+		"the error must name the merged entity even though it is not among the returned rows")
+	require.ErrorContains(t, err, "11 member rows")
+	require.ErrorContains(t, err, "10 distinct sessions")
+
+	// And the same call still succeeds once nothing overlaps: the alarm is
+	// pre-LIMIT, not unconditional.
+	cleanTop, err := store.UniverseAsOf(ctx, market.SourceBhavcopy, sessions[9], 10, 1, time.Now())
+	require.NoError(t, err)
+	require.Len(t, cleanTop.Members, 1, "n is still a limit; only the alarm ignores it")
 }
 
 // TestEntityLabelWithSentinelValidFrom is design §8.13 -- the test that would
