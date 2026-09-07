@@ -467,6 +467,47 @@ this document after that round and have not been re-reviewed.
   the fixture directory's contents changed underneath it between brief-authoring and
   implementation. Idempotency (`inserted 0` on the second run) holds exactly as
   specified.
+- **Task 6 (point-in-time universe, `universe.go`/`universe_test.go`):** `universe.go`
+  and the `universe` command are exactly as the brief specifies, no changes. One test
+  beyond the brief's Step 1 listing was added:
+  `TestUniverseAsOf_AsOfIngestIsolatesRevisions`. The brief's three given tests all pass
+  `time.Now()` as `asOfIngest`, so none of them exercises `UniverseAsOf`'s own
+  point-in-time parameter — the `ingested_at <= $5` predicate that is this project's
+  whole reason for being an insert-only, versioned store. The added test inserts one
+  bhavcopy day, records a timestamp, revises one symbol's turnover (a second version,
+  same version key), then asserts `UniverseAsOf` as-of the earlier timestamp returns the
+  original turnover, as-of now returns the revised turnover, and both rows remain in
+  `bars` (2 versions for that symbol/date/source). Confirmed to actually discriminate by
+  temporarily flipping the two expected values and watching the test fail on the correct
+  values before reverting. No SQL, signature, or naming from the brief was touched.
+- **Task 6 (pre-existing test-infra finding, not fixed here):** `go test ./...` (the
+  Makefile's `test` target) is intermittently flaky with a `duplicate key value violates
+  unique constraint "bars_pkey"` error from `InsertBars`, reproducing on roughly half of
+  attempts once `universe_test.go` exists. Root cause: `internal/db/db_test.go`,
+  `internal/market` (via `testutil.Pool`), and `internal/market/bhavcopy` (via
+  `testutil.Pool`) all point at the *same* physical `verdict_test` database and each
+  independently runs its own `TRUNCATE bars, symbols ... RESTART IDENTITY` at test setup
+  with no cross-process coordination; Go's default `go test ./...` runs different
+  packages' test binaries concurrently. `EnsureSymbols` (`store.go`) assigns each new
+  ISIN its `symbol_id` with its own separate, non-transactional `INSERT ... RETURNING`
+  call in a per-ISIN loop rather than one batch/transaction; when a concurrently-running
+  package's `TRUNCATE ... RESTART IDENTITY` lands mid-loop, the sequence resets to 1
+  partway through, and two different ISINs in the same `InsertBars` call can end up
+  mapped to the same `symbol_id` — a real primary-key collision on `(symbol_id, date,
+  source, ingested_at)`, not a bug in `UniverseAsOf`. This race pre-dates Task 6 (it
+  lives in Task 2's `db_test.go` truncate and Task 3/5's `EnsureSymbols`), but Tasks 2-5's
+  own tests use 1-2 bars so the vulnerable window is too short to trigger it often.
+  Task 6's brief-specified tests load a full bhavcopy day (hundreds of EQ rows), which
+  keeps `EnsureSymbols`'s loop open long enough to make the race land reliably.
+  Confirmed by: (a) running the exact pre-Task-6 tree repeatedly — clean every time; (b)
+  running with Task 6's files added — fails on roughly half of attempts; (c) running
+  `go test -p 1 ./...` (forcing sequential package execution) with Task 6's files present
+  — clean every time. Nothing in `universe.go`, `store.go`, or `testutil/testdb.go` was
+  changed to address this; it is out of Task 6's file scope (`universe.go`,
+  `universe_test.go`, `main.go` only) and touches shared infrastructure other tasks
+  depend on. Recommend a follow-up task: either wrap `EnsureSymbols`'s per-ISIN inserts
+  in one statement/transaction, or give each test package (or each test) its own schema,
+  or pin `-p 1` for the database-touching test run in the Makefile and CI.
 
 ## What I noticed about how you think
 

@@ -31,6 +31,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newMigrateCmd())
 	root.AddCommand(newIngestCmd())
 	root.AddCommand(newBackfillCmd())
+	root.AddCommand(newUniverseCmd())
 	return root
 }
 
@@ -195,6 +196,48 @@ func newBackfillCmd() *cobra.Command {
 	cmd.Flags().String("from", "2011-09-01", "first session date (YYYY-MM-DD)")
 	cmd.Flags().String("to", "", "last session date (default today)")
 	cmd.Flags().Duration("delay", 750*time.Millisecond, "pause between requests")
+	cmd.Flags().String("database-url", "", "Postgres URL (default $VERDICT_DATABASE_URL)")
+	return cmd
+}
+
+func newUniverseCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "universe",
+		Short: "Print the point-in-time universe: top N by median rupee turnover",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			asOfS, _ := cmd.Flags().GetString("as-of")
+			lookback, _ := cmd.Flags().GetInt("lookback")
+			n, _ := cmd.Flags().GetInt("n")
+			source, _ := cmd.Flags().GetString("source")
+			asOf, err := time.Parse("2006-01-02", asOfS)
+			if err != nil {
+				return fmt.Errorf("--as-of: %w", err)
+			}
+			url, err := databaseURL(cmd)
+			if err != nil {
+				return err
+			}
+			pool, err := db.Connect(cmd.Context(), url)
+			if err != nil {
+				return err
+			}
+			defer pool.Close()
+			members, err := market.NewStore(pool).UniverseAsOf(cmd.Context(), source, asOf, lookback, n, time.Now())
+			if err != nil {
+				return err
+			}
+			w := cmd.OutOrStdout()
+			fmt.Fprintf(w, "rank\tticker\tisin\tmedian_turnover_inr\tdays\n")
+			for i, m := range members {
+				fmt.Fprintf(w, "%d\t%s\t%s\t%.0f\t%d\n", i+1, m.Ticker, m.ISIN, m.MedianTurnover, m.DaysPresent)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().String("as-of", time.Now().UTC().Format("2006-01-02"), "session date (YYYY-MM-DD)")
+	cmd.Flags().Int("lookback", 125, "sessions in the ranking window (about six months)")
+	cmd.Flags().Int("n", 500, "universe size")
+	cmd.Flags().String("source", market.SourceBhavcopy, "bar source: nse-bhavcopy or eod2")
 	cmd.Flags().String("database-url", "", "Postgres URL (default $VERDICT_DATABASE_URL)")
 	return cmd
 }
