@@ -26,11 +26,20 @@ func testURL(t *testing.T) string {
 func TestMigrateCreatesInsertOnlyMarketTables(t *testing.T) {
 	ctx := context.Background()
 	url := testURL(t)
-	require.NoError(t, db.Migrate(ctx, url))
-	require.NoError(t, db.Migrate(ctx, url), "migrate must be idempotent")
+	// Migrating twice proves idempotency, but a bare db.Migrate is only safe
+	// against an already-migrated database. On a virgin one -- a fresh clone,
+	// where docker/initdb creates verdict_test empty -- goose's Up path takes
+	// no lock of its own, so these calls would race the first testutil.Pool of
+	// every other package's test binary, which go test runs concurrently.
+	// WithDBLock puts them under the same advisory lock Pool uses.
+	testutil.WithDBLock(t, url, func() {
+		require.NoError(t, db.Migrate(ctx, url))
+		require.NoError(t, db.Migrate(ctx, url), "migrate must be idempotent")
+	})
 
-	// testutil.Pool migrates (again; idempotent, see above), connects, and
-	// truncates under the shared cross-package advisory lock — the same path
+	// From here on the lock is held for the rest of the test: testutil.Pool
+	// migrates (again; idempotent, see above), connects, and truncates while
+	// holding it, and keeps holding it until this test is done — the same path
 	// every other package's database test uses, so this test's own TRUNCATE
 	// can never interleave with another package's symbol_id-assigning insert
 	// loop. See testutil.Pool's doc comment.

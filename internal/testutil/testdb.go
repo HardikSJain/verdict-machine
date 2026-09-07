@@ -60,17 +60,11 @@ func Pool(t *testing.T) *pgxpool.Pool {
 	// lifetime; see its doc comment. It is taken before db.Migrate, on a
 	// connection that does not come from the pool below, because the pool
 	// does not exist yet and the migration is inside what the lock protects.
-	lockConn, err := pgx.Connect(ctx, url)
-	require.NoError(t, err)
-	_, err = lockConn.Exec(ctx, "SELECT pg_advisory_lock($1)", dbTestLockKey)
-	require.NoError(t, err)
+	lockConn := acquireDBLock(ctx, t, url)
 	// t.Cleanup runs LIFO and pool.Close is registered after this, so the
 	// pool closes first and the lock is released last: it is held until this
 	// test is fully done with the database.
-	t.Cleanup(func() {
-		_, _ = lockConn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", dbTestLockKey)
-		_ = lockConn.Close(context.Background())
-	})
+	t.Cleanup(func() { releaseDBLock(lockConn) })
 
 	require.NoError(t, db.Migrate(ctx, url))
 	pool, err := db.Connect(ctx, url)
@@ -81,4 +75,45 @@ func Pool(t *testing.T) *pgxpool.Pool {
 	_, err = pool.Exec(ctx, "TRUNCATE bars, symbols, ingest_log RESTART IDENTITY")
 	require.NoError(t, err)
 	return pool
+}
+
+// acquireDBLock opens a standalone connection and takes dbTestLockKey on it.
+// The connection is deliberately not from any pool: the lock is session-level
+// and has to outlive every statement it protects, including the migration
+// that runs before a pool exists.
+func acquireDBLock(ctx context.Context, t *testing.T, url string) *pgx.Conn {
+	t.Helper()
+	conn, err := pgx.Connect(ctx, url)
+	require.NoError(t, err)
+	_, err = conn.Exec(ctx, "SELECT pg_advisory_lock($1)", dbTestLockKey)
+	require.NoError(t, err)
+	return conn
+}
+
+// releaseDBLock unlocks and closes a connection from acquireDBLock. It uses a
+// fresh context because it runs from t.Cleanup, after the test's own context
+// may already be done.
+func releaseDBLock(conn *pgx.Conn) {
+	_, _ = conn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", dbTestLockKey)
+	_ = conn.Close(context.Background())
+}
+
+// WithDBLock runs fn while holding dbTestLockKey -- the same cross-package
+// advisory lock Pool holds -- and releases it before returning.
+//
+// It exists for the one thing a test may need to do to the shared database
+// *outside* a Pool: run db.Migrate directly. An unguarded db.Migrate is safe
+// only on an already-migrated database, where it is a no-op. On a virgin one
+// -- a fresh clone, which is exactly the newcomer's first `make test` -- it
+// races every other package's first Pool call on goose's unguarded
+// CREATE TABLE goose_db_version, because go test runs package binaries
+// concurrently. See dbTestLockKey.
+//
+// url is passed in rather than read from the environment here so the caller
+// keeps its own skip/fail behaviour for an unset VERDICT_TEST_DATABASE_URL.
+func WithDBLock(t *testing.T, url string, fn func()) {
+	t.Helper()
+	conn := acquireDBLock(context.Background(), t, url)
+	defer releaseDBLock(conn)
+	fn()
 }
