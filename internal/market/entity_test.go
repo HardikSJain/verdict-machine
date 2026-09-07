@@ -714,3 +714,155 @@ func TestEntityBoundariesAndInvariantsOnAWellFormedEntity(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, violations, "a flat, disjoint, same-issuer entity violates nothing")
 }
+
+// TestEntityInvariantsCatchABogusLink_Overlapping is design 8.7a: the half of
+// the negative control that fires.
+//
+// A proof suite that cannot fail is not a proof suite, so a deliberately
+// wrong link -- two known-different companies, merged -- is injected and all
+// three detectors are asserted to catch it: the invariant checker, the
+// BarsForDate guard and, on the read M1 actually calls, the universe's
+// member_rows check.
+//
+// Read it beside 8.7b, which is the other half and asserts the opposite.
+// This half only fires because the two companies TRADE ON THE SAME SESSIONS,
+// and the seeder's G3 forbids exactly that at seed time, so what is caught
+// here is a hand-written line or a restored dump -- never a link the gates
+// admitted.
+func TestEntityInvariantsCatchABogusLink_Overlapping(t *testing.T) {
+	ctx := context.Background()
+	store := market.NewStore(testutil.Pool(t))
+	pool := store.Pool()
+
+	var sessions []time.Time
+	for i := 0; i < 10; i++ {
+		sessions = append(sessions, market.Day(2023, 3, 1).AddDate(0, 0, i))
+	}
+	var bars []market.Bar
+	for _, d := range sessions {
+		bars = append(bars, barAt("INE888B01018", "ALPHA", d, 400))
+		bars = append(bars, barAt("INE777C01011", "BETA", d, 60))
+	}
+	_, err := store.InsertBars(ctx, market.SourceBhavcopy, bars)
+	require.NoError(t, err)
+	ids, err := store.EnsureSymbols(ctx, []market.Bar{
+		{ISIN: "INE888B01018", Ticker: "ALPHA", Date: sessions[0]},
+		{ISIN: "INE777C01011", Ticker: "BETA", Date: sessions[0]},
+	})
+	require.NoError(t, err)
+	alpha, beta := ids["INE888B01018"], ids["INE777C01011"]
+
+	clean, err := store.CheckEntityInvariants(ctx, time.Now())
+	require.NoError(t, err)
+	require.Empty(t, clean, "two unlinked companies violate nothing")
+
+	linkRow(t, pool, beta, alpha, sessions[3])
+
+	violations, err := store.CheckEntityInvariants(ctx, time.Now())
+	require.NoError(t, err)
+	require.NotEmpty(t, violations)
+	var overlaps, issuers int
+	for _, v := range violations {
+		switch v.Kind {
+		case "overlap":
+			overlaps++
+			require.Equal(t, alpha, v.EntityID)
+			require.False(t, v.Advisory(), "an overlap is a defect, not a question")
+		case "issuer":
+			issuers++
+			require.True(t, v.Advisory())
+		default:
+			t.Fatalf("unexpected violation %q", v.Kind)
+		}
+	}
+	require.Equal(t, 10, overlaps, "every session the two companies shared is reported")
+	require.Equal(t, 1, issuers, "and the issuer codes disagree, which is a question for a human")
+
+	_, err = store.BarsForDate(ctx, market.SourceBhavcopy, sessions[5], time.Now())
+	require.ErrorContains(t, err, "two members of one entity cannot trade the same session")
+
+	_, err = store.UniverseAsOf(ctx, market.SourceBhavcopy, sessions[9], 10, 500, time.Now())
+	require.Error(t, err, "the universe must refuse a ranking that contains a merged entity")
+	require.ErrorContains(t, err, "20 member rows")
+	require.ErrorContains(t, err, "10 distinct sessions",
+		"without this check the entity comes back with a median over two companies' turnovers and no error anywhere")
+}
+
+// TestEntityInvariantsCatchABogusLink_Disjoint is design 8.7b, and it asserts
+// that NOTHING fires. It is deliberately a test that documents a hole.
+//
+// The failure mode design 1 calls the single worst outcome available here --
+// a freed ticker picked up by a different company, a reverse merger into a
+// listed shell -- is DISJOINT by definition: the old company is dead, so it
+// can never produce a colliding bar. Every structural detector in the store
+// is keyed on facts the gates already enforce:
+//
+//   - I2 and the BarsForDate guard need two members to hold a bar on one
+//     session, and G3 forbids that at seed time.
+//   - I3 needs the members' issuer codes to disagree, and G1 IS issuer-code
+//     equality, so on the auto-accepted set it is a tautology. The fixture
+//     below therefore gives the two companies the same NSDL issuer code,
+//     which is what a G1-passing ticker reuse looks like.
+//   - eod2 cannot supply the overlap either: eod2.LoadDir files a ticker's
+//     whole CSV under today's ISIN, so predecessors have no eod2 bars at all
+//     (verified on the live store: 0 of 572).
+//
+// So post-hoc detection from inside the store is NIL for a link that passed
+// G1 and G4. The gates and one human review pass are not one of three
+// defences; they are the whole defence. G6, the boundary close ratio, is a
+// gate rather than a detector precisely because there is no detector to be
+// had.
+//
+// This test fails if someone later claims the invariants detect a wrong merge
+// in general. That is its entire job: pinning the blind spot so it stays
+// visible after the design document is forgotten.
+func TestEntityInvariantsCatchABogusLink_Disjoint(t *testing.T) {
+	ctx := context.Background()
+	store := market.NewStore(testutil.Pool(t))
+	pool := store.Pool()
+
+	// Two genuinely different companies, sharing an issuer code and a ticker,
+	// trading in sequence: DEADCO stops, and six weeks later NEWCO -- a
+	// different business -- starts under the freed ticker.
+	var sessions []time.Time
+	for i := 0; i < 10; i++ {
+		sessions = append(sessions, market.Day(2023, 5, 1).AddDate(0, 0, i))
+	}
+	var bars []market.Bar
+	for i, d := range sessions {
+		if i < 5 {
+			bars = append(bars, barAt("INE999A01015", "SHELL", d, 12))
+		} else {
+			bars = append(bars, barAt("INE999A01023", "SHELL", d, 13))
+		}
+	}
+	_, err := store.InsertBars(ctx, market.SourceBhavcopy, bars)
+	require.NoError(t, err)
+	ids, err := store.EnsureSymbols(ctx, []market.Bar{
+		{ISIN: "INE999A01015", Ticker: "SHELL", Date: sessions[0]},
+		{ISIN: "INE999A01023", Ticker: "SHELL", Date: sessions[5]},
+	})
+	require.NoError(t, err)
+	dead, live := ids["INE999A01015"], ids["INE999A01023"]
+
+	linkRow(t, pool, live, dead, sessions[5])
+
+	violations, err := store.CheckEntityInvariants(ctx, time.Now())
+	require.NoError(t, err)
+	require.Empty(t, violations,
+		"the structural net cannot catch a disjoint wrong merge -- not the overlap check, not the issuer check, not ever")
+
+	got, err := store.BarsForDate(ctx, market.SourceBhavcopy, sessions[7], time.Now())
+	require.NoError(t, err, "there is no colliding bar to notice, because the merged company is dead")
+	require.Len(t, got, 1)
+	require.Equal(t, dead, got[0].EntityID)
+
+	u, err := store.UniverseAsOf(ctx, market.SourceBhavcopy, sessions[9], 10, 500, time.Now())
+	require.NoError(t, err)
+	m := memberOf(t, u.Members, "SHELL")
+	require.Equal(t, dead, m.EntityID)
+	require.Equal(t, 10, m.DaysPresent,
+		"the wrong merge produces a member that looks exactly like a real one: ten sessions, two fragments, one plausible history")
+	require.Equal(t, 2, m.Fragments)
+	require.NotNil(t, m.LastBreak)
+}
