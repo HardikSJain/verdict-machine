@@ -55,12 +55,37 @@ type symbolVersion struct {
 	validFrom time.Time
 }
 
-// versionAt returns the version in force on date d: the latest one whose
-// valid_from is at or before d, or, when d predates every recorded version,
-// the earliest one. versions must be sorted ascending by
-// (valid_from, ingested_at).
+// versionAt returns the version in force on date d: the latest valid_from at
+// or before d, and among the versions tying that valid_from the one ingested
+// last, because a later observation of the same session corrects an earlier
+// one. When d predates every recorded version nothing is in force and the
+// answer has to be invented: it takes the earliest valid_from instead -- a bar
+// older than anything the store ever observed takes the oldest label there is,
+// not today's -- resolving a tie on that date the same way, to the last
+// ingested.
+//
+// That is the rule symbolLabelLateral implements in SQL, and the two must not
+// drift apart: this function decides whether an incoming batch is a rename,
+// that ORDER BY decides what a bar is called when it is read back, and a bar
+// the write side and the read side label differently is one the store cannot
+// answer for. The pre-history fallback is where they did drift -- this side
+// took the first row of a list ordered ingested_at ascending, the SQL side
+// ordered ingested_at DESC -- so a correction to the earliest version was
+// visible to readers and invisible to the rename check.
+// See TestSymbolLabelFallbackAgreesWriterAndReader.
+//
+// versions must be sorted ascending by (valid_from, ingested_at).
 func versionAt(versions []symbolVersion, d time.Time) symbolVersion {
 	chosen := versions[0]
+	if chosen.validFrom.After(d) {
+		for _, v := range versions[1:] {
+			if !v.validFrom.Equal(chosen.validFrom) {
+				break
+			}
+			chosen = v
+		}
+		return chosen
+	}
 	for _, v := range versions {
 		if v.validFrom.After(d) {
 			break
@@ -302,10 +327,12 @@ func (s *Store) LoggedDates(ctx context.Context, source string) (map[time.Time]b
 //
 // The ordering picks the latest version in force at or before dateExpr; when
 // the bar predates every recorded version -- a source that only ever reports
-// today's ticker, such as eod2, registers the symbol at today's date -- it
-// falls back to the earliest recorded version rather than dropping the row.
-// Ties on valid_from break on ingested_at DESC, which is how a same-session
-// correction supersedes the version it corrects.
+// today's ticker, such as eod2, registers the symbol at today's date -- the
+// third key falls back to the earliest recorded valid_from rather than
+// dropping the row. Ties on valid_from break on ingested_at DESC in both
+// cases, which is how a same-session correction supersedes the version it
+// corrects. versionAt is the Go statement of this same rule and the two are
+// held to agree by TestSymbolLabelFallbackAgreesWriterAndReader.
 //
 // idExpr, dateExpr and ingestExpr are SQL fragments written by this file,
 // never values from outside it.
