@@ -40,8 +40,10 @@ type Roster struct {
 // Reason maps to symbol_links.reason. A "succession" line is machine-proposed
 // and must satisfy every gate. A "manual" line is hand-written for a
 // quarantined pair -- an INF fund-unit transfer, a long-gap relisting -- and
-// is exempt from the structural gates by construction, since it exists
-// precisely because none of them admitted it. In exchange it must name a
+// is exempt from most of the structural gates by construction, since it
+// exists precisely because none of them admitted it. It is NOT exempt from
+// G0's check digit: that gate exists for hand-written lines specifically, and
+// it passes on every INF unit in this archive. In exchange it must name a
 // ratifier and carry a note, because design 5.6 is explicit that no
 // quarantined pair may be promoted without an external NSE corporate-action
 // source, and the schema cannot supply that fact: a human with a circular
@@ -275,8 +277,30 @@ func validateLink(l Link) error {
 			l.Gates.PredecessorLastBar, l.Gates.SuccessorFirstBar)
 	}
 
+	// G0's check digit, and it runs for EVERY line, manual ones included.
+	// What a manual line is exempt from is G0's INE-only half, which is
+	// genuinely meaningless for the 51 INF fund-unit pairs a hand-written
+	// line exists for. The ISO 6166 mod-10 is not meaningless for them, and
+	// design 5.3 justifies it by pointing AT the hand-written line: it
+	// "catches a typo in a hand-written roster line, which is exactly where a
+	// false positive would originate". It is also free -- across all 1,250
+	// ISINs in the 625 candidates, 104 of them non-INE INF/IN9 units and
+	// including NIFTYBEES' own INF732E01011 and INF204KB14I2, zero fail it.
+	// The residual defence, `apply` refusing an ISIN this store never
+	// registered, only fires when the typo lands on nothing: a typo that
+	// lands on another REAL company's ISIN is the false positive named, and
+	// it goes into a table with no DELETE.
+	for _, isin := range []string{l.Predecessor, l.Successor} {
+		if !WellFormedISIN(isin) {
+			return fmt.Errorf("G0: %s fails the ISO 6166 check digit", isin)
+		}
+	}
+	if !l.Gates.CheckDigit {
+		return fmt.Errorf("G0: gates.check_digit is false")
+	}
+
 	if reasonOf(l) == ReasonManual {
-		// A manual line is exempt from the structural gates -- it exists
+		// A manual line is exempt from the REST of the gates -- it exists
 		// because none of them admitted it -- and in exchange it must point
 		// at a person and a reason.
 		if l.RatifiedBy == "" {
@@ -291,17 +315,9 @@ func validateLink(l Link) error {
 		return nil
 	}
 
-	// G0. Well-formed, INE equity, check digit good.
+	// G0's other half, which a manual line IS exempt from: INE equity only.
 	if !IsEquityISIN(l.Predecessor) || !IsEquityISIN(l.Successor) {
 		return fmt.Errorf("G0: an auto-accepted line must join two INE equity ISINs; fund units (INF) go to the quarantine queue, because one INF issuer code covers dozens of unrelated schemes and G1 is meaningless for them")
-	}
-	for _, isin := range []string{l.Predecessor, l.Successor} {
-		if !WellFormedISIN(isin) {
-			return fmt.Errorf("G0: %s fails the ISO 6166 check digit", isin)
-		}
-	}
-	if !l.Gates.CheckDigit {
-		return fmt.Errorf("G0: gates.check_digit is false")
 	}
 	// G1. Same NSDL issuer.
 	prefix := IssuerPrefix(l.Predecessor)

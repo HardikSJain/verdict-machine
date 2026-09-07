@@ -43,9 +43,32 @@ const (
 	G6  = "G6 boundary continuity"
 )
 
+// QRetracted is not a gate. It is the quarantine `propose` applies to a pair
+// a human has already WITHDRAWN with `entities retract`.
+//
+// It exists because `propose` reads bars, symbols and ingest_log and nothing
+// else, so a pair retracted for merging two different companies passes G0-G6
+// again next month and is regenerated into the roster -- which `propose`
+// overwrites wholesale. `apply` then re-links it without a word: a retraction
+// row sets entity_id = symbol_id, so the "already linked" skip cannot see it
+// and the INSERT goes straight through. Design 5.6's "a wrong merge is undone
+// by writing one more row" is the single argument that beat the rebuild
+// proposal, and without this the undo survives only if a human remembers to
+// hand-delete the line from a machine-regenerated file every month, forever.
+// Design 9 makes `propose` a monthly ops item, so it fires on schedule.
+//
+// It quarantines rather than refuses, because design 8.4 requires re-linking
+// after a retraction to stay possible: the pair goes to the review file with
+// the retraction's timestamp and note attached, and a human who still wants
+// the link writes it with `entities link`.
+const QRetracted = "Q retracted pair"
+
 // GateOrder is every gate, in evaluation order, so a report can list them all
 // including the ones nothing failed.
 var GateOrder = []string{G0, G1, G2, G3, G4, G4a, G4b, G5, G6}
+
+// ReportOrder is every reason a candidate can be quarantined, gates first.
+var ReportOrder = append(append([]string{}, GateOrder...), QRetracted)
 
 // ist is India Standard Time, the clock NSE's sessions and the evening
 // bhavcopy publish both run on. It is duplicated from bhavcopy.ist rather
@@ -99,6 +122,11 @@ type Candidate struct {
 
 	Disposition string   `json:"disposition"`
 	FailedGates []string `json:"failed_gates,omitempty"`
+
+	// Set only when this pair's successor currently carries a retraction
+	// row: what a human already withdrew, and what they said about it.
+	RetractedAt    string `json:"retracted_at,omitempty"`
+	RetractionNote string `json:"retraction_note,omitempty"`
 }
 
 // Accepted reports whether every gate held.
@@ -117,6 +145,14 @@ type Counts struct {
 	ArchiveTo        time.Time
 	ArchiveUnsettled int
 	ArchivePending   int
+
+	// LinkOverlayPresent says whether symbol_links exists in this store. It
+	// does not on a database still on migration 0003, and `propose` runs
+	// there anyway -- it needs bars, symbols and ingest_log, nothing else --
+	// but with no overlay there is no retraction memory either, and a report
+	// that did not say so would be claiming a check it never ran.
+	LinkOverlayPresent bool
+	RetractedPairs     int
 }
 
 // ProposeOptions configures one read-only run.
@@ -177,6 +213,21 @@ func Propose(ctx context.Context, pool *pgxpool.Pool, opts ProposeOptions) (*Ros
 	}
 	for _, c := range candidates {
 		gate(c, sessions, settled, counts.ArchiveUnsettled)
+	}
+	retracted, overlay, err := loadRetractions(ctx, pool, opts.AsOfIngest)
+	if err != nil {
+		return nil, nil, counts, err
+	}
+	counts.LinkOverlayPresent = overlay
+	for _, c := range candidates {
+		r, ok := retracted[c.SuccessorID]
+		if !ok {
+			continue
+		}
+		counts.RetractedPairs++
+		c.RetractedAt, c.RetractionNote = r.at.UTC().Format(time.RFC3339), r.note
+		c.FailedGates = append(c.FailedGates, QRetracted)
+		sortGates(c.FailedGates)
 	}
 	applyPathGate(candidates)
 
@@ -424,12 +475,12 @@ func applyPathGate(candidates []*Candidate) {
 
 func sortGates(gates []string) {
 	rank := func(g string) int {
-		for i, name := range GateOrder {
+		for i, name := range ReportOrder {
 			if name == g {
 				return i
 			}
 		}
-		return len(GateOrder)
+		return len(ReportOrder)
 	}
 	sort.SliceStable(gates, func(i, j int) bool { return rank(gates[i]) < rank(gates[j]) })
 }
@@ -667,6 +718,58 @@ func loadSettlement(ctx context.Context, pool *pgxpool.Pool, asOfIngest time.Tim
 		}
 	}
 	return settled, lastFetch, rows.Err()
+}
+
+// retraction is what a withdrawal left behind: when it was written and what
+// the human said about it.
+type retraction struct {
+	at   time.Time
+	note string
+}
+
+// loadRetractions returns the symbols whose CURRENT link row is a
+// retraction -- the pairs a human has withdrawn and not re-linked -- and
+// whether the overlay table exists at all.
+//
+// The existence check is not defensive noise. `propose` is the one verb that
+// runs against a store still on migration 0003: it reads bars, symbols and
+// ingest_log, which is exactly why the roster could be generated at all while
+// symbol_links was missing from the live database. Requiring the table here
+// would take that away, so a missing overlay means no retraction memory and
+// the caller is told which of the two it got.
+//
+// A symbol retracted and then deliberately re-linked has a link row as its
+// latest, so it is not here: the human already answered this question.
+func loadRetractions(ctx context.Context, pool *pgxpool.Pool, asOfIngest time.Time) (map[int64]retraction, bool, error) {
+	var present bool
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('symbol_links') IS NOT NULL`).Scan(&present); err != nil {
+		return nil, false, fmt.Errorf("propose: looking for symbol_links: %w", err)
+	}
+	if !present {
+		return map[int64]retraction{}, false, nil
+	}
+	rows, err := pool.Query(ctx, `
+		SELECT symbol_id, ingested_at, coalesce(note, '')
+		FROM (
+			SELECT DISTINCT ON (symbol_id) symbol_id, reason, ingested_at, note
+			FROM symbol_links WHERE ingested_at <= $1
+			ORDER BY symbol_id, ingested_at DESC
+		) latest
+		WHERE reason = 'retraction'`, asOfIngest)
+	if err != nil {
+		return nil, false, fmt.Errorf("propose: retractions: %w", err)
+	}
+	defer rows.Close()
+	out := map[int64]retraction{}
+	for rows.Next() {
+		var id int64
+		var r retraction
+		if err := rows.Scan(&id, &r.at, &r.note); err != nil {
+			return nil, false, err
+		}
+		out[id] = r
+	}
+	return out, true, rows.Err()
 }
 
 // measureOverlaps counts the sessions each candidate pair actually SHARES,

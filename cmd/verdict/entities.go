@@ -72,9 +72,16 @@ func newEntitiesProposeCmd() *cobra.Command {
 				counts.Sessions, counts.Symbols, asOfIngest.Format(time.RFC3339))
 			fmt.Fprintf(w, "# ingest_log: %d unsettled dates in the span, %d pending (too recent for the last run to settle)\n",
 				counts.ArchiveUnsettled, counts.ArchivePending)
+			if counts.LinkOverlayPresent {
+				fmt.Fprintf(w, "# symbol_links: %d pair(s) currently retracted, quarantined here rather than silently re-proposed\n",
+					counts.RetractedPairs)
+			} else {
+				fmt.Fprintln(w, "# symbol_links does not exist in this store, so there was no retraction memory to consult:"+
+					" a pair a human already withdrew cannot be recognised here. Run `verdict migrate` first.")
+			}
 			fmt.Fprintf(w, "candidates\t%d\naccepted\t%d\nquarantined\t%d\n",
 				counts.Candidates, counts.Accepted, counts.Quarantined)
-			for _, g := range entities.GateOrder {
+			for _, g := range entities.ReportOrder {
 				fmt.Fprintf(w, "  %-24s rejected %4d  (first failure for %d)\n", g, counts.AnyFailure[g], counts.FirstFailure[g])
 			}
 
@@ -240,9 +247,15 @@ func newEntitiesApplyCmd() *cobra.Command {
 					unratified++
 				}
 			}
+			relinked := 0
 			for _, row := range res.Rows {
 				fmt.Fprintf(w, "%s\tsymbol %d -> entity %d (%s)\tboundary %s\t%s\n",
 					row.ISIN, row.SymbolID, row.EntityID, row.EntityISIN, row.Boundary.Format("2006-01-02"), row.Reason)
+				if row.WasRetracted {
+					relinked++
+					fmt.Fprintf(w, "  WARNING: symbol %d (%s) carries a retraction row -- this link was WITHDRAWN by a human and is being written back.\n",
+						row.SymbolID, row.ISIN)
+				}
 			}
 			verb := "inserted"
 			if dryRun {
@@ -253,6 +266,10 @@ func newEntitiesApplyCmd() *cobra.Command {
 			if unratified > 0 {
 				fmt.Fprintf(w, "# WARNING: %d of %d roster lines name no ratifier. The rows are written; the file does not say who approved them.\n",
 					unratified, len(roster.Links))
+			}
+			if relinked > 0 {
+				fmt.Fprintf(w, "# WARNING: %d row(s) re-link a pair that was retracted. `propose` regenerates the roster out of bars alone,"+
+					" so a withdrawn pair reappears in it every month -- check that this was meant.\n", relinked)
 			}
 			return nil
 		},
@@ -311,7 +328,16 @@ func newEntitiesRetractCmd() *cobra.Command {
 			for _, m := range res.Members {
 				fmt.Fprintf(w, "retracted\tsymbol %d (%s)\twas in entity %d\n", m.SymbolID, m.ISIN, m.WasIn)
 			}
-			fmt.Fprintf(w, "# entity %d dissolved: %d members resolve to themselves from now on\n", res.EntityID, len(res.Members))
+			// Say what happened, not what the verb is usually for. A
+			// symbol-scoped run detaches one member; calling that "entity N
+			// dissolved" would be the same class of untrue confirmation
+			// design 4.6 exists to remove.
+			if res.SymbolScoped {
+				fmt.Fprintf(w, "# symbol %d detached from entity %d: %d linked member(s) remain\n",
+					res.Members[0].SymbolID, res.EntityID, res.Remaining)
+			} else {
+				fmt.Fprintf(w, "# entity %d dissolved: %d members resolve to themselves from now on\n", res.EntityID, len(res.Members))
+			}
 			fmt.Fprintln(w, "# remove these lines from the roster and commit, or the next `apply` writes them back:")
 			for _, m := range res.Members {
 				fmt.Fprintf(w, "#   successor %s\n", m.ISIN)

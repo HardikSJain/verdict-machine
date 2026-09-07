@@ -756,15 +756,117 @@ from something the design says or leaves open:
    and is normalised before hashing, so adding the word does not change the digest.
    `overlap_dates` is measured per candidate and recorded in the review file rather than in
    the roster's `gates` block, which stays exactly as §5.1 writes it.
-3. **A `manual` line is exempt from G0–G4b and G6, and must name a ratifier and a note.**
-   The design requires both that `Load` validate G0–G6 and that hand-written lines exist for
-   the 51 fund-unit pairs — where G1 is meaningless by §10's own account — so the two cannot
-   both apply to the same line. Manual lines are still held to G3 (disjoint spans), to G5
-   (the graph must be a path) and to the boundary being the successor's first bar, because
-   those are what the store itself will enforce or silently mis-answer.
+3. **A `manual` line is exempt from G1–G4b and G6 — NOT from G0's check digit — and must
+   name a ratifier and a note.** The design requires both that `Load` validate G0–G6 and
+   that hand-written lines exist for the 51 fund-unit pairs — where G1 is meaningless by
+   §10's own account — so the two cannot both apply to the same line. What a manual line is
+   excused is G0's `^INE` half and the gates that depend on the pair being an equity
+   succession at all. **The ISO 6166 mod-10 check digit is not excused, and an earlier
+   revision of this note wrongly said it was.** §5.3 justifies that gate by pointing AT the
+   hand-written line — it "catches a typo in a hand-written roster line, which is exactly
+   where a false positive would originate" — and it is free: across all 1,250 ISINs in the
+   625 candidates, 104 of them non-INE `INF`/`IN9` units and including NIFTYBEES' own
+   `INF732E01011` and `INF204KB14I2`, zero fail it. The residual defence, `apply` refusing
+   an ISIN this store never registered, fires only when the typo lands on nothing; a typo
+   that lands on another real company's ISIN is the false positive §5.6 names, and it goes
+   into a table with no DELETE. Manual lines are also still held to G3 (disjoint spans), to
+   G5 (the graph must be a path) and to the boundary being the successor's first bar,
+   because those are what the store itself will enforce or silently mis-answer.
 4. **`apply` warns about unratified lines rather than refusing them.** The generated roster
    leaves `ratified_by` empty: `propose` cannot know who will ratify, and filling in a name
    would be the machine asserting a human's approval. `apply` prints how many lines name no
    ratifier and writes them anyway, because the provenance that matters — the sha256 of the
    exact file, in every row — is recorded either way, and refusing would make a scratch
    store unusable. A reviewer merging the roster PR is expected to fill the field in.
+
+#### Stage 2, fix round 1: five more judgement calls, and one measurement
+
+Recorded here for the same reason as the four above — each departs from something the
+design says, leaves open, or claims.
+
+5. **G6 admits an arbitrary cross-company splice about two times in five. §5.3 says
+   "probability close to 1" of rejecting it; that is the one number in the design this
+   implementation cannot reproduce.** The band rule is the design's and is unchanged — the
+   design is the authority — but the residual risk is now sized instead of asserted.
+   Measured read-only against the live store: at the four real boundary dates 2014-07-30,
+   2016-09-09, 2019-09-20 and 2022-07-29, every successor-side close over every OTHER
+   company's close on the prior session gives **9,311,610 genuine "a different company's
+   price spliced in here" ratios, of which 3,859,740 — 41.5% — land inside a G6 band.** The
+   cause is the union of the nine bands at ±25%: `[0.0075,0.0125] ∪ [0.015,0.025] ∪
+   [0.0375,0.0625] ∪ [0.075,0.125] ∪ [0.15,0.625] ∪ [0.75,1.25]`, where the 2/5 band fuses
+   1/4, 1/5 and 1/2 into one 0.475-wide interval covering the middle of the plausible
+   range. In log space over [0.0075, 2] the accepting set covers 71%. Since §5.6 establishes
+   that post-hoc detection from inside the store is nil for a link that passed G1 and G4,
+   G6 is the only non-structural thing standing behind 444 irreversible rows, and the human
+   running `apply` should size it as *weak evidence* rather than as near-certain rejection.
+   The cost of tightening, if it is ever wanted, is now known: **±20% loses exactly 1 of the
+   444 accepted lines** (the one at ratio 0.605), breaks the fused interval into
+   `[0.16,0.30] ∪ [0.32,0.60]`, and drops the false-accept rate to 34.8% (59% in log
+   space); **±15% loses 23 lines**, which is well past §5.4's budget.
+6. **`boundary_delivery_ratio` is `null` on all 625 records in
+   `data/succession-review.jsonl`, and structurally always will be.** §5.6's second
+   consequence names the review file's content as "the close ratio, the turnover ratio and
+   the delivery ratio across the boundary", so a third of the material is inert. The cause
+   is not a data gap that might close: `SELECT count(*) FILTER (WHERE delivery_qty IS NOT
+   NULL) FROM bars WHERE source='nse-bhavcopy'` is **0 of 6,031,245** because the bhavcopy
+   parser never reads `DELIV_QTY` (`internal/market/bhavcopy/parse_test.go` pins
+   `require.Nil(t, dhfl.DeliveryQty)`). The field is kept rather than dropped so the record
+   shape does not change under a reviewer mid-review, but **the review file carries close
+   and turnover only**, and a reviewer must not read a null there as "delivery was flat".
+7. **§4.1's growth path for an OLDER predecessor is not implementable against §4.2's
+   CHECK, and `apply` now refuses that roster instead of failing inside a trigger.** §4.1
+   says a predecessor older than the current root "joins by pointing at the existing
+   `entity_id` rather than renaming the entity". `plan` derives every row's entity from the
+   roster's own chain root, so a roster that gains such a predecessor renames the entity —
+   and migration 0004's flatness trigger then rejects the insert with `symbol_links: N is
+   the entity of other symbols; re-point every member or none`, which is advice §4.1 and
+   §10 both forbid taking. The row §4.1 wants is `(symbol P, entity A)` with **no
+   predecessor to record**, and §4.2's CHECK requires `predecessor IS NOT NULL` on every
+   non-retraction row, so the two sections are not compatible and this is reported back to
+   the design rather than improvised around. What changed in the code is only the failure:
+   `apply` runs both flatness guards before the INSERT and refuses with an error that names
+   the entity, its members and the contradiction. **The backward-extension path stays
+   unavailable until the design settles the row shape**; forward extension (a fresh split)
+   is unaffected and works.
+8. **`apply` refuses a roster whose `boundary` or `predecessor` disagrees with the row
+   already in the store, instead of reporting "already linked".** Deciding "already linked"
+   on `entity_id` alone made a re-apply of a CORRECTED roster a silent no-op — and since §0
+   withdrew revision 1's claim and made `boundary` the only column that says which member
+   is in force on a date, that is a silent failure to correct a load-bearing value. It is
+   reachable from the monthly ops flow: `bars` is insert-only, but a backfill can still add
+   EARLIER sessions (§5.3 cites 19 previously-unknown weekend sessions added by one run),
+   which moves a successor's first bar and hence `effective_from`. The comparison is on
+   `boundary` and `predecessor` — what the row MEANS — and deliberately **not** on
+   `roster_sha`: the sha covers the whole file, so treating a changed one as a change to
+   every row would rewrite all 444 rows for an edit to one line, into a table with no
+   DELETE. A stale `roster_sha` on an unchanged row is still accurate — that row was
+   authorised by that roster. Correcting a boundary is `retract --symbol` then `apply`,
+   which the error names; the new row supersedes the old one and both stay replayable.
+9. **`retract --symbol` refuses whenever the entity has more than one linked member, not
+   only when the named symbol is a root.** §4.6 retains `--symbol` "as an alias only for the
+   single-member case"; implementing only the literal half of that sentence let a NON-root
+   member of a three-member chain through, detaching it and leaving its siblings pointed at
+   the old root — one company split across two entity ids, with a hole in the middle of the
+   survivor's history, reported as "entity N dissolved". Nothing downstream sees it: the
+   resulting map is flat (I1 silent), disjoint (I2 silent) and same-issuer (I3 silent),
+   which is the blind spot already recorded above for the trigger, reached from a supported
+   CLI flag. The guard now implements the whole sentence, and it collapses to the previous
+   behaviour for a two-member entity. The CLI also no longer prints "entity N dissolved"
+   for a symbol-scoped run; it prints what happened.
+10. **`propose` quarantines a pair that a human has retracted, and `apply` warns when it
+    re-links one.** `propose` reads `bars`, `symbols` and `ingest_log` and nothing else, so
+    a pair retracted for merging two different companies passes G0–G6 again next month and
+    is regenerated into the roster — which `propose` overwrites wholesale — and `apply`
+    re-links it without a word, because a retraction row sets `entity_id = symbol_id` and
+    the "already linked" skip cannot see it. §5.6's "a wrong merge is undone by writing one
+    more row" is the single argument that beat the ratified rebuild, and §9 makes `propose`
+    a monthly item, so the undo would survive only if a human remembered to hand-delete a
+    line from a machine-generated file every month, forever. The quarantine is reported as
+    `Q retracted pair` — it is **not** a gate, and G0–G6 are unchanged — and it carries the
+    retraction's timestamp and note into the review file. It quarantines rather than
+    refuses because §8.4 requires re-linking after a retraction to stay possible; `apply`
+    still writes the link back and now says, per row, that it is undoing an undo.
+    Consequence worth stating: `propose` reads `symbol_links` when the table exists and
+    **degrades to no retraction memory when it does not**, which is the live store's state
+    today (§0). It says which of the two it did on every run, because a report that stayed
+    silent would be claiming a check it never ran.

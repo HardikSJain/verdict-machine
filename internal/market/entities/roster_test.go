@@ -116,13 +116,68 @@ func TestRosterRejectsASerialThatDoesNotIncrease(t *testing.T) {
 }
 
 func TestRosterRejectsAnISINClaimedTwiceAsASuccessor(t *testing.T) {
+	// Both links have to be well-formed on their own or this never reaches
+	// G5: an earlier version pointed the second link at INE081A01020 from a
+	// HIGHER serial, so it died at G2 and the test passed on the wrong error
+	// (the G2 message contains the ISIN too, via the `roster: %s -> %s:`
+	// wrapper). Disabling G5 outright left it green. Both of these pass
+	// G0-G4b and G6 and collide only at the successor.
 	a := tataSteel()
+	a.Successor = "INE081A01038"
+	a.Gates.Serial = "01->03"
 	b := tataSteel()
-	b.Predecessor = "INE081A01038" // a second, different predecessor for one successor
-	b.Gates.Serial = "03->02"
+	b.Predecessor = "INE081A01020"
+	b.Successor = "INE081A01038"
+	b.Gates.Serial = "02->03"
 	err := roster(a, b).Validate()
 	require.Error(t, err, "G5: the map must be a path, and two predecessors for one successor is a merge point")
+	require.Contains(t, err.Error(), "G5", "and it must be G5 that says so, not some other gate")
+	require.Contains(t, err.Error(), "INE081A01038")
+	require.Contains(t, err.Error(), "INE081A01012")
 	require.Contains(t, err.Error(), "INE081A01020")
+
+	// `apply` resolves a chain to its root by walking the roster, so a
+	// successor with two predecessors would be resolved arbitrarily into a
+	// row that cannot be deleted.
+	require.ErrorContains(t, roster(a, b).Validate(), "one predecessor")
+}
+
+func TestRosterRejectsABadCheckDigitOnAManualLineToo(t *testing.T) {
+	// G0 has two halves and a manual line is exempt from ONE of them. The
+	// INE-only half is genuinely meaningless for the 51 INF fund-unit pairs a
+	// hand-written line exists for. The ISO 6166 mod-10 is not: design 5.3
+	// justifies it by pointing AT the hand-written line -- it "catches a typo
+	// in a hand-written roster line, which is exactly where a false positive
+	// would originate" -- and it passes on every INF and IN9 unit in this
+	// archive, so enforcing it costs nothing and refuses nothing genuine.
+	fund := entities.Link{
+		Reason:        entities.ReasonManual,
+		Predecessor:   "INF732E01011",
+		Successor:     "INF204KB14I2",
+		EffectiveFrom: "2019-12-20",
+		Gates:         entities.Gates{CheckDigit: true, PredecessorLastBar: "2019-12-19", SuccessorFirstBar: "2019-12-20"},
+		RatifiedBy:    "hardik", RatifiedAt: "2026-09-08",
+		Note: "NSE circular: AMC transfer, Goldman Sachs MF to Nippon India MF",
+	}
+	require.NoError(t, roster(fund).Validate(), "the exemption that remains: a fund unit pair may be hand-written")
+
+	typo := fund
+	typo.Successor = "INE090A01014" // one digit off ICICIBANK's real INE090A01013
+	require.ErrorContains(t, roster(typo).Validate(), "check digit",
+		"a typo in a hand-written line is the one thing this gate exists for")
+
+	unchecked := fund
+	unchecked.Gates.CheckDigit = false
+	require.ErrorContains(t, roster(unchecked).Validate(), "check_digit",
+		"and a line claiming the digit was never checked is refused as loudly")
+
+	// What it still cannot catch, said out loud rather than implied: a typo
+	// that lands on a DIFFERENT real ISIN passes the check digit. Only
+	// `apply` refusing an unregistered ISIN stands behind that, and it fires
+	// only when the typo lands on nothing.
+	real := fund
+	real.Successor = "INE090A01013"
+	require.NoError(t, roster(real).Validate())
 }
 
 func TestRosterRejectsAPredecessorWithTwoSuccessors(t *testing.T) {
@@ -148,8 +203,12 @@ func TestRosterRejectsACycle(t *testing.T) {
 		return entities.Link{
 			Reason: entities.ReasonManual, Predecessor: p, Successor: s,
 			EffectiveFrom: first,
-			Gates:         entities.Gates{PredecessorLastBar: last, SuccessorFirstBar: first},
-			RatifiedBy:    "hardik", RatifiedAt: "2026-09-08", Note: "hand-written",
+			// check_digit is recorded even on a hand-written line: G0's
+			// mod-10 half is not exempted, because it is free on every INF
+			// and IN9 unit in this archive and it is the one gate design 5.3
+			// justifies by pointing at the hand-written line.
+			Gates:      entities.Gates{CheckDigit: true, PredecessorLastBar: last, SuccessorFirstBar: first},
+			RatifiedBy: "hardik", RatifiedAt: "2026-09-08", Note: "hand-written",
 		}
 	}
 	err := roster(
@@ -283,7 +342,7 @@ func TestRosterManualLineRequiresANoteAndARatifier(t *testing.T) {
 		Predecessor:   "INF732E01011",
 		Successor:     "INF204KB14I2",
 		EffectiveFrom: "2019-12-20",
-		Gates:         entities.Gates{PredecessorLastBar: "2019-12-19", SuccessorFirstBar: "2019-12-20"},
+		Gates:         entities.Gates{CheckDigit: true, PredecessorLastBar: "2019-12-19", SuccessorFirstBar: "2019-12-20"},
 	}
 	require.ErrorContains(t, roster(l).Validate(), "ratified_by")
 
