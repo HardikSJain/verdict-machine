@@ -433,6 +433,19 @@ this document after that round and have not been re-reviewed.
   them). The line changes no signature, no SQL, no schema, and no other behaviour; it
   only silences goose's own informational logging. `newMigrateCmd` still prints its own
   "migrations applied" line on success, so the CLI keeps useful output.
+- **Task 4 (bar store, `ingest eod2`):** the brief's Step 6 verification expects
+  `eod2: parsed 13 bars, inserted 13 new versions, ...` against
+  `internal/market/eod2/testdata`. Running the exact command specified reports
+  `parsed 15 bars, inserted 15 new versions` instead (`0` on the second run, as
+  expected). This is not an implementation deviation: cleanup commit `d96470f`
+  (landed after the brief was written, and which the task instructions say not to
+  revert) added `internal/market/eod2/testdata/daily/reliance.CSV` — a 2-data-row
+  fixture with an upper-case `.CSV` extension — specifically to exercise that same
+  commit's case-insensitive extension match in `eod2.LoadDir`. 13 (tatasteel.csv) + 2
+  (reliance.CSV) = 15. No code in `store.go` or `main.go` differs from the brief; only
+  the fixture directory's contents changed underneath it between brief-authoring and
+  implementation. Idempotency (`inserted 0` on the second run) holds exactly as
+  specified.
 
 ## What I noticed about how you think
 

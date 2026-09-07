@@ -5,11 +5,15 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/HardikSJain/verdict-machine/internal/db"
+	"github.com/HardikSJain/verdict-machine/internal/market"
+	"github.com/HardikSJain/verdict-machine/internal/market/eod2"
 )
 
 // version is overridden at build time with -ldflags "-X main.version=...".
@@ -24,6 +28,7 @@ func newRootCmd() *cobra.Command {
 	}
 	root.AddCommand(newVersionCmd())
 	root.AddCommand(newMigrateCmd())
+	root.AddCommand(newIngestCmd())
 	return root
 }
 
@@ -105,6 +110,51 @@ func newMigrateCmd() *cobra.Command {
 	}
 	cmd.Flags().String("database-url", "", "Postgres URL (default $VERDICT_DATABASE_URL)")
 	return cmd
+}
+
+func newIngestCmd() *cobra.Command {
+	ingest := &cobra.Command{Use: "ingest", Short: "Load market data into the store"}
+	ingest.PersistentFlags().String("database-url", "", "Postgres URL (default $VERDICT_DATABASE_URL)")
+
+	e := &cobra.Command{
+		Use:   "eod2",
+		Short: "Load eod2's adjusted daily CSVs (source=eod2)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			dir, _ := cmd.Flags().GetString("dir")
+			if dir == "" {
+				return fmt.Errorf("--dir is required (the eod2_data directory)")
+			}
+			url, err := databaseURL(cmd)
+			if err != nil {
+				return err
+			}
+			pool, err := db.Connect(cmd.Context(), url)
+			if err != nil {
+				return err
+			}
+			defer pool.Close()
+
+			sym2isin, err := eod2.LoadSymbolMap(filepath.Join(dir, "isin_symbol_map.json"))
+			if err != nil {
+				return err
+			}
+			bars, skipped, err := eod2.LoadDir(filepath.Join(dir, "daily"), sym2isin)
+			if err != nil {
+				return err
+			}
+			started := time.Now()
+			n, err := market.NewStore(pool).InsertBars(cmd.Context(), market.SourceEod2, bars)
+			if err != nil {
+				return err
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "eod2: parsed %d bars, inserted %d new versions, skipped %d tickers without ISIN, %s\n",
+				len(bars), n, len(skipped), time.Since(started).Round(time.Millisecond))
+			return err
+		},
+	}
+	e.Flags().String("dir", "", "path to eod2_data (contains daily/ and isin_symbol_map.json)")
+	ingest.AddCommand(e)
+	return ingest
 }
 
 func main() {
