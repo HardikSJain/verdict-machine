@@ -83,9 +83,9 @@ func testServer(t *testing.T, handle func(w http.ResponseWriter, date string)) (
 	return f, log
 }
 
-// 2024-01-01 is a Monday, 2024-01-05 a Friday, 2024-01-08 the following
-// Monday, so from..to spans exactly the weekdays used below with Jan 6-7
-// (Sat/Sun) skipped by Backfill's own weekend check.
+// 2024-01-01 is a Monday, 2024-01-05 a Friday, 2024-01-06 and 2024-01-07 the
+// weekend, 2024-01-08 the following Monday. Backfill walks all eight dates:
+// it has no weekday filter, because NSE holds real sessions on some weekends.
 
 func TestBackfill_SkipsAlreadyLoggedDate(t *testing.T) {
 	ctx := context.Background()
@@ -152,7 +152,7 @@ func TestBackfill_AbortsAfterFiveConsecutiveErrors(t *testing.T) {
 	ctx := context.Background()
 	store := market.NewStore(testutil.Pool(t))
 	from := market.Day(2024, 1, 1) // Mon
-	to := market.Day(2024, 1, 8)   // the following Mon: 6 weekdays in range
+	to := market.Day(2024, 1, 8)   // the following Mon: 8 calendar dates in range
 
 	f, log := testServer(t, func(w http.ResponseWriter, date string) {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -162,15 +162,15 @@ func TestBackfill_AbortsAfterFiveConsecutiveErrors(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "aborting after 5 consecutive errors")
 	require.Equal(t, Summary{Errors: 5}, sum)
-	require.Len(t, log.all(), 5, "the 6th weekday must never be attempted once the run aborts")
+	require.Len(t, log.all(), 5, "the 6th date must never be attempted once the run aborts")
 }
 
 func TestBackfill_SuccessResetsConsecutiveErrorCounter(t *testing.T) {
 	ctx := context.Background()
 	store := market.NewStore(testutil.Pool(t))
 	from := market.Day(2024, 1, 1)        // Mon: error 1
-	successDate := market.Day(2024, 1, 5) // Fri: 4th weekday, succeeds and resets the counter
-	to := market.Day(2024, 1, 8)          // Mon: error 5th overall, but only the 1st since the reset
+	successDate := market.Day(2024, 1, 5) // Fri: 5th date, succeeds and resets the counter
+	to := market.Day(2024, 1, 8)          // Mon: 7 errors overall, but never 5 in a row
 
 	payload := zipCSV(t, "bhav.csv", legacyCSV(legacyRow(successDate, "TESTCO", "TESTISIN0001", 105)))
 	f, log := testServer(t, func(w http.ResponseWriter, date string) {
@@ -184,8 +184,8 @@ func TestBackfill_SuccessResetsConsecutiveErrorCounter(t *testing.T) {
 
 	sum, err := Backfill(ctx, store, f, from, to, 0, io.Discard)
 	require.NoError(t, err, "a success between two runs of errors resets the counter, so 5 non-consecutive errors must not abort")
-	require.Equal(t, Summary{Errors: 5, Fetched: 1, Inserted: 1}, sum)
-	require.Len(t, log.all(), 6, "every weekday in range must be attempted; the run must not abort")
+	require.Equal(t, Summary{Errors: 7, Fetched: 1, Inserted: 1}, sum)
+	require.Len(t, log.all(), 8, "every calendar date in range must be attempted; the run must not abort")
 }
 
 func TestBackfill_SummaryCountersMatchMixedScenario(t *testing.T) {
@@ -244,14 +244,11 @@ func TestNoFileSettled_HoldsUntilNSEsPublishWindowHasPassed(t *testing.T) {
 		"a long-past date settles")
 }
 
-// unpublishedSession returns a weekday NSE cannot yet be assumed to have
-// published: today in IST, or the coming Monday when today is the weekend
-// (Backfill skips weekend dates outright, so they can never exercise this).
+// unpublishedSession returns a date NSE cannot yet be assumed to have
+// published: today in IST. Backfill walks weekend dates too, so today serves
+// whatever day of the week the suite happens to run on.
 func unpublishedSession(now time.Time) time.Time {
 	d := now.In(ist)
-	for d.Weekday() == time.Saturday || d.Weekday() == time.Sunday {
-		d = d.AddDate(0, 0, 1)
-	}
 	return market.Day(d.Year(), d.Month(), d.Day())
 }
 
@@ -303,4 +300,47 @@ func TestBackfill_SettledNoFileStillLogsAndSkipsOnRerun(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, Summary{Skipped: 1}, sum, "a settled holiday is never refetched")
 	require.Equal(t, []string{"2024-01-01"}, log.all())
+}
+
+// TestBackfill_FetchesWeekendSessions pins the absence of a weekday filter.
+// NSE holds live sessions on some Saturdays and Sundays -- Muhurat trading,
+// Budget Saturdays, special live-trading and disaster-recovery sessions --
+// and 2024-01-20 was one of them (a Saturday special session). A
+// time.Weekday()-driven skip fired before ingest_log was read or written, so
+// such a date was never attempted, never logged, and no later run could
+// recover it: the bars were permanently and silently absent from the source
+// of record. The Sunday beside it stands for the ordinary case and must
+// settle as 'no-file' exactly as a holiday does.
+func TestBackfill_FetchesWeekendSessions(t *testing.T) {
+	ctx := context.Background()
+	store := market.NewStore(testutil.Pool(t))
+	saturday := market.Day(2024, 1, 20)
+	sunday := market.Day(2024, 1, 21)
+	require.Equal(t, time.Saturday, saturday.Weekday())
+	require.Equal(t, time.Sunday, sunday.Weekday())
+
+	payload := zipCSV(t, "bhav.csv", legacyCSV(legacyRow(saturday, "TESTCO", "TESTISIN0001", 105)))
+	f, log := testServer(t, func(w http.ResponseWriter, date string) {
+		if date != saturday.Format("2006-01-02") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/zip")
+		_, _ = w.Write(payload)
+	})
+
+	sum, err := Backfill(ctx, store, f, saturday, sunday, 0, io.Discard)
+	require.NoError(t, err)
+	require.Equal(t, Summary{Fetched: 1, NoFile: 1, Inserted: 1}, sum)
+	require.Equal(t, []string{"2024-01-20", "2024-01-21"}, log.all(),
+		"both weekend dates must be attempted; a weekday filter would fetch neither")
+
+	bars, err := store.BarsForDate(ctx, market.SourceBhavcopy, saturday, time.Now())
+	require.NoError(t, err)
+	require.Len(t, bars, 1, "the Saturday session's bars reach the store")
+
+	done, err := store.LoggedDates(ctx, market.SourceBhavcopy)
+	require.NoError(t, err)
+	require.True(t, done[saturday])
+	require.True(t, done[sunday], "a weekend with no session settles as no-file like any holiday")
 }

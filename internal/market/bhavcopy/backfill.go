@@ -41,12 +41,23 @@ func noFileSettled(d, now time.Time) bool {
 	return !now.Before(endOfSession.Add(noFileSettleLag))
 }
 
-// Backfill walks every weekday from `from` to `to` inclusive, skipping dates
-// already settled in ingest_log, fetching the rest with `delay` between
+// Backfill walks every calendar date from `from` to `to` inclusive, skipping
+// dates already settled in ingest_log, fetching the rest with `delay` between
 // requests. Errors are logged and retried on the next run; five consecutive
 // errors abort the run so a blocked client does not hammer NSE. A 404 for a
 // date too recent to be sure NSE has published it yet is also retried on the
 // next run rather than settled as 'no-file'.
+//
+// Saturdays and Sundays are walked like every other date. NSE does hold live
+// sessions on some of them -- Muhurat trading, Budget Saturdays, and special
+// live-trading or disaster-recovery sessions -- and a calendar-shaped skip
+// drops those bars from the source of record permanently: it fires before
+// ingest_log is read or written, so the date is never attempted, never
+// logged, and no later run can notice it is missing. A weekend with no
+// session simply 404s and settles as 'no-file' down the same path a holiday
+// already takes. The cost is roughly 40% more requests, every one of them a
+// cheap 404, and the benefit is a set of session dates decided by NSE rather
+// than by time.Weekday.
 func Backfill(ctx context.Context, store *market.Store, f *Fetcher, from, to time.Time, delay time.Duration, log io.Writer) (Summary, error) {
 	var sum Summary
 	done, err := store.LoggedDates(ctx, market.SourceBhavcopy)
@@ -58,9 +69,6 @@ func Backfill(ctx context.Context, store *market.Store, f *Fetcher, from, to tim
 	startedAt := time.Now()
 	consecutiveErrors := 0
 	for d := market.Day(from.Year(), from.Month(), from.Day()); !d.After(to); d = d.AddDate(0, 0, 1) {
-		if d.Weekday() == time.Saturday || d.Weekday() == time.Sunday {
-			continue
-		}
 		if done[d] {
 			sum.Skipped++
 			continue
