@@ -39,6 +39,31 @@ func TestParseLegacy_2015KeepsEQAndCarriesTurnover(t *testing.T) {
 	require.Nil(t, dhfl.DeliveryQty)
 }
 
+func TestParseLegacy_2020TwoDigitYearParses(t *testing.T) {
+	f, err := os.Open("testdata/cm13JUL2020bhav.csv")
+	require.NoError(t, err)
+	defer f.Close()
+
+	bars, err := Parse("cm13JUL2020bhav.csv", f)
+	require.NoError(t, err)
+	require.Len(t, bars, 4, "only series EQ rows are kept; the two BE rows are filtered out")
+
+	for _, b := range bars {
+		require.Equal(t, market.Day(2020, 7, 13), b.Date, "TIMESTAMP %q must parse to the two-digit-year session", "13-Jul-20")
+	}
+
+	reliance, ok := find(bars, "RELIANCE")
+	require.True(t, ok)
+	require.Equal(t, "INE002A01018", reliance.ISIN)
+	require.Equal(t, 1903.35, reliance.Open)
+	require.Equal(t, 1947.7, reliance.High)
+	require.Equal(t, 1900.0, reliance.Low)
+	require.Equal(t, 1935.0, reliance.Close)
+	require.EqualValues(t, 32124397, reliance.Volume)
+	require.NotNil(t, reliance.Turnover)
+	require.InDelta(t, 61905840823.0, *reliance.Turnover, 0.01)
+}
+
 func TestParseUDiFF_2026KeepsEQAndCarriesTurnover(t *testing.T) {
 	f, err := os.Open("testdata/BhavCopy_NSE_CM_0_0_0_20260828_F_0000.csv")
 	require.NoError(t, err)

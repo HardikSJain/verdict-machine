@@ -51,15 +51,21 @@ func has(col map[string]int, names ...string) bool {
 	return true
 }
 
-// layout maps the fields we need onto a format's column names.
+// layout maps the fields we need onto a format's column names. dateFmts is
+// tried in order; the first layout that parses the column value wins.
 type layout struct {
-	date, dateFmt, isin, ticker, series, open, high, low, close, volume, turnover string
+	date, isin, ticker, series, open, high, low, close, volume, turnover string
+	dateFmts                                                             []string
 }
 
-var legacyLayout = layout{date: "TIMESTAMP", dateFmt: "02-Jan-2006", isin: "ISIN", ticker: "SYMBOL", series: "SERIES",
+// legacyLayout's TIMESTAMP column is almost always four-digit DD-Mon-YYYY,
+// but NSE's 2020-07-13 archive uses a two-digit year (DD-Mon-YY) throughout
+// that one session. Both forms are accepted; four-digit is tried first since
+// it is the overwhelming majority.
+var legacyLayout = layout{date: "TIMESTAMP", dateFmts: []string{"02-Jan-2006", "02-Jan-06"}, isin: "ISIN", ticker: "SYMBOL", series: "SERIES",
 	open: "OPEN", high: "HIGH", low: "LOW", close: "CLOSE", volume: "TOTTRDQTY", turnover: "TOTTRDVAL"}
 
-var udiffLayout = layout{date: "TradDt", dateFmt: "2006-01-02", isin: "ISIN", ticker: "TckrSymb", series: "SctySrs",
+var udiffLayout = layout{date: "TradDt", dateFmts: []string{"2006-01-02"}, isin: "ISIN", ticker: "TckrSymb", series: "SctySrs",
 	open: "OpnPric", high: "HghPric", low: "LwPric", close: "ClsPric", volume: "TtlTradgVol", turnover: "TtlTrfVal"}
 
 func parseRows(name string, cr *csv.Reader, l layout, col map[string]int) ([]market.Bar, error) {
@@ -88,9 +94,16 @@ func parseRows(name string, cr *csv.Reader, l layout, col map[string]int) ([]mar
 		if field(rec, l.series) != "EQ" {
 			continue
 		}
-		d, err := time.Parse(l.dateFmt, field(rec, l.date))
+		dateVal := field(rec, l.date)
+		var d time.Time
+		for _, fm := range l.dateFmts {
+			d, err = time.Parse(fm, dateVal)
+			if err == nil {
+				break
+			}
+		}
 		if err != nil {
-			return nil, fmt.Errorf("bhavcopy %s line %d: date %q: %w", name, line, field(rec, l.date), err)
+			return nil, fmt.Errorf("bhavcopy %s line %d: date %q: %w", name, line, dateVal, err)
 		}
 		b := market.Bar{ISIN: field(rec, l.isin), Ticker: field(rec, l.ticker), Series: "EQ",
 			Date: market.Day(d.Year(), d.Month(), d.Day())}
