@@ -47,4 +47,18 @@ func TestMigrateCreatesInsertOnlyMarketTables(t *testing.T) {
 	require.ErrorContains(t, err, "insert-only")
 	_, err = pool.Exec(ctx, "DELETE FROM symbols WHERE isin = 'INE081A01020'")
 	require.ErrorContains(t, err, "insert-only")
+
+	// bars carries its own insert-only trigger, separate from symbols'; exercise it
+	// directly rather than relying on the symbols assertions above to stand in for it.
+	// symbol_id 1 is deterministic here: RESTART IDENTITY above reset the sequence and
+	// exactly one symbols row (inserted just above) has been written since.
+	_, err = pool.Exec(ctx,
+		`INSERT INTO bars (symbol_id, date, source, series, open, high, low, close, volume, content_hash)
+		 VALUES (1, '2024-01-01', 'nse-bhavcopy', 'EQ', 100, 105, 95, 102, 1000, $1)`,
+		[]byte{0})
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, "UPDATE bars SET close = 999 WHERE symbol_id = 1")
+	require.ErrorContains(t, err, "insert-only")
+	_, err = pool.Exec(ctx, "DELETE FROM bars WHERE symbol_id = 1")
+	require.ErrorContains(t, err, "insert-only")
 }
