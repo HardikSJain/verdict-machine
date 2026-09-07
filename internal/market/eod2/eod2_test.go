@@ -98,13 +98,38 @@ func TestLoadSymbolMap(t *testing.T) {
 }
 
 func TestLoadDir_SkipsTickersWithoutISIN(t *testing.T) {
+	// testdata/daily also has reliance.CSV (see
+	// TestLoadDir_MatchesUpperCaseCSVExtension below), so mapping only
+	// RELIANCE loads that file and skips tatasteel.csv, and vice versa.
 	bars, skipped, err := LoadDir("testdata/daily", map[string]string{"RELIANCE": "INE002A01018"})
 	require.NoError(t, err)
-	require.Empty(t, bars)
+	require.Len(t, bars, 2)
 	require.Equal(t, []string{"TATASTEEL"}, skipped)
 
 	bars, skipped, err = LoadDir("testdata/daily", map[string]string{"TATASTEEL": "INE081A01020"})
 	require.NoError(t, err)
 	require.Len(t, bars, 13)
-	require.Empty(t, skipped)
+	require.Equal(t, []string{"RELIANCE"}, skipped)
+}
+
+// TestLoadDir_MatchesUpperCaseCSVExtension proves LoadDir treats the .csv
+// extension case-insensitively. Before the fix, the filter
+// strings.HasSuffix(e.Name(), ".csv") was case-sensitive, so a file named
+// with an upper-case ".CSV" extension (as some data providers produce) was
+// silently dropped: not loaded into bars, and not reported in skipped
+// either, since the extension filter excluded it before the ticker was ever
+// looked up against sym2isin.
+func TestLoadDir_MatchesUpperCaseCSVExtension(t *testing.T) {
+	bars, skipped, err := LoadDir("testdata/daily", map[string]string{"RELIANCE": "INE002A01018"})
+	require.NoError(t, err)
+	require.NotContains(t, skipped, "RELIANCE")
+
+	var got []market.Bar
+	for _, b := range bars {
+		if b.Ticker == "RELIANCE" {
+			got = append(got, b)
+		}
+	}
+	require.Len(t, got, 2, "reliance.CSV should have been loaded despite its upper-case extension")
+	require.Equal(t, "INE002A01018", got[0].ISIN)
 }

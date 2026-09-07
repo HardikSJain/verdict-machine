@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -37,9 +38,20 @@ func newVersionCmd() *cobra.Command {
 	}
 }
 
-// databaseURL resolves the connection string from the flag, then the environment.
+// databaseURL resolves the connection string from the local flag, then an
+// inherited flag (for a command that gets --database-url from a parent's
+// persistent flags rather than declaring it itself), then the environment.
 func databaseURL(cmd *cobra.Command) (string, error) {
-	url, _ := cmd.Flags().GetString("database-url")
+	url, err := lookupFlagString(cmd.Flags(), "database-url")
+	if err != nil {
+		return "", err
+	}
+	if url == "" {
+		url, err = lookupFlagString(cmd.InheritedFlags(), "database-url")
+		if err != nil {
+			return "", err
+		}
+	}
 	if url == "" {
 		url = os.Getenv("VERDICT_DATABASE_URL")
 	}
@@ -47,6 +59,32 @@ func databaseURL(cmd *cobra.Command) (string, error) {
 		return "", fmt.Errorf("set --database-url or VERDICT_DATABASE_URL")
 	}
 	return url, nil
+}
+
+// stringFlagGetter is satisfied by *pflag.FlagSet, as returned by both
+// cmd.Flags() and cmd.InheritedFlags(); declared locally so this file does
+// not need to import pflag directly just to name the parameter type.
+type stringFlagGetter interface {
+	GetString(name string) (string, error)
+}
+
+// lookupFlagString reads a string flag. pflag's GetString returns an error
+// of "flag accessed but not defined: <name>" when the flag was never
+// declared on that FlagSet -- expected when a flag lives on a different
+// command in the tree (e.g. local here, inherited there), so that case is
+// treated as "no value" and the caller falls through to the next source.
+// Any other error means the flag was declared with the wrong type, which is
+// a programming error, and is wrapped and returned instead of being
+// silently discarded.
+func lookupFlagString(flags stringFlagGetter, name string) (string, error) {
+	val, err := flags.GetString(name)
+	if err != nil {
+		if strings.Contains(err.Error(), "flag accessed but not defined") {
+			return "", nil
+		}
+		return "", fmt.Errorf("%s flag: %w", name, err)
+	}
+	return val, nil
 }
 
 func newMigrateCmd() *cobra.Command {

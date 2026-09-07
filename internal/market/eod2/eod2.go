@@ -131,10 +131,11 @@ func LoadDir(dailyDir string, sym2isin map[string]string) ([]market.Bar, []strin
 	var bars []market.Bar
 	var skipped []string
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".csv") {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(strings.ToLower(name), ".csv") {
 			continue
 		}
-		ticker := strings.ToUpper(strings.TrimSuffix(e.Name(), ".csv"))
+		ticker := strings.ToUpper(name[:len(name)-len(".csv")])
 		isin, ok := sym2isin[ticker]
 		if !ok {
 			skipped = append(skipped, ticker)

@@ -39,7 +39,7 @@ func Migrate(ctx context.Context, url string) error {
 	goose.SetLogger(goose.NopLogger()) // keep test/CLI output pristine; goose otherwise logs every step
 	goose.SetBaseFS(migrations)
 	if err := goose.SetDialect("postgres"); err != nil {
-		return err
+		return fmt.Errorf("db dialect: %w", err)
 	}
 	if err := goose.UpContext(ctx, sqlDB, "migrations"); err != nil {
 		return fmt.Errorf("db migrate: %w", err)
