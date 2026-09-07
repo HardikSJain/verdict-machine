@@ -117,6 +117,17 @@ func (s *Store) EnsureSymbols(ctx context.Context, bars []Bar) (map[string]int64
 		if b.ISIN == "" {
 			return nil, fmt.Errorf("bar %s %s has no ISIN", b.Ticker, b.Date.Format("2006-01-02"))
 		}
+		// A bar with no date would be registered at valid_from 0001-01-01,
+		// which is not a date -- it is the sentinel migration 0002 gave the
+		// rows that predate valid_from, meaning "no observed date; applies to
+		// every bar date". Letting a caller's zero time.Time land on it would
+		// make a parser bug permanently indistinguishable from the migration's
+		// own backfill, in an insert-only table with no UPDATE to sort them out
+		// again. The date is what makes "what was this called then" answerable,
+		// so it is as required here as the ISIN is.
+		if b.Date.IsZero() {
+			return nil, fmt.Errorf("bar %s (%s) has no date; valid_from would collide with the 0001-01-01 pre-migration sentinel", b.Ticker, b.ISIN)
+		}
 		if prev, ok := want[b.ISIN]; !ok || b.Date.After(prev.validFrom) {
 			want[b.ISIN] = observation{ticker: b.Ticker, validFrom: b.Date}
 		}

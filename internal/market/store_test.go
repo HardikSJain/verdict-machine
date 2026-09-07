@@ -91,13 +91,46 @@ func TestInsertBars_RejectsConflictingDuplicateInSameBatch(t *testing.T) {
 	require.Empty(t, after, "a rejected batch must not insert any bar for that symbol/date")
 }
 
+// TestEnsureSymbols_RejectsBarWithNoDate covers the one bad input that would
+// otherwise be written rather than rejected. valid_from 0001-01-01 is not a
+// date the store can hold; it is the sentinel migration 0002 stamped on the
+// rows written before valid_from existed, and it means "applies to every bar
+// date". A zero time.Time out of a broken parser lands exactly there, and
+// symbols is insert-only, so the two would be indistinguishable forever with
+// no UPDATE available to separate them.
+func TestEnsureSymbols_RejectsBarWithNoDate(t *testing.T) {
+	ctx := context.Background()
+	store := market.NewStore(testutil.Pool(t))
+
+	_, err := store.EnsureSymbols(ctx, []market.Bar{{ISIN: "INE081A01020", Ticker: "TATASTEEL"}})
+	require.ErrorContains(t, err, "TATASTEEL")
+	require.ErrorContains(t, err, "has no date")
+
+	var n int
+	require.NoError(t, store.Pool().QueryRow(ctx, "SELECT count(*) FROM symbols").Scan(&n))
+	require.Zero(t, n, "the batch is rejected before anything is written")
+
+	// The same batch with a date is accepted, so the check rejects the missing
+	// date and not the bar.
+	ids, err := store.EnsureSymbols(ctx, []market.Bar{
+		{ISIN: "INE081A01020", Ticker: "TATASTEEL", Date: market.Day(2015, 6, 30)}})
+	require.NoError(t, err)
+	require.Len(t, ids, 1)
+}
+
 func TestEnsureSymbols_KeepsSymbolIDAcrossRename(t *testing.T) {
 	ctx := context.Background()
 	store := market.NewStore(testutil.Pool(t))
 
-	ids, err := store.EnsureSymbols(ctx, []market.Bar{{ISIN: "INE081A01020", Ticker: "TATASTEEL"}})
+	// Both observations carry the session date they were seen for. They used
+	// to carry none, which meant both landed on valid_from 0001-01-01 -- the
+	// pre-migration sentinel -- and the rename this test is about was recorded
+	// as having happened before the calendar starts.
+	ids, err := store.EnsureSymbols(ctx, []market.Bar{
+		{ISIN: "INE081A01020", Ticker: "TATASTEEL", Date: market.Day(2015, 6, 30)}})
 	require.NoError(t, err)
-	renamed, err := store.EnsureSymbols(ctx, []market.Bar{{ISIN: "INE081A01020", Ticker: "TATASTL"}})
+	renamed, err := store.EnsureSymbols(ctx, []market.Bar{
+		{ISIN: "INE081A01020", Ticker: "TATASTL", Date: market.Day(2016, 6, 30)}})
 	require.NoError(t, err)
 	require.Equal(t, ids["INE081A01020"], renamed["INE081A01020"])
 
