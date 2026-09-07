@@ -13,6 +13,7 @@ import (
 
 	"github.com/HardikSJain/verdict-machine/internal/db"
 	"github.com/HardikSJain/verdict-machine/internal/market"
+	"github.com/HardikSJain/verdict-machine/internal/market/bhavcopy"
 	"github.com/HardikSJain/verdict-machine/internal/market/eod2"
 )
 
@@ -29,6 +30,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newVersionCmd())
 	root.AddCommand(newMigrateCmd())
 	root.AddCommand(newIngestCmd())
+	root.AddCommand(newBackfillCmd())
 	return root
 }
 
@@ -155,6 +157,46 @@ func newIngestCmd() *cobra.Command {
 	e.Flags().String("dir", "", "path to eod2_data (contains daily/ and isin_symbol_map.json)")
 	ingest.AddCommand(e)
 	return ingest
+}
+
+func newBackfillCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "backfill",
+		Short: "Download NSE bhavcopy archives into the store (source=nse-bhavcopy); resumable",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			fromS, _ := cmd.Flags().GetString("from")
+			toS, _ := cmd.Flags().GetString("to")
+			delay, _ := cmd.Flags().GetDuration("delay")
+			from, err := time.Parse("2006-01-02", fromS)
+			if err != nil {
+				return fmt.Errorf("--from: %w", err)
+			}
+			to := time.Now().UTC()
+			if toS != "" {
+				if to, err = time.Parse("2006-01-02", toS); err != nil {
+					return fmt.Errorf("--to: %w", err)
+				}
+			}
+			url, err := databaseURL(cmd)
+			if err != nil {
+				return err
+			}
+			pool, err := db.Connect(cmd.Context(), url)
+			if err != nil {
+				return err
+			}
+			defer pool.Close()
+			sum, err := bhavcopy.Backfill(cmd.Context(), market.NewStore(pool), bhavcopy.NewFetcher(), from, to, delay, cmd.ErrOrStderr())
+			fmt.Fprintf(cmd.OutOrStdout(), "backfill: fetched %d, no-file %d, errors %d, skipped %d, inserted %d bars\n",
+				sum.Fetched, sum.NoFile, sum.Errors, sum.Skipped, sum.Inserted)
+			return err
+		},
+	}
+	cmd.Flags().String("from", "2011-09-01", "first session date (YYYY-MM-DD)")
+	cmd.Flags().String("to", "", "last session date (default today)")
+	cmd.Flags().Duration("delay", 750*time.Millisecond, "pause between requests")
+	cmd.Flags().String("database-url", "", "Postgres URL (default $VERDICT_DATABASE_URL)")
+	return cmd
 }
 
 func main() {
