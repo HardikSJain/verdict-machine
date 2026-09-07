@@ -261,6 +261,31 @@ func newUniverseCmd() *cobra.Command {
 	return cmd
 }
 
+// parseIngestPin turns `--as-of-ingest` into the ingested_at pin every store
+// read takes. An empty value means now(), which is what the command did
+// before the flag existed and stays the default.
+//
+// Two forms are accepted because two different people type this. An RFC3339
+// timestamp is what a recorded run hands back, and it is the form that can
+// name a moment precisely enough to replay one. A bare YYYY-MM-DD is what a
+// human types, and it is read as midnight UTC rather than midnight local: a
+// pin that means a different instant depending on where the operator is
+// sitting is not a pin, and ingested_at is timestamptz.
+func parseIngestPin(s string) (time.Time, error) {
+	if s == "" {
+		return time.Now(), nil
+	}
+	if ts, err := time.Parse(time.RFC3339, s); err == nil {
+		return ts, nil
+	}
+	ts, err := time.Parse("2006-01-02", s)
+	if err != nil {
+		return time.Time{}, fmt.Errorf(
+			"want an RFC3339 timestamp (2026-09-07T18:30:00+05:30) or a date (2026-09-07, read as midnight UTC), got %q", s)
+	}
+	return ts, nil
+}
+
 // newEntitiesCmd groups the commands that operate on the canonical-entity
 // overlay. Only `check` exists so far, and deliberately: reading the map is
 // safe, minting it is not. `propose`, `link`, `apply` and `retract` land with
@@ -283,8 +308,23 @@ func newEntitiesCmd() *cobra.Command {
 			"than a proven error.\n\n" +
 			"What this cannot do: a wrong-but-DISJOINT merge -- a reverse-merger shell, a\n" +
 			"freed ticker reused by a different company -- is undetectable from inside the\n" +
-			"store, and no exit code here should be read as saying otherwise.",
+			"store, and no exit code here should be read as saying otherwise.\n\n" +
+			"--as-of-ingest evaluates the invariants against the map as the store knew it at\n" +
+			"a past moment rather than at now(). It is not a convenience. Migration 0004's\n" +
+			"flatness trigger reads the map as resolved at now(), so what it guarantees is\n" +
+			"that the CURRENT map is flat -- a row inserted with a backdated ingested_at can\n" +
+			"leave a past pin resolving through two hops while the present map looks clean.\n" +
+			"CheckEntityInvariants has always been pinned; this flag is what makes the pin\n" +
+			"reachable, so the map a recorded run actually read can be checked after the\n" +
+			"fact rather than only the map today's readers see.",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Parsed before the database URL is resolved, so a mistyped pin
+			// is reported as a mistyped pin rather than as a missing URL.
+			asOfIngestS, _ := cmd.Flags().GetString("as-of-ingest")
+			asOfIngest, err := parseIngestPin(asOfIngestS)
+			if err != nil {
+				return fmt.Errorf("--as-of-ingest: %w", err)
+			}
 			url, err := databaseURL(cmd)
 			if err != nil {
 				return err
@@ -295,7 +335,7 @@ func newEntitiesCmd() *cobra.Command {
 			}
 			defer pool.Close()
 
-			violations, err := market.NewStore(pool).CheckEntityInvariants(cmd.Context(), time.Now())
+			violations, err := market.NewStore(pool).CheckEntityInvariants(cmd.Context(), asOfIngest)
 			if err != nil {
 				return err
 			}
@@ -310,13 +350,18 @@ func newEntitiesCmd() *cobra.Command {
 				}
 				fmt.Fprintf(w, "%s\t%s\tentity %d\t%s\n", severity, v.Kind, v.EntityID, v.Detail)
 			}
-			fmt.Fprintf(w, "# %d violations, %d advisory\n", fatal, len(violations)-fatal)
+			// The pin is printed, always. An operator reading a clean report
+			// has to be able to tell WHICH map came back clean.
+			fmt.Fprintf(w, "# %d violations, %d advisory, map as of ingest %s\n",
+				fatal, len(violations)-fatal, asOfIngest.Format(time.RFC3339))
 			if fatal > 0 {
 				return fmt.Errorf("entities check: %d entity invariant violations", fatal)
 			}
 			return nil
 		},
 	}
+	check.Flags().String("as-of-ingest", "",
+		"evaluate the map as the store knew it at this ingest timestamp: RFC3339, or YYYY-MM-DD for midnight UTC (default now)")
 	entities.AddCommand(check)
 	return entities
 }

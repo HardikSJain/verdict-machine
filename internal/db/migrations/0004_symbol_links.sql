@@ -52,9 +52,27 @@ CREATE TRIGGER symbol_links_insert_only BEFORE UPDATE OR DELETE ON symbol_links
 
 -- Flatness is enforced at write time, not merely checked afterwards. The resolver does
 -- not follow hops, so a two-hop map would silently SPLIT one entity in two -- a wrong
--- answer with no error. History is append-only and each insert only changes resolution
--- from its own timestamp forward, so checking the currently-resolved map on insert makes
--- the map flat at every timestamp.
+-- answer with no error.
+--
+-- What this guarantees, stated exactly, because the guarantee is narrower than it looks:
+-- the map AS RESOLVED AT now() -- the latest row per symbol -- stays flat. Both SELECTs
+-- below read symbol_links with no bound relative to NEW.ingested_at, so what they inspect
+-- is the map today's readers see, not the map a reader pinned at NEW.ingested_at sees.
+-- Revision 1's comment here claimed the stronger "flat at every timestamp". That follows
+-- only while every row's ingested_at is non-decreasing: then the map at any past pin is a
+-- map this trigger already validated at the moment it was the current one, and induction
+-- carries it. ingested_at is a settable column with a default, and one BACKDATED row
+-- breaks the induction. Reproduced against this schema on 2026-09-08: insert B -> A at
+-- 10:00, retract B at 10:01, then insert C -> B with ingested_at 10:00:30. The trigger
+-- passes -- at now() B resolves to itself, so C -> B is one hop -- and entity_map_now is
+-- flat, while entity_map_at('10:00:45') returns C -> B and B -> A, two hops, for a read
+-- pinned inside that interval.
+--
+-- Bounding the trigger to NEW.ingested_at is NOT the fix: it would let a backdated row
+-- pass a check the present map would fail, trading a past hole for a present one. Nothing
+-- in Stage 1 writes a backdated row -- only the test helper can, and Stage 2's `apply`
+-- takes the default -- so the map at a past pin is checked after the fact instead, by I1:
+-- `verdict entities check --as-of-ingest <that timestamp>`. docs/DESIGN.md records the gap.
 -- +goose StatementBegin
 -- BOTH checks are guarded on the self-link case, and this is not cosmetic: revision 1's
 -- unguarded version REJECTED THE DESIGN'S OWN UNDO. A retraction row is constrained to

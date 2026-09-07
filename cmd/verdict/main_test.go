@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/require"
@@ -113,6 +114,72 @@ func TestBackfillCommand_MissingDatabaseURLReturnsError(t *testing.T) {
 
 	err := root.Execute()
 	require.EqualError(t, err, "set --database-url or VERDICT_DATABASE_URL")
+}
+
+// TestParseIngestPin covers the three forms `entities check --as-of-ingest`
+// accepts and the one it does not. The flag exists because migration 0004's
+// flatness trigger only guarantees the map is flat as resolved at now(), so
+// the map a past run actually read has to be checkable after the fact --
+// which means the pin has to survive being typed.
+func TestParseIngestPin(t *testing.T) {
+	before := time.Now()
+	got, err := parseIngestPin("")
+	require.NoError(t, err)
+	require.False(t, got.Before(before), "an empty pin is now(), which is what the command did before the flag existed")
+
+	got, err = parseIngestPin("2026-09-07T18:30:00+05:30")
+	require.NoError(t, err)
+	require.True(t, got.Equal(time.Date(2026, 9, 7, 13, 0, 0, 0, time.UTC)),
+		"an RFC3339 pin keeps its offset; this is the form a recorded run hands back")
+
+	got, err = parseIngestPin("2026-09-07")
+	require.NoError(t, err)
+	require.True(t, got.Equal(time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)),
+		"a bare date is midnight UTC and not midnight local: a pin whose instant depends on where the operator sits is not a pin")
+
+	_, err = parseIngestPin("last tuesday")
+	require.Error(t, err)
+	require.ErrorContains(t, err, "last tuesday", "the error has to quote what was typed")
+	require.ErrorContains(t, err, "RFC3339", "and say what would have worked")
+}
+
+// TestEntitiesCheckCommand_RejectsABadAsOfIngestBeforeTouchingTheDatabase
+// pins the ORDER of the two failures, not just that both exist. With no
+// database URL set, a bad --as-of-ingest must still be reported as a bad
+// --as-of-ingest: parsing it after resolving the URL would tell an operator
+// their connection string is missing when what is actually wrong is the
+// timestamp they typed, and would also mean a mistyped pin is only caught
+// after a connection is opened.
+func TestEntitiesCheckCommand_RejectsABadAsOfIngestBeforeTouchingTheDatabase(t *testing.T) {
+	t.Setenv("VERDICT_DATABASE_URL", "")
+	root := newRootCmd()
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&out)
+	root.SetArgs([]string{"entities", "check", "--as-of-ingest", "last tuesday"})
+
+	err := root.Execute()
+	require.Error(t, err)
+	require.ErrorContains(t, err, "--as-of-ingest")
+	require.NotContains(t, err.Error(), "VERDICT_DATABASE_URL",
+		"the pin is parsed first, so this never gets as far as needing a database")
+}
+
+// TestEntitiesCheckCommand_DeclaresAsOfIngestFlag pins the default: absent,
+// the command checks the map at now(), which is what it did before the flag
+// existed.
+func TestEntitiesCheckCommand_DeclaresAsOfIngestFlag(t *testing.T) {
+	entities := newEntitiesCmd()
+	var check *cobra.Command
+	for _, c := range entities.Commands() {
+		if c.Name() == "check" {
+			check = c
+		}
+	}
+	require.NotNil(t, check)
+	f := check.Flags().Lookup("as-of-ingest")
+	require.NotNil(t, f)
+	require.Equal(t, "", f.DefValue)
 }
 
 // TestEntitiesCheckCommand_MissingDatabaseURLReturnsError mirrors the migrate

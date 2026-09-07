@@ -652,6 +652,39 @@ places where that document says two things:
    split keeps the NSDL issuer code, so a mismatch is a question for a human, and making it
    fatal would train an operator to ignore the command.
 
+Two gaps in Stage 1's write-time guard, found by review after the code landed and recorded
+here rather than papered over. **Neither is a defect in the trigger**: the design specifies
+that SQL and Stage 1 implemented it. In both cases what was wrong was the claim being made
+about what the SQL guarantees, so the claim is what changed.
+
+1. **The flatness trigger guarantees the map is flat *as resolved at `now()`*, not "flat at
+   every timestamp".** Its two `SELECT`s read `symbol_links` with no bound relative to
+   `NEW.ingested_at`, so they inspect the map today's readers see. The stronger reading
+   holds only while every row's `ingested_at` is non-decreasing — then the map at a past pin
+   is one the trigger validated when it was current, and induction carries it — and a single
+   backdated row breaks the induction. Reproduced against the live schema: write `B -> A` at
+   10:00, retract `B` at 10:01, then insert `C -> B` with `ingested_at` 10:00:30. The trigger
+   accepts it (at `now()`, `B` resolves to itself), `entity_map_now` is flat, and
+   `entity_map_at('10:00:45')` returns `C -> B` and `B -> A`: two hops, for any read pinned
+   inside that interval. Bounding the trigger to `NEW.ingested_at` would not be a fix — it
+   would let a backdated row pass a check the *present* map would fail. Nothing in Stage 1
+   writes a backdated row (only the test helper can) and Stage 2's `apply` takes the default,
+   so the past map is checked after the fact instead: `verdict entities check
+   --as-of-ingest <timestamp>` runs I1/I2/I3 at any pin. `CheckEntityInvariants` was already
+   pinned; before that flag the pin was simply unreachable from the CLI.
+2. **§8.6's "re-point every member or none" is enforced in the ROOT direction only.** The
+   trigger raises that exact sentence when the row being written is an entity's root and
+   members still hang off it. It asks nothing about the *siblings* of the symbol being
+   written, so the literal case the clause names — move ONE member of a multi-member entity
+   to a different root, leave its siblings behind — is accepted: check 1 asks whether the new
+   root resolves elsewhere (it does not) and check 2 asks whether the moved symbol is itself
+   the entity of others (it is not). The result is the silent split §8.6 exists to prevent,
+   arriving from the member side, and nothing downstream catches it either: the resulting map
+   is flat, so I1 is silent, and the halves are disjoint by construction, so I2 is silent.
+   `TestSymbolLinksAcceptsMovingOneMemberOutOfAMultiMemberEntity` pins the accepted case in
+   the shape of §8.7b — a test that asserts nothing fires — and
+   `TestSymbolLinksRejectsATwoHopMap`'s doc comment no longer claims the general rule.
+
 The rollback caveat from the migration is worth repeating here: 0004's `Down` drops the read
 surface (the view, `entity_map_at`, the flatness trigger) and deliberately **not** the table
 or its rows. Once any run records a `snapshot_id` computed over `symbol_links`, dropping the

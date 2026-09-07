@@ -55,14 +55,28 @@ func linkRow(t *testing.T, pool *pgxpool.Pool, symbolID, entityID int64, boundar
 // company into two entities and every read afterwards is quietly wrong about
 // which bars belong together. There is no later check that would notice.
 //
-// The second half is the partial re-point. Moving an entity to a new root is
-// legal, but moving the ROOT while a member is still pointing at it leaves
-// that member stranded in an entity of one -- which is the same silent split
-// arriving by a different route. The trigger's rule is "re-point every member
-// or none", and the last phase asserts the "every" half really is reachable,
-// because a guard that rejected the legitimate move as well would be a
-// one-way door (design §0 records that revision 1's did exactly that to the
-// retraction path).
+// The second half is the partial re-point, and what this test proves about it
+// is narrower than the trigger's own error message says. Moving an entity to a
+// new root is legal, but moving the ROOT while a member is still pointing at
+// it leaves that member stranded in an entity of one -- the same silent split
+// arriving by a different route -- and the trigger rejects it with the
+// sentence "re-point every member or none".
+//
+// Every rejection asserted below writes the ROOT's own row. That is the only
+// direction the trigger enforces, and so the only direction this test is
+// evidence for: check 1 asks whether the row's new entity_id is itself
+// mapped elsewhere, and check 2 asks whether the row's own symbol_id is the
+// entity of others. Neither question is ever about the siblings of the symbol
+// being written, so the literal case §8.6's clause names -- moving ONE member
+// of a multi-member entity to a different root and leaving its siblings
+// behind -- is accepted. This test does NOT show otherwise, and
+// TestSymbolLinksAcceptsMovingOneMemberOutOfAMultiMemberEntity pins that
+// accepted case as the hole it is.
+//
+// The last phase asserts the "every" half really is reachable, because a
+// guard that rejected the legitimate move as well would be a one-way door
+// (design §0 records that revision 1's did exactly that to the retraction
+// path).
 func TestSymbolLinksRejectsATwoHopMap(t *testing.T) {
 	ctx := context.Background()
 	store := market.NewStore(testutil.Pool(t))
@@ -102,21 +116,107 @@ func TestSymbolLinksRejectsATwoHopMap(t *testing.T) {
 	require.NoError(t, tryLink(pool, root, other, boundary, time.Time{}),
 		"once no member points at the root any more, the root may follow them")
 
-	var members []int64
-	rows, err := pool.Query(ctx,
+	require.ElementsMatch(t, []int64{root, a, b}, linkedMembers(t, pool, other),
+		"the whole entity moved, not part of it")
+}
+
+// linkedMembers returns the symbol_ids the currently-resolved map points at
+// entityID -- the same DISTINCT ON the read path and the flatness trigger
+// both use. A root carries no link row of its own, so it appears here only
+// once it has been re-pointed at something.
+func linkedMembers(t *testing.T, pool *pgxpool.Pool, entityID int64) []int64 {
+	t.Helper()
+	rows, err := pool.Query(context.Background(),
 		`SELECT symbol_id FROM (
 		     SELECT DISTINCT ON (symbol_id) symbol_id, entity_id FROM symbol_links
 		     ORDER BY symbol_id, ingested_at DESC
-		 ) m WHERE entity_id = $1 ORDER BY symbol_id`, other)
+		 ) m WHERE entity_id = $1 ORDER BY symbol_id`, entityID)
 	require.NoError(t, err)
+	defer rows.Close()
+	var members []int64
 	for rows.Next() {
 		var id int64
 		require.NoError(t, rows.Scan(&id))
 		members = append(members, id)
 	}
-	rows.Close()
 	require.NoError(t, rows.Err())
-	require.ElementsMatch(t, []int64{root, a, b}, members, "the whole entity moved, not part of it")
+	return members
+}
+
+// TestSymbolLinksAcceptsMovingOneMemberOutOfAMultiMemberEntity documents a
+// hole, in the shape of design §8.7b: it is a test that asserts nothing
+// fires, and it exists so the hole stays visible after the paragraph
+// describing it is forgotten.
+//
+// §8.6's second clause is "re-point every member or none", and the trigger
+// raises exactly that sentence -- in the ROOT direction only. The literal case
+// the clause names is the member direction: take an entity with two members
+// hanging off one root and move ONE of them to a different root. The trigger
+// accepts it. Check 1 asks whether the new root resolves elsewhere, and it
+// does not; check 2 asks whether the symbol being moved is itself the entity
+// of other symbols, and it is not. Neither question is about the sibling left
+// behind, and there is no third question.
+//
+// What that produces is the outcome §8.6 exists to prevent, arriving from the
+// other side: one company's bars are now filed under two entity ids, every
+// read afterwards is quietly right about each half and wrong about the whole,
+// and nothing errors -- not the trigger, not I1 (the resulting map is FLAT;
+// splitting is not a flatness violation), not I2 (the halves are disjoint by
+// construction, which is what made them one entity), not the read path.
+//
+// This is deliberately not a fix. The design is the authority on the trigger's
+// SQL and Stage 1 implemented that SQL correctly; what was wrong was the claim
+// made about it. If the guard is ever widened to cover the member direction,
+// this test fails and says exactly what changed.
+func TestSymbolLinksAcceptsMovingOneMemberOutOfAMultiMemberEntity(t *testing.T) {
+	ctx := context.Background()
+	store := market.NewStore(testutil.Pool(t))
+	pool := store.Pool()
+	d := market.Day(2020, 1, 2)
+	boundary := market.Day(2021, 3, 1)
+
+	ids, err := store.EnsureSymbols(ctx, []market.Bar{
+		{ISIN: "INE000R01011", Ticker: "ROOT", Date: d},
+		{ISIN: "INE000A01012", Ticker: "AAA", Date: d},
+		{ISIN: "INE000B01013", Ticker: "BBB", Date: d},
+		{ISIN: "INE000N01015", Ticker: "NEWROOT", Date: d},
+	})
+	require.NoError(t, err)
+	root, a, b, newroot := ids["INE000R01011"], ids["INE000A01012"], ids["INE000B01013"], ids["INE000N01015"]
+
+	// One entity, three symbols: root, and two members hanging off it.
+	linkRow(t, pool, a, root, boundary)
+	linkRow(t, pool, b, root, boundary)
+	require.ElementsMatch(t, []int64{a, b}, linkedMembers(t, pool, root),
+		"the fixture is a multi-member entity, which is the only shape the clause is about")
+
+	// The counterexample: move A alone. This is what "re-point every member or
+	// none" forbids in words, and it is accepted.
+	require.NoError(t, tryLink(pool, a, newroot, boundary, time.Time{}),
+		"the trigger only ever asks about the row being written and the root it names; moving one member out of a multi-member entity is asked about by neither check")
+
+	require.Equal(t, []int64{a}, linkedMembers(t, pool, newroot),
+		"A now belongs to a different entity")
+	require.Equal(t, []int64{b}, linkedMembers(t, pool, root),
+		"and B is left behind: one company, two entity ids, no error anywhere")
+
+	// The split map is FLAT, which is why no later check catches it either.
+	// A -> newroot and B -> root are both one hop; I1 asks about transitivity
+	// and has nothing to report, and I2 asks about date overlap between
+	// members, which a split can only ever reduce. (I3 does fire, on both
+	// halves, but only because these fixture ISINs are four unrelated issuer
+	// codes -- it is advisory and it would be silent on the real case, a
+	// genuine multi-ISIN company whose members share a prefix.)
+	violations, err := store.CheckEntityInvariants(ctx, time.Now())
+	require.NoError(t, err)
+	var defects []market.Violation
+	for _, v := range violations {
+		if !v.Advisory() {
+			defects = append(defects, v)
+		}
+	}
+	require.Empty(t, defects,
+		"neither invariant is a second line of defence here: a split entity is flat, and disjoint, which is all I1 and I2 measure")
 }
 
 // TestEntityMapAtIsPinnedAndEntityMapNowIsNot is design §8.15.
