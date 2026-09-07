@@ -232,3 +232,41 @@ func TestUniverseAsOf_TickerIsPointInTimeOnBothAxes(t *testing.T) {
 	require.Equal(t, "SONACOMS", tickerAsOf(old2015, time.Now()))
 	require.Equal(t, "JTEKTINDIA", tickerAsOf(new2016, time.Now()), "correcting 2015 does not relabel 2016")
 }
+
+// TestUniverseAsOf_EmptyRankingStillReportsTheWindow pins the case that made
+// the realised session count and the ranking share one statement: a window
+// that is real but ranks nobody. A caller handed zero members needs the
+// window most of all, because that is the only thing that separates "the
+// store holds these sessions and nothing in them qualified" from "the store
+// holds nothing here at all" -- and the two call for opposite responses, one
+// a filter to loosen and the other a backfill to run.
+//
+// The bars below are series BE, so the window's sessions exist but
+// window_rows (series = 'EQ') is empty. Collapsing the two queries into one
+// is what put this at risk: a plain inner join to the ranking would return no
+// rows at all and take the session count down with it.
+func TestUniverseAsOf_EmptyRankingStillReportsTheWindow(t *testing.T) {
+	ctx := context.Background()
+	store := market.NewStore(testutil.Pool(t))
+
+	var bars []market.Bar
+	for _, d := range []time.Time{market.Day(2015, 6, 29), market.Day(2015, 6, 30)} {
+		b := barAt("INE081A01020", "TATASTEEL", d, 100)
+		b.Series = "BE"
+		bars = append(bars, b)
+	}
+	_, err := store.InsertBars(ctx, market.SourceBhavcopy, bars)
+	require.NoError(t, err)
+
+	u, err := store.UniverseAsOf(ctx, market.SourceBhavcopy, market.Day(2015, 6, 30), 2, 500, time.Now())
+	require.NoError(t, err)
+	require.Empty(t, u.Members, "no EQ series in the window, so nobody is ranked")
+	require.Equal(t, 2, u.Sessions, "the window is still two real sessions and must say so")
+
+	// A store with nothing in range reports a zero window, which is the state
+	// the empty ranking above has to stay distinguishable from.
+	none, err := store.UniverseAsOf(ctx, market.SourceBhavcopy, market.Day(2001, 6, 30), 2, 500, time.Now())
+	require.NoError(t, err)
+	require.Empty(t, none.Members)
+	require.Equal(t, 0, none.Sessions)
+}

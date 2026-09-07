@@ -28,9 +28,13 @@ type Universe struct {
 	Members  []UniverseMember
 }
 
-// windowCTE defines the point-in-time window. Both the ranking query and the
-// realised-session count are built from this one definition so the count can
-// never describe a different window from the one that was ranked.
+// windowCTE defines the point-in-time window. The ranking and the realised
+// session count are read from this one definition in one statement, so the
+// count can never describe a different window from the one that was ranked --
+// not a different definition of it, and not a different snapshot of it. Two
+// statements would be two snapshots, and this project ingests concurrently
+// with reads, so a bar landing between them would make the reported window a
+// description of a window nothing was ranked over.
 //
 // $1 source, $2 asOf, $3 since, $4 asOfIngest, $5 lookbackDays.
 const windowCTE = `
@@ -69,13 +73,19 @@ func (s *Store) UniverseAsOf(ctx context.Context, source string, asOf time.Time,
 	// Bound the scan: lookbackDays sessions never span more than 2x that in calendar days plus holidays.
 	since := asOf.AddDate(0, 0, -(lookbackDays*2 + 14))
 
-	var u Universe
-	if err := s.pool.QueryRow(ctx, windowCTE+`
-		SELECT count(*)::int FROM days`,
-		source, asOf, since, asOfIngest, lookbackDays).Scan(&u.Sessions); err != nil {
-		return Universe{}, fmt.Errorf("universe window: %w", err)
-	}
-
+	// The session count rides along as a column of the ranking rather than
+	// coming from a second query: one statement is one snapshot, and the
+	// window a caller is told about is then necessarily the window its members
+	// were ranked over. `w` is a single row, so cross-joining it repeats the
+	// count on every member and changes nothing else.
+	//
+	// It is a LEFT JOIN out of `w` and not into it because a universe can
+	// legitimately rank nobody -- a window whose sessions hold no EQ series,
+	// or where no symbol clears the 80% presence rule -- and that caller needs
+	// the realised window most of all, to tell "the window is real and empty"
+	// from "there is no window here". So `w` is the driving side and produces
+	// its row either way; the member columns come back NULL when `ranked` is
+	// empty, and that one row is skipped below.
 	rows, err := s.pool.Query(ctx, windowCTE+`, window_rows AS (
 			SELECT l.symbol_id, COALESCE(l.turnover, l.close * l.volume)::float8 AS turnover
 			FROM latest l JOIN days USING (date)
@@ -88,20 +98,33 @@ func (s *Store) UniverseAsOf(ctx context.Context, source string, asOf time.Time,
 			GROUP BY symbol_id
 			HAVING count(*) >= ceil(0.8 * (SELECT count(*) FROM days))
 		)
-		SELECT r.symbol_id, sym.isin, sym.ticker, r.median_turnover, r.days_present
-		FROM ranked r
-		JOIN LATERAL `+symbolLabelLateral("r.symbol_id", "$2", "$4")+` sym ON true
-		ORDER BY r.median_turnover DESC, sym.ticker
+		SELECT w.sessions, r.symbol_id, sym.isin, sym.ticker, r.median_turnover, r.days_present
+		FROM (SELECT count(*)::int AS sessions FROM days) w
+		LEFT JOIN ranked r ON true
+		LEFT JOIN LATERAL `+symbolLabelLateral("r.symbol_id", "$2", "$4")+` sym ON true
+		ORDER BY r.median_turnover DESC NULLS LAST, sym.ticker
 		LIMIT $6`, source, asOf, since, asOfIngest, lookbackDays, n)
 	if err != nil {
 		return Universe{}, fmt.Errorf("universe: %w", err)
 	}
 	defer rows.Close()
+	var u Universe
 	for rows.Next() {
 		var m UniverseMember
-		if err := rows.Scan(&m.SymbolID, &m.ISIN, &m.Ticker, &m.MedianTurnover, &m.DaysPresent); err != nil {
+		// Nullable only for the no-members row described above; when `ranked`
+		// has anything at all, every one of these is present on every row.
+		var symbolID *int64
+		var isin, ticker *string
+		var median *float64
+		var daysPresent *int
+		if err := rows.Scan(&u.Sessions, &symbolID, &isin, &ticker, &median, &daysPresent); err != nil {
 			return Universe{}, err
 		}
+		if symbolID == nil {
+			continue
+		}
+		m.SymbolID, m.ISIN, m.Ticker = *symbolID, *isin, *ticker
+		m.MedianTurnover, m.DaysPresent = *median, *daysPresent
 		u.Members = append(u.Members, m)
 	}
 	if err := rows.Err(); err != nil {
