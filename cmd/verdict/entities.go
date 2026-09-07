@@ -359,14 +359,19 @@ func newEntitiesRetractCmd() *cobra.Command {
 // map does not carry. It returns the number of accepted candidates missing
 // from the map, which is what makes `check` exit non-zero.
 //
-// propose's own G4a refusal is deliberately not softened here. It fires when
-// a date inside the archive span is neither 'ok' nor 'no-file' in
-// ingest_log, and it means the candidate set cannot be trusted: G4 counts
-// sessions out of bars, so a real NSE session the store never fetched reads
-// as "zero sessions between" and a demerger passes every gate. A monthly
-// check that answered "no new candidates" from an archive with a hole in it
-// would be worse than no check at all, so the hole IS the finding and the
-// command fails on it.
+// propose's own G4a refusal is deliberately not softened here. It fires on a
+// HOLE -- a date inside the archive span left unlogged or 'error' after the
+// last fetch for the source had the chance to settle it -- and a hole means
+// the candidate set cannot be trusted: G4 counts sessions out of bars, so a
+// real NSE session the store never fetched reads as "zero sessions between"
+// and a demerger passes every gate. A monthly check that answered "no new
+// candidates" from an archive with a hole in it would be worse than no check
+// at all, so the hole IS the finding and the command fails on it.
+//
+// The recent unlogged tail that backfill leaves on purpose is pending rather
+// than a hole and does not stop the run; a candidate whose own gap dates are
+// unsettled fails its own G4a and is quarantined, so nothing is admitted by
+// the narrower refusal.
 func scanCandidates(ctx context.Context, pool *pgxpool.Pool, store *market.Store, asOfIngest time.Time, w io.Writer) (int, error) {
 	_, cands, _, err := entities.Propose(ctx, pool, entities.ProposeOptions{AsOfIngest: asOfIngest})
 	if err != nil {

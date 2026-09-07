@@ -359,9 +359,12 @@ func newEntitiesCmd() *cobra.Command {
 			"and each one drops a name out of the point-in-time universe around its boundary\n" +
 			"until a roster PR is merged and applied. Quarantined pairs are printed as a\n" +
 			"count and do not fail the command -- that queue is 181 deep and is not going to\n" +
-			"be worked. The scan inherits G4a, so it also exits non-zero while any date\n" +
-			"inside the archive span is unsettled in ingest_log: with a hole in the archive\n" +
-			"a demerger reads as adjacent and 'no new candidates' would be a false negative.\n" +
+			"be worked. The scan inherits G4a, so it also exits non-zero when the archive\n" +
+			"holds a hole -- an ingest_log date left unlogged or 'error' after the last fetch\n" +
+			"had the chance to settle it. With a hole in the archive a demerger reads as\n" +
+			"adjacent and 'no new candidates' would be a false negative. The recent unlogged\n" +
+			"tail backfill leaves on purpose is pending rather than a hole and does not stop\n" +
+			"the run; a candidate whose own gap dates are unsettled is quarantined anyway.\n" +
 			"--skip-candidates runs the invariants alone, which is the right thing mid-backfill\n" +
 			"and on a store with no bars.\n\n" +
 			"What this cannot do: a wrong-but-DISJOINT merge -- a reverse-merger shell, a\n" +

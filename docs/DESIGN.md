@@ -370,9 +370,16 @@ Monthly, on a settled archive:
 1. `verdict entities check` -- runs I1/I2/I3 against the map, then re-generates candidates
    read-only and reports every pair the gates would accept that the map does not carry.
    **It exits non-zero on any accepted candidate the map is missing, and on any unsettled
-   `ingest_log` date inside the archive span** (it inherits gate G4a from `propose`: with a
-   hole in the archive a demerger reads as adjacent, and "no new candidates" from an
-   incomplete archive is a false negative rather than an answer). Quarantined pairs are
+   `ingest_log` date the archive had the chance to settle and did not** (it inherits gate
+   G4a from `propose`: with a hole in the archive a demerger reads as adjacent, and "no new
+   candidates" from an incomplete archive is a false negative rather than an answer). G4a's
+   "hole" is precise and worth knowing before trusting a green run: a date is a hole when it
+   is unlogged or `'error'` **and** the last fetch for the source happened after that date's
+   settlement horizon. The recent unlogged tail `backfill` deliberately leaves behind is
+   *pending*, not a hole, and so is every date in a store that has never been fetched at
+   all -- in both cases the run proceeds, and a candidate whose own gap dates are unsettled
+   is quarantined rather than accepted, so it cannot pass a gate it did not satisfy.
+   Quarantined pairs are
    printed as a count and do not fail the run -- that queue is 181 deep and is not going to
    be worked, and a permanently red check is one an operator stops reading. Advisory I3
    findings likewise print without failing.
@@ -1094,9 +1101,14 @@ same spirit as the two stages before it.
    not carry -- a link the gates would make, that nothing has made -- fails the run. The
    quarantined count is printed on every run so the queue stays visible.
 3. **The candidate scan inherits G4a rather than softening it**, so `check` also exits
-   non-zero while any date inside the archive span is unsettled in `ingest_log`. That is the
-   second half of §9's parenthetical, and it means one command covers both conditions the
-   monthly item names. The invariant report is printed *before* the scan runs, so a
+   non-zero when the archive holds a hole -- an `ingest_log` date that was unlogged or
+   `'error'` after the last fetch had the chance to settle it. That is the second half of
+   §9's parenthetical, and it means one command covers both conditions the monthly item
+   names. It is narrower than "any unsettled date", and deliberately so: Stage 2 split
+   holes from the pending tail because `backfill` leaves a recent 404 unlogged on purpose,
+   and treating that tail as a hole would make the roster ungeneratable for a reason that
+   is a clock rather than a gap. A candidate whose own gap dates are unsettled is
+   quarantined either way, so the narrower refusal does not admit anything. The invariant report is printed *before* the scan runs, so a
    mid-backfill refusal does not withhold an answer that was already computed.
 4. **`Store.EntityMapAt` is new and is not in the design's method list.** It reads the
    published `entity_map_at(ts)` function rather than a fourth hand-rolled `DISTINCT ON`, so
