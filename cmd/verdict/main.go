@@ -222,13 +222,18 @@ func newUniverseCmd() *cobra.Command {
 				return err
 			}
 			defer pool.Close()
-			members, err := market.NewStore(pool).UniverseAsOf(cmd.Context(), source, asOf, lookback, n, time.Now())
+			u, err := market.NewStore(pool).UniverseAsOf(cmd.Context(), source, asOf, lookback, n, time.Now())
 			if err != nil {
 				return err
 			}
 			w := cmd.OutOrStdout()
+			// The realised window comes first: a store that holds fewer than
+			// --lookback sessions ranks on what it has, and the rows below
+			// look exactly the same either way.
+			fmt.Fprintf(w, "# as-of %s, source %s, window %d of %d sessions requested, %d symbols\n",
+				asOf.Format("2006-01-02"), source, u.Sessions, lookback, len(u.Members))
 			fmt.Fprintf(w, "rank\tticker\tisin\tmedian_turnover_inr\tdays\n")
-			for i, m := range members {
+			for i, m := range u.Members {
 				fmt.Fprintf(w, "%d\t%s\t%s\t%.0f\t%d\n", i+1, m.Ticker, m.ISIN, m.MedianTurnover, m.DaysPresent)
 			}
 			return nil

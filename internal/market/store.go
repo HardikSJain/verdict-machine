@@ -27,35 +27,109 @@ func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
 // Pool exposes the underlying pool for tests and ad-hoc queries.
 func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 
+// symbolRegistryLockKey is the fixed Postgres advisory-lock key EnsureSymbols
+// holds for the length of its transaction. Registering an ISIN is a
+// read-then-insert: snapshot the versions that exist, decide from that
+// snapshot whether to mint a symbol_id, then insert. Two callers doing that
+// concurrently -- `verdict backfill` and `verdict ingest eod2`, the two
+// commands the README puts side by side, run as separate processes over a
+// backfill that takes hours -- both read "this ISIN is unknown" and both
+// mint, and every constraint on the table passes: PRIMARY KEY
+// (symbol_id, ingested_at) and UNIQUE (isin, ingested_at) are both satisfied
+// because the two autocommit transactions get different now() values. One
+// ISIN then owns two symbol_ids permanently. Every market table is
+// insert-only, so there is no UPDATE or DELETE available to repair it: the
+// company is two companies forever, its bars split across both ids,
+// UniverseAsOf returns the name twice and mis-ranks the window, and
+// BarsForDate returns two bars for one company on one date.
+//
+// A transaction alone does not close this -- read committed lets both
+// snapshots predate both inserts -- so the snapshot and the inserts are made
+// atomic with respect to any other registrar by taking this lock first.
+const symbolRegistryLockKey = 84031178
+
+// symbolVersion is one row of a symbol's ticker history.
+type symbolVersion struct {
+	id        int64
+	ticker    string
+	validFrom time.Time
+}
+
+// versionAt returns the version in force on date d: the latest one whose
+// valid_from is at or before d, or, when d predates every recorded version,
+// the earliest one. versions must be sorted ascending by
+// (valid_from, ingested_at).
+func versionAt(versions []symbolVersion, d time.Time) symbolVersion {
+	chosen := versions[0]
+	for _, v := range versions {
+		if v.validFrom.After(d) {
+			break
+		}
+		chosen = v
+	}
+	return chosen
+}
+
 // EnsureSymbols registers every distinct ISIN in bars and returns ISIN -> symbol_id.
 // A known ISIN whose ticker changed gets a new version row with the same symbol_id.
+//
+// The ticker a batch reports is recorded against the latest bar date in that
+// batch for the ISIN -- the session the file describes -- not against the
+// moment the row was written. That is what makes "what was this symbol called
+// on this date" answerable, and it is what stops the ticker oscillating when
+// an eod2 ingest (which maps every year of a ticker's history to today's
+// ticker) and a historical backfill interleave: a new version is written only
+// when the incoming ticker differs from the one in force *on that session
+// date*, so replaying an old session never re-asserts an old name over a
+// newer one.
 func (s *Store) EnsureSymbols(ctx context.Context, bars []Bar) (map[string]int64, error) {
-	want := map[string]string{} // isin -> ticker
+	type observation struct {
+		ticker    string
+		validFrom time.Time
+	}
+	want := map[string]observation{}
 	for _, b := range bars {
 		if b.ISIN == "" {
 			return nil, fmt.Errorf("bar %s %s has no ISIN", b.Ticker, b.Date.Format("2006-01-02"))
 		}
-		want[b.ISIN] = b.Ticker
+		if prev, ok := want[b.ISIN]; !ok || b.Date.After(prev.validFrom) {
+			want[b.ISIN] = observation{ticker: b.Ticker, validFrom: b.Date}
+		}
+	}
+	if len(want) == 0 {
+		return map[string]int64{}, nil
+	}
+	isins := make([]string, 0, len(want))
+	for isin := range want {
+		isins = append(isins, isin)
 	}
 
-	type current struct {
-		id     int64
-		ticker string
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
 	}
-	known := map[string]current{}
-	rows, err := s.pool.Query(ctx,
-		`SELECT DISTINCT ON (isin) isin, symbol_id, ticker FROM symbols ORDER BY isin, ingested_at DESC`)
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(symbolRegistryLockKey)); err != nil {
+		return nil, fmt.Errorf("symbols lock: %w", err)
+	}
+
+	history := map[string][]symbolVersion{}
+	rows, err := tx.Query(ctx,
+		`SELECT isin, symbol_id, ticker, valid_from FROM symbols
+		 WHERE isin = ANY($1) ORDER BY isin, valid_from, ingested_at`, isins)
 	if err != nil {
 		return nil, fmt.Errorf("symbols: %w", err)
 	}
 	for rows.Next() {
-		var isin, ticker string
-		var id int64
-		if err := rows.Scan(&isin, &id, &ticker); err != nil {
+		var isin string
+		var v symbolVersion
+		var from time.Time
+		if err := rows.Scan(&isin, &v.id, &v.ticker, &from); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		known[isin] = current{id: id, ticker: ticker}
+		v.validFrom = Day(from.Year(), from.Month(), from.Day())
+		history[isin] = append(history[isin], v)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
@@ -63,25 +137,31 @@ func (s *Store) EnsureSymbols(ctx context.Context, bars []Bar) (map[string]int64
 	}
 
 	ids := map[string]int64{}
-	for isin, ticker := range want {
-		cur, ok := known[isin]
-		switch {
-		case !ok:
+	for isin, obs := range want {
+		versions := history[isin]
+		if len(versions) == 0 {
 			var id int64
-			if err := s.pool.QueryRow(ctx,
-				`INSERT INTO symbols (isin, ticker) VALUES ($1, $2) RETURNING symbol_id`, isin, ticker).Scan(&id); err != nil {
+			if err := tx.QueryRow(ctx,
+				`INSERT INTO symbols (isin, ticker, valid_from) VALUES ($1, $2, $3) RETURNING symbol_id`,
+				isin, obs.ticker, obs.validFrom).Scan(&id); err != nil {
 				return nil, fmt.Errorf("symbols insert %s: %w", isin, err)
 			}
 			ids[isin] = id
-		case cur.ticker != ticker:
-			if _, err := s.pool.Exec(ctx,
-				`INSERT INTO symbols (symbol_id, isin, ticker) VALUES ($1, $2, $3)`, cur.id, isin, ticker); err != nil {
-				return nil, fmt.Errorf("symbols rename %s: %w", isin, err)
-			}
-			ids[isin] = cur.id
-		default:
-			ids[isin] = cur.id
+			continue
 		}
+		// Every version of one ISIN carries the same symbol_id, so any row answers.
+		ids[isin] = versions[0].id
+		if versionAt(versions, obs.validFrom).ticker == obs.ticker {
+			continue
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO symbols (symbol_id, isin, ticker, valid_from) VALUES ($1, $2, $3, $4)`,
+			versions[0].id, isin, obs.ticker, obs.validFrom); err != nil {
+			return nil, fmt.Errorf("symbols rename %s: %w", isin, err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
 	}
 	return ids, nil
 }
@@ -214,18 +294,43 @@ func (s *Store) LoggedDates(ctx context.Context, source string) (map[time.Time]b
 	return done, rows.Err()
 }
 
+// symbolLabelLateral builds the LATERAL subquery that resolves a symbol_id to
+// the (isin, ticker) it carried on one session date, as the store knew it at
+// one ingest timestamp. Those are two independent axes and a point-in-time
+// store needs both: ingested_at answers "what did we believe then" (the audit
+// trail), valid_from answers "what was this called then" (market time).
+//
+// The ordering picks the latest version in force at or before dateExpr; when
+// the bar predates every recorded version -- a source that only ever reports
+// today's ticker, such as eod2, registers the symbol at today's date -- it
+// falls back to the earliest recorded version rather than dropping the row.
+// Ties on valid_from break on ingested_at DESC, which is how a same-session
+// correction supersedes the version it corrects.
+//
+// idExpr, dateExpr and ingestExpr are SQL fragments written by this file,
+// never values from outside it.
+func symbolLabelLateral(idExpr, dateExpr, ingestExpr string) string {
+	return `(
+		SELECT isin, ticker FROM symbols
+		WHERE symbol_id = ` + idExpr + ` AND ingested_at <= ` + ingestExpr + `
+		ORDER BY (valid_from <= ` + dateExpr + `) DESC,
+		         CASE WHEN valid_from <= ` + dateExpr + ` THEN valid_from END DESC,
+		         valid_from,
+		         ingested_at DESC
+		LIMIT 1
+	)`
+}
+
 // BarsForDate returns the latest version of every bar for one source and date,
-// as it was known at asOfIngest (rows ingested later are invisible).
+// as it was known at asOfIngest (rows ingested later are invisible). Each bar
+// carries the ticker its symbol held on that session date, not today's.
 func (s *Store) BarsForDate(ctx context.Context, source string, date, asOfIngest time.Time) ([]Bar, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT ON (b.symbol_id) sym.isin, sym.ticker, b.series, b.date,
 		       b.open::float8, b.high::float8, b.low::float8, b.close::float8, b.volume,
 		       b.turnover::float8, b.delivery_qty
 		FROM bars b
-		JOIN LATERAL (
-			SELECT isin, ticker FROM symbols WHERE symbol_id = b.symbol_id AND ingested_at <= $3
-			ORDER BY ingested_at DESC LIMIT 1
-		) sym ON true
+		JOIN LATERAL `+symbolLabelLateral("b.symbol_id", "b.date", "$3")+` sym ON true
 		WHERE b.source = $1 AND b.date = $2 AND b.ingested_at <= $3
 		ORDER BY b.symbol_id, b.ingested_at DESC`, source, date, asOfIngest)
 	if err != nil {

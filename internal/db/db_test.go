@@ -43,7 +43,8 @@ func TestMigrateCreatesInsertOnlyMarketTables(t *testing.T) {
 		require.True(t, exists, "table %s", table)
 	}
 
-	_, err := pool.Exec(ctx, "INSERT INTO symbols (isin, ticker) VALUES ('INE081A01020', 'TATASTEEL')")
+	_, err := pool.Exec(ctx,
+		"INSERT INTO symbols (isin, ticker, valid_from) VALUES ('INE081A01020', 'TATASTEEL', '2015-06-30')")
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, "UPDATE symbols SET ticker = 'X' WHERE isin = 'INE081A01020'")
 	require.ErrorContains(t, err, "insert-only")

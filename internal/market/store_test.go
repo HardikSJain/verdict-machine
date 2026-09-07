@@ -2,6 +2,8 @@ package market_test
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -126,4 +128,146 @@ func closeOf(bars []market.Bar, ticker string) float64 {
 		}
 	}
 	return -1
+}
+
+// barAt is a minimal, self-consistent EQ bar: enough to be inserted, ranked
+// and labelled, with the ticker and the session date being the parts under test.
+func barAt(isin, ticker string, d time.Time, close float64) market.Bar {
+	turnover := close * 1000
+	return market.Bar{ISIN: isin, Ticker: ticker, Series: "EQ", Date: d,
+		Open: close, High: close, Low: close, Close: close, Volume: 1000, Turnover: &turnover}
+}
+
+// TestBarsForDate_TickerIsTheOneInForceOnThatSession pins the as-of-calendar
+// axis. Before symbols carried valid_from, both readers resolved the label
+// with `ORDER BY ingested_at DESC LIMIT 1`, so every bar of every date was
+// labelled with whichever version happened to land last -- and interleaving
+// `ingest eod2` (which maps a ticker's whole history to today's name) with a
+// `backfill` still walking 2015 made that oscillate. A point-in-time store
+// that cannot say what a symbol was called on a date is not point-in-time.
+func TestBarsForDate_TickerIsTheOneInForceOnThatSession(t *testing.T) {
+	ctx := context.Background()
+	store := market.NewStore(testutil.Pool(t))
+	const isin = "INE095I01015"
+	old2015 := market.Day(2015, 6, 30)
+	new2016 := market.Day(2016, 6, 30)
+
+	_, err := store.InsertBars(ctx, market.SourceBhavcopy, []market.Bar{barAt(isin, "SONASTEER", old2015, 100)})
+	require.NoError(t, err)
+	_, err = store.InsertBars(ctx, market.SourceBhavcopy, []market.Bar{barAt(isin, "JTEKTINDIA", new2016, 120)})
+	require.NoError(t, err)
+
+	label := func(d time.Time) string {
+		bars, err := store.BarsForDate(ctx, market.SourceBhavcopy, d, time.Now())
+		require.NoError(t, err)
+		require.Len(t, bars, 1)
+		return bars[0].Ticker
+	}
+	require.Equal(t, "SONASTEER", label(old2015), "a 2015 bar carries the 2015 ticker, not today's")
+	require.Equal(t, "JTEKTINDIA", label(new2016))
+
+	versions := func() int {
+		var n int
+		require.NoError(t, store.Pool().QueryRow(ctx,
+			"SELECT count(*) FROM symbols WHERE isin = $1", isin).Scan(&n))
+		return n
+	}
+	require.Equal(t, 2, versions(), "one rename, two versions")
+
+	// Replaying the two sessions in either order -- what two ingest processes
+	// running side by side amount to -- must write no further versions and
+	// change no label.
+	for i := 0; i < 3; i++ {
+		_, err = store.InsertBars(ctx, market.SourceBhavcopy, []market.Bar{barAt(isin, "SONASTEER", old2015, 100)})
+		require.NoError(t, err)
+		_, err = store.InsertBars(ctx, market.SourceBhavcopy, []market.Bar{barAt(isin, "JTEKTINDIA", new2016, 120)})
+		require.NoError(t, err)
+	}
+	require.Equal(t, 2, versions(), "replaying an old session must not re-assert the old name over the newer one")
+	require.Equal(t, "SONASTEER", label(old2015))
+	require.Equal(t, "JTEKTINDIA", label(new2016))
+}
+
+// TestBarsForDate_TickerIsAsOfIngestTimestamp pins the other axis: the
+// `symbols.ingested_at <= asOfIngest` predicate in the reader's lateral join.
+// Replacing it with `(ingested_at <= $3 OR true)` left the whole suite green
+// before this test existed: the write side's rename behaviour was covered,
+// the read side's was not.
+func TestBarsForDate_TickerIsAsOfIngestTimestamp(t *testing.T) {
+	ctx := context.Background()
+	store := market.NewStore(testutil.Pool(t))
+	const isin = "INE095I01015"
+	d := market.Day(2015, 6, 30)
+
+	_, err := store.InsertBars(ctx, market.SourceBhavcopy, []market.Bar{barAt(isin, "OLD", d, 100)})
+	require.NoError(t, err)
+	firstIngest := time.Now()
+	time.Sleep(20 * time.Millisecond)
+
+	// A corrected file for that same session, carrying a different ticker.
+	_, err = store.EnsureSymbols(ctx, []market.Bar{{ISIN: isin, Ticker: "NEW", Date: d}})
+	require.NoError(t, err)
+
+	before, err := store.BarsForDate(ctx, market.SourceBhavcopy, d, firstIngest)
+	require.NoError(t, err)
+	require.Len(t, before, 1)
+	require.Equal(t, "OLD", before[0].Ticker, "as-of an earlier ingest, the label is the one the store held then")
+
+	after, err := store.BarsForDate(ctx, market.SourceBhavcopy, d, time.Now())
+	require.NoError(t, err)
+	require.Len(t, after, 1)
+	require.Equal(t, "NEW", after[0].Ticker)
+}
+
+// TestEnsureSymbols_ConcurrentRegistrationKeepsOneSymbolID reproduces the
+// race the old non-transactional loop had: two callers both read "this ISIN
+// is unknown" and both mint, and every constraint on the table passes because
+// their autocommit transactions get different now() values. Since every
+// market table is insert-only there is no UPDATE or DELETE to repair it -- the
+// company would be two companies forever. `verdict backfill` and
+// `verdict ingest eod2` are separate processes the README puts side by side,
+// and a 15-year backfill runs for hours, so the window is wide, not narrow.
+func TestEnsureSymbols_ConcurrentRegistrationKeepsOneSymbolID(t *testing.T) {
+	ctx := context.Background()
+	store := market.NewStore(testutil.Pool(t))
+
+	// Several rounds of a fresh ISIN, because the window is a scheduling
+	// accident: one round can happen to serialize on its own.
+	const (
+		callers = 4
+		rounds  = 25
+	)
+	for round := 0; round < rounds; round++ {
+		isin := fmt.Sprintf("INE111Z%05d", round)
+		bars := []market.Bar{{ISIN: isin, Ticker: "NEWCO", Date: market.Day(2024, 1, 2)}}
+
+		ids := make([]int64, callers)
+		errs := make([]error, callers)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := 0; i < callers; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				got, err := store.EnsureSymbols(ctx, bars)
+				errs[i] = err
+				if err == nil {
+					ids[i] = got[isin]
+				}
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+
+		for i := range errs {
+			require.NoError(t, errs[i], "round %d, caller %d", round, i)
+			require.Equal(t, ids[0], ids[i], "round %d: every caller must be told the same symbol_id", round)
+		}
+		var distinct int
+		require.NoError(t, store.Pool().QueryRow(ctx,
+			"SELECT count(DISTINCT symbol_id) FROM symbols WHERE isin = $1", isin).Scan(&distinct))
+		require.Equal(t, 1, distinct,
+			"round %d: one ISIN owns exactly one symbol_id, whatever the concurrency", round)
+	}
 }
