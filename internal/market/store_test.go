@@ -57,6 +57,38 @@ func TestInsertBars_IsIdempotentAndVersioned(t *testing.T) {
 	}
 }
 
+func TestInsertBars_CollapsesIdenticalDuplicateInSameBatch(t *testing.T) {
+	ctx := context.Background()
+	store := market.NewStore(testutil.Pool(t))
+
+	bar := sampleBars()[0]
+	n, err := store.InsertBars(ctx, market.SourceBhavcopy, []market.Bar{bar, bar})
+	require.NoError(t, err, "a repeated identical line in the same batch must not fail the insert")
+	require.Equal(t, 1, n, "the duplicate collapses to a single version")
+
+	after, err := store.BarsForDate(ctx, market.SourceBhavcopy, bar.Date, time.Now())
+	require.NoError(t, err)
+	require.Len(t, after, 1)
+}
+
+func TestInsertBars_RejectsConflictingDuplicateInSameBatch(t *testing.T) {
+	ctx := context.Background()
+	store := market.NewStore(testutil.Pool(t))
+
+	bar := sampleBars()[0]
+	conflicting := bar
+	conflicting.Close = bar.Close + 1 // same (symbol_id, date, source), different content
+
+	n, err := store.InsertBars(ctx, market.SourceBhavcopy, []market.Bar{bar, conflicting})
+	require.Error(t, err, "two different versions of the same (symbol, date, source) in one call must be rejected, not silently resolved")
+	require.Equal(t, 0, n)
+	require.Contains(t, err.Error(), bar.ISIN)
+
+	after, err := store.BarsForDate(ctx, market.SourceBhavcopy, bar.Date, time.Now())
+	require.NoError(t, err)
+	require.Empty(t, after, "a rejected batch must not insert any bar for that symbol/date")
+}
+
 func TestEnsureSymbols_KeepsSymbolIDAcrossRename(t *testing.T) {
 	ctx := context.Background()
 	store := market.NewStore(testutil.Pool(t))

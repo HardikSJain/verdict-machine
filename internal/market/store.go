@@ -1,6 +1,7 @@
 package market
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"time"
@@ -96,6 +97,10 @@ func (s *Store) InsertBars(ctx context.Context, source string, bars []Bar) (int,
 	if err != nil {
 		return 0, err
 	}
+	bars, err = dedupeBars(bars)
+	if err != nil {
+		return 0, err
+	}
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -133,6 +138,48 @@ func (s *Store) InsertBars(ctx context.Context, source string, bars []Bar) (int,
 		return 0, err
 	}
 	return int(tag.RowsAffected()), nil
+}
+
+// dedupeBars collapses bars within one InsertBars call that share the version
+// key (symbol_id, date, source) into a single row. source is one value for
+// the whole call, so the key here is (isin, date).
+//
+// Postgres's now() is fixed for the whole transaction, so two staged rows
+// with the same version key would otherwise be assigned the identical
+// ingested_at and collide on the bars primary key, aborting the entire
+// transaction on an opaque unique-violation and discarding every other,
+// unrelated bar in that same call.
+//
+// A duplicate whose content is identical to the one already kept (a repeated
+// line in a source file) is dropped silently. A duplicate whose content
+// differs is a genuine conflict this store's version key cannot represent
+// within a single call — most commonly two rows for the same symbol and date
+// under different series, which (symbol_id, date, source) does not
+// distinguish — and is rejected up front with a precise error naming the
+// offending symbol and date, instead of surfacing as a bare PK violation that
+// rolls back the whole batch.
+func dedupeBars(bars []Bar) ([]Bar, error) {
+	type key struct {
+		isin string
+		date time.Time
+	}
+	kept := map[key]int{} // key -> index into out
+	out := make([]Bar, 0, len(bars))
+	for _, b := range bars {
+		k := key{isin: b.ISIN, date: b.Date}
+		if i, ok := kept[k]; ok {
+			if !bytes.Equal(out[i].ContentHash(), b.ContentHash()) {
+				return nil, fmt.Errorf(
+					"insert: %s (%s) on %s appears more than once in this batch with different content; "+
+						"the version key (symbol_id, date, source) cannot distinguish them",
+					b.Ticker, b.ISIN, b.Date.Format("2006-01-02"))
+			}
+			continue
+		}
+		kept[k] = len(out)
+		out = append(out, b)
+	}
+	return out, nil
 }
 
 // LogIngest records one fetch attempt. status is 'ok', 'no-file' or 'error'.
