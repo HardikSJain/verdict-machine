@@ -32,6 +32,11 @@ make build              # bin/verdict
   still contain delisted names, so the universe has no survivorship bias.
 - `bin/verdict universe --as-of 2015-06-30` prints the top 500 by median turnover.
 
+```
+# crontab -e  (19:30 IST on weekdays; eod2 needs NSE's reports published after 19:00)
+30 19 * * 1-5 EOD2_DIR=$HOME/.local/share/eod2 /path/to/verdict-machine/scripts/eod2-sync.sh >> $HOME/.local/share/eod2/sync.log 2>&1
+```
+
 ## Layout
 
 ```
