@@ -271,3 +271,37 @@ func TestEnsureSymbols_ConcurrentRegistrationKeepsOneSymbolID(t *testing.T) {
 			"round %d: one ISIN owns exactly one symbol_id, whatever the concurrency", round)
 	}
 }
+
+// TestInsertBars_RevisesANonCloseField exercises the versioning path end to
+// end on a field no other test touches. The existing coverage revises only
+// Close (store_test.go) and Turnover (universe_test.go), so a field silently
+// dropped from ContentHash would make InsertBars do the opposite of what it
+// promises: keep the stale row and discard the correction, permanently, with
+// no error. eod2 rewrites its daily CSVs in place and its bars never carry
+// turnover, so a re-issued file whose only change is a corrected DLV_QTY is
+// exactly the case that would have been swallowed.
+func TestInsertBars_RevisesANonCloseField(t *testing.T) {
+	ctx := context.Background()
+	store := market.NewStore(testutil.Pool(t))
+	d := market.Day(2022, 7, 28)
+	qty := int64(52403544)
+	bar := market.Bar{ISIN: "INE081A01020", Ticker: "TATASTEEL", Series: "EQ", Date: d,
+		Open: 98.1, High: 102, Low: 97.15, Close: 100.35, Volume: 137156107, DeliveryQty: &qty}
+
+	n, err := store.InsertBars(ctx, market.SourceEod2, []market.Bar{bar})
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+
+	corrected := bar
+	correctedQty := qty + 1000
+	corrected.DeliveryQty = &correctedQty
+	n, err = store.InsertBars(ctx, market.SourceEod2, []market.Bar{corrected})
+	require.NoError(t, err)
+	require.Equal(t, 1, n, "a corrected delivery quantity is a new version, not an unchanged bar")
+
+	after, err := store.BarsForDate(ctx, market.SourceEod2, d, time.Now())
+	require.NoError(t, err)
+	require.Len(t, after, 1)
+	require.NotNil(t, after[0].DeliveryQty)
+	require.EqualValues(t, correctedQty, *after[0].DeliveryQty)
+}
