@@ -183,7 +183,7 @@ func TestBackfill_SuccessResetsConsecutiveErrorCounter(t *testing.T) {
 	})
 
 	sum, err := Backfill(ctx, store, f, from, to, 0, io.Discard)
-	require.NoError(t, err, "a success between two runs of errors resets the counter, so 5 non-consecutive errors must not abort")
+	require.NoError(t, err, "a success between two runs of errors resets the counter, so 7 errors that never reach 5 in a row must not abort")
 	require.Equal(t, Summary{Errors: 7, Fetched: 1, Inserted: 1}, sum)
 	require.Len(t, log.all(), 8, "every calendar date in range must be attempted; the run must not abort")
 }
