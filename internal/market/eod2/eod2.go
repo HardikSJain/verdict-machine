@@ -49,9 +49,21 @@ func ParseDaily(r io.Reader, ticker, isin string) ([]market.Bar, error) {
 	for i, h := range header {
 		col[strings.TrimSpace(h)] = i
 	}
-	for _, need := range []string{"Date", "Open", "High", "Low", "Close", "Volume", "Series"} {
+	required := []string{"Date", "Open", "High", "Low", "Close", "Volume", "Series"}
+	for _, need := range required {
 		if _, ok := col[need]; !ok {
 			return nil, fmt.Errorf("eod2 %s: missing column %q", ticker, need)
+		}
+	}
+	// minFields is one past the highest index any required column maps to. With
+	// FieldsPerRecord = -1 (above) the csv reader tolerates ragged rows so eod2
+	// files missing trailing optional columns (e.g. no DLV_QTY) still parse; this
+	// guard is what catches a row that is short on the *required* columns instead
+	// of panicking with an index-out-of-range.
+	minFields := 0
+	for _, need := range required {
+		if col[need]+1 > minFields {
+			minFields = col[need] + 1
 		}
 	}
 
@@ -63,6 +75,9 @@ func ParseDaily(r io.Reader, ticker, isin string) ([]market.Bar, error) {
 		}
 		if err != nil {
 			return nil, fmt.Errorf("eod2 %s line %d: %w", ticker, line, err)
+		}
+		if len(rec) < minFields {
+			return nil, fmt.Errorf("eod2 %s line %d: got %d fields, want at least %d", ticker, line, len(rec), minFields)
 		}
 		date, err := time.Parse("2006-01-02", rec[col["Date"]])
 		if err != nil {
