@@ -114,3 +114,19 @@ func TestBackfillCommand_MissingDatabaseURLReturnsError(t *testing.T) {
 	err := root.Execute()
 	require.EqualError(t, err, "set --database-url or VERDICT_DATABASE_URL")
 }
+
+// TestEntitiesCheckCommand_MissingDatabaseURLReturnsError mirrors the migrate
+// and backfill cases: `entities check` takes --database-url from a persistent
+// flag on its parent, which is the inherited-flag path databaseURL exists to
+// handle, so this also pins that the grouping command wired it up.
+func TestEntitiesCheckCommand_MissingDatabaseURLReturnsError(t *testing.T) {
+	t.Setenv("VERDICT_DATABASE_URL", "")
+	root := newRootCmd()
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&out)
+	root.SetArgs([]string{"entities", "check"})
+
+	err := root.Execute()
+	require.EqualError(t, err, "set --database-url or VERDICT_DATABASE_URL")
+}

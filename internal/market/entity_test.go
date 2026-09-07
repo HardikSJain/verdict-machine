@@ -455,3 +455,53 @@ func TestEntityLabelWithSentinelValidFrom(t *testing.T) {
 	require.NotNil(t, late.Members[0].LastBreak)
 	require.Equal(t, boundary, *late.Members[0].LastBreak)
 }
+
+// TestEntityBoundariesAndInvariantsOnAWellFormedEntity covers the two store
+// methods M1 and the monthly ops item will call, on the only configuration
+// Stage 1 can build: one hand-made, well-formed entity.
+//
+// It is NOT design §8.7, the negative control, and must not be read as
+// standing in for it. Nothing here injects a bogus link, so nothing here is
+// evidence that the invariant checker can FAIL -- which is the only property
+// worth having from a safety net. §8.7 lands with the seeder in Stage 2,
+// including §8.7b, the case that documents what the net cannot catch at all.
+func TestEntityBoundariesAndInvariantsOnAWellFormedEntity(t *testing.T) {
+	ctx := context.Background()
+	store := market.NewStore(testutil.Pool(t))
+	pool := store.Pool()
+	boundary := market.Day(2022, 7, 29)
+
+	ids, err := store.EnsureSymbols(ctx, []market.Bar{
+		{ISIN: "INE081A01012", Ticker: "TATASTEEL", Date: market.Day(2015, 1, 2)},
+		{ISIN: "INE081A01020", Ticker: "TATASTEEL", Date: market.Day(2022, 10, 31)},
+	})
+	require.NoError(t, err)
+	pred, succ := ids["INE081A01012"], ids["INE081A01020"]
+
+	before := time.Now()
+	time.Sleep(10 * time.Millisecond)
+	linkRow(t, pool, succ, pred, boundary)
+
+	early, err := store.EntityBoundaries(ctx, []int64{pred}, before)
+	require.NoError(t, err)
+	require.Empty(t, early, "pinned before the link's ingest the entity has no boundary, because it has no members")
+
+	got, err := store.EntityBoundaries(ctx, []int64{pred}, time.Now())
+	require.NoError(t, err)
+	require.Len(t, got[pred], 1)
+	require.Equal(t, market.EntityBoundary{
+		Date:            boundary,
+		PredecessorID:   pred,
+		SuccessorID:     succ,
+		PredecessorISIN: "INE081A01012",
+		SuccessorISIN:   "INE081A01020",
+	}, got[pred][0])
+
+	none, err := store.EntityBoundaries(ctx, nil, time.Now())
+	require.NoError(t, err)
+	require.Empty(t, none)
+
+	violations, err := store.CheckEntityInvariants(ctx, time.Now())
+	require.NoError(t, err)
+	require.Empty(t, violations, "a flat, disjoint, same-issuer entity violates nothing")
+}

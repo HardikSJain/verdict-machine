@@ -32,6 +32,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newIngestCmd())
 	root.AddCommand(newBackfillCmd())
 	root.AddCommand(newUniverseCmd())
+	root.AddCommand(newEntitiesCmd())
 	return root
 }
 
@@ -258,6 +259,66 @@ func newUniverseCmd() *cobra.Command {
 	cmd.Flags().Bool("allow-stale", false, "keep names whose last bar predates the window's final session (halted/suspended names); default drops them")
 	cmd.Flags().String("database-url", "", "Postgres URL (default $VERDICT_DATABASE_URL)")
 	return cmd
+}
+
+// newEntitiesCmd groups the commands that operate on the canonical-entity
+// overlay. Only `check` exists so far, and deliberately: reading the map is
+// safe, minting it is not. `propose`, `link`, `apply` and `retract` land with
+// the seeder and the git-reviewed roster, because the decision that two ISINs
+// are one company is made in a reviewed file and not by a command.
+func newEntitiesCmd() *cobra.Command {
+	entities := &cobra.Command{
+		Use:   "entities",
+		Short: "Inspect the canonical-entity overlay (symbol_links)",
+	}
+	entities.PersistentFlags().String("database-url", "", "Postgres URL (default $VERDICT_DATABASE_URL)")
+
+	check := &cobra.Command{
+		Use:   "check",
+		Short: "Run the entity invariants: I1 flatness, I2 disjointness, I3 issuer agreement",
+		Long: "Run the entity invariants against the current map.\n\n" +
+			"I1 (flatness) and I2 (disjointness) are defects and exit non-zero. I3 (issuer\n" +
+			"agreement) is advisory and is printed without failing the command: a face-value\n" +
+			"split keeps the NSDL issuer code, so a mismatch is a question for a human rather\n" +
+			"than a proven error.\n\n" +
+			"What this cannot do: a wrong-but-DISJOINT merge -- a reverse-merger shell, a\n" +
+			"freed ticker reused by a different company -- is undetectable from inside the\n" +
+			"store, and no exit code here should be read as saying otherwise.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			url, err := databaseURL(cmd)
+			if err != nil {
+				return err
+			}
+			pool, err := db.Connect(cmd.Context(), url)
+			if err != nil {
+				return err
+			}
+			defer pool.Close()
+
+			violations, err := market.NewStore(pool).CheckEntityInvariants(cmd.Context(), time.Now())
+			if err != nil {
+				return err
+			}
+			w := cmd.OutOrStdout()
+			var fatal int
+			for _, v := range violations {
+				severity := "VIOLATION"
+				if v.Advisory() {
+					severity = "advisory"
+				} else {
+					fatal++
+				}
+				fmt.Fprintf(w, "%s\t%s\tentity %d\t%s\n", severity, v.Kind, v.EntityID, v.Detail)
+			}
+			fmt.Fprintf(w, "# %d violations, %d advisory\n", fatal, len(violations)-fatal)
+			if fatal > 0 {
+				return fmt.Errorf("entities check: %d entity invariant violations", fatal)
+			}
+			return nil
+		},
+	}
+	entities.AddCommand(check)
+	return entities
 }
 
 func main() {

@@ -623,3 +623,39 @@ irreversibly. That belongs in its own change with its own review, before M1's en
 `bars`. Until it lands, the "no survivorship bias" claim holds for every name that never
 changed its ISIN, and the M0 exit criterion (DHFL and JETAIRWAYS in a 2015 universe) is
 unaffected -- neither ever split.
+
+#### Stage 1 of the repair has landed (migration 0004, `symbol_links`)
+
+The canonical-entity layer described above now exists as a read-time overlay: migration
+0004 adds `symbol_links`, and `UniverseAsOf` and `BarsForDate` resolve identity through it.
+**It ships with the table empty**, so every symbol is still its own entity and both reads
+answer exactly what they answered before — verified read-only against the live 13,792,595-bar
+store: the whole ranked universe at `--asof 2026-09-04 --lookback 125` (2,127 entities) and
+`BarsForDate` for that session (2,633 rows) are row-for-row identical to the pre-change
+queries, and the entity label agrees with the per-symbol label for 4,100 of 4,100 symbols on
+each of six sampled dates. **That equivalence is weak evidence and must not be cited as
+though it were strong**: with no link rows every entity is a singleton and the two queries
+are identical by construction, so it can only rule out a regression for unlinked symbols. It
+says nothing about the multi-member path. The full design, its staging and its test plan are
+in `.superpowers/sdd/2026-09-07-m0-scaffold/isin-design.md`.
+
+Two judgement calls made while implementing Stage 1, recorded here because they resolve
+places where that document says two things:
+
+1. **`verdict entities check` reports the three invariants only.** §4.6 describes the
+   command as "I1/I2/I3 plus unlinked candidates", but the candidate SQL and the G0–G6 gates
+   it runs are assigned to Stage 2 in §9, with the seeder. The candidate half is therefore
+   absent rather than half-built, and `CheckEntityInvariants` says so in its doc comment.
+2. **I3 (issuer agreement) does not fail the command.** §4.6 calls I3 "advisory, non-fatal"
+   while the CLI table beside it says `check` "exits non-zero on any violation". The more
+   specific statement wins: I1 and I2 exit non-zero, I3 prints and does not. A face-value
+   split keeps the NSDL issuer code, so a mismatch is a question for a human, and making it
+   fatal would train an operator to ignore the command.
+
+The rollback caveat from the migration is worth repeating here: 0004's `Down` drops the read
+surface (the view, `entity_map_at`, the flatness trigger) and deliberately **not** the table
+or its rows. Once any run records a `snapshot_id` computed over `symbol_links`, dropping the
+table is not a rollback, it is permanent data loss — re-running `apply` mints fresh
+`ingested_at` values that are not the ones the snapshot hashed. A consequence to know before
+using it: because the table survives `Down`, migration 0004 is not re-runnable after one
+without dropping the table by hand.
