@@ -227,3 +227,80 @@ func TestBackfill_SummaryCountersMatchMixedScenario(t *testing.T) {
 		[]string{d2.Format("2006-01-02"), d3.Format("2006-01-02"), d4.Format("2006-01-02"), d5.Format("2006-01-02")},
 		log.all(), "d1 was already logged ok and must not be fetched")
 }
+
+func TestNoFileSettled_HoldsUntilNSEsPublishWindowHasPassed(t *testing.T) {
+	session := market.Day(2024, 1, 1)
+	// The session ends at 2024-01-02 00:00 IST; a 404 only settles a further
+	// noFileSettleLag later, at 2024-01-03 00:00 IST == 2024-01-02 18:30 UTC.
+	cutoff := time.Date(2024, 1, 2, 18, 30, 0, 0, time.UTC)
+
+	require.False(t, noFileSettled(session, time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)),
+		"midday on the session itself: NSE publishes in the evening IST, so a 404 proves nothing yet")
+	require.False(t, noFileSettled(session, cutoff.Add(-time.Second)),
+		"one second before the cutoff the date is still retryable")
+	require.True(t, noFileSettled(session, cutoff),
+		"at the cutoff a 404 means there was no session")
+	require.True(t, noFileSettled(session, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)),
+		"a long-past date settles")
+}
+
+// unpublishedSession returns a weekday NSE cannot yet be assumed to have
+// published: today in IST, or the coming Monday when today is the weekend
+// (Backfill skips weekend dates outright, so they can never exercise this).
+func unpublishedSession(now time.Time) time.Time {
+	d := now.In(ist)
+	for d.Weekday() == time.Saturday || d.Weekday() == time.Sunday {
+		d = d.AddDate(0, 0, 1)
+	}
+	return market.Day(d.Year(), d.Month(), d.Day())
+}
+
+func TestBackfill_UnpublishedSessionIsNotSettledAndIsRetried(t *testing.T) {
+	ctx := context.Background()
+	store := market.NewStore(testutil.Pool(t))
+	d := unpublishedSession(time.Now())
+	require.False(t, noFileSettled(d, time.Now()), "the test date must be inside the publish window")
+	ds := d.Format("2006-01-02")
+
+	// NSE has not published this session yet, so the archive 404s exactly as a
+	// holiday would.
+	f, log := testServer(t, func(w http.ResponseWriter, date string) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	sum, err := Backfill(ctx, store, f, d, d, 0, io.Discard)
+	require.NoError(t, err)
+	require.Equal(t, Summary{NoFile: 1}, sum)
+
+	done, err := store.LoggedDates(ctx, market.SourceBhavcopy)
+	require.NoError(t, err)
+	require.False(t, done[d],
+		"a 404 for a session NSE may simply not have published yet must not be settled as no-file")
+
+	// A later run -- the operator waiting for the evening publish -- must try
+	// again rather than skip the date forever.
+	sum, err = Backfill(ctx, store, f, d, d, 0, io.Discard)
+	require.NoError(t, err)
+	require.Equal(t, Summary{NoFile: 1}, sum, "still unsettled, so fetched again rather than skipped")
+	require.Equal(t, []string{ds, ds}, log.all(), "the second run refetches the unsettled date")
+}
+
+func TestBackfill_SettledNoFileStillLogsAndSkipsOnRerun(t *testing.T) {
+	ctx := context.Background()
+	store := market.NewStore(testutil.Pool(t))
+	holiday := market.Day(2024, 1, 1) // long past: a 404 here really is a holiday
+	require.True(t, noFileSettled(holiday, time.Now()))
+
+	f, log := testServer(t, func(w http.ResponseWriter, date string) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	sum, err := Backfill(ctx, store, f, holiday, holiday, 0, io.Discard)
+	require.NoError(t, err)
+	require.Equal(t, Summary{NoFile: 1}, sum)
+
+	sum, err = Backfill(ctx, store, f, holiday, holiday, 0, io.Discard)
+	require.NoError(t, err)
+	require.Equal(t, Summary{Skipped: 1}, sum, "a settled holiday is never refetched")
+	require.Equal(t, []string{"2024-01-01"}, log.all())
+}

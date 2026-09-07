@@ -253,25 +253,26 @@ with `seq <= ledger_head_seq`. Everything hashed uses RFC 8785 canonical JSON, m
 iteration is sorted, and wall-clock timestamps are excluded from hashed payloads. Together
 with `git_sha` and `config_hash` this makes any run reproducible byte-for-byte.
 
-### Known limitation: `verdict backfill --to` near today
+### Not-yet-published sessions vs. holidays in `backfill`
 
 `ingest_log(source, date, status, rows, note)` (M0) records one row per fetch attempt;
 `LoggedDates` treats a date as permanently settled once it has a row with status `ok` or
-`no-file`, so `backfill` never refetches it. An HTTP 404 from NSE's archive is logged as
-`no-file` unconditionally, on the theory that a 404 means a non-trading day. That theory
-only holds for a date safely in the past: NSE publishes each session's bhavcopy in the
-evening (IST), so a 404 for the *current* trading day, requested before that evening
-publish, is a "not yet available" 404, not a "no trading happened" 404 -- and `backfill`
-cannot tell the two apart. `backfill --to` defaults to today, so running it before the
-day's archive is published permanently marks that date `no-file`; the only way to correct
-it today is an operator deleting the stray `ingest_log` row by hand (`ingest_log`, unlike
-`bars`/`symbols`, has no insert-only trigger blocking that). **Operators: don't run
-`backfill` with `--to` at or near today until NSE's bhavcopy for that date is known to be
-published; pass an explicit `--to` at least one trading day in the past instead.** Fixing
-this properly (e.g. only settling a 404 as `no-file` once the date is older than a
-publish-lag cutoff, otherwise leaving it unlogged for a later retry) is deferred: Task 5's
-brief specifies `backfill`'s no-file handling verbatim, so changing it is out of scope for
-a review-driven fix and belongs in its own task.
+`no-file`, so `backfill` never refetches it. That makes an HTTP 404 from NSE's archive a
+load-bearing judgement: a 404 usually means a non-trading day, but for a date NSE has not
+published yet it only means "not available *yet*". NSE posts each session's bhavcopy in
+the evening IST, and `backfill --to` defaults to today, so settling every 404 as `no-file`
+would let a single early run mark a real trading day absent forever -- an insert-only
+`bars` table can never be corrected by a later run, and the only recovery would be an
+operator deleting the stray `ingest_log` row by hand.
+
+`Backfill` therefore settles a 404 only once the session date is safely past: a full day
+(`noFileSettleLag`) after that date ends at midnight IST, which clears the evening publish
+window with a day to spare. A 404 inside that window is counted in the run's `no-file`
+total and reported on stderr, but **no `ingest_log` row is written**, so the next run
+fetches the date again and picks up the archive as soon as NSE publishes it. The cost is
+that a genuine holiday close to today is re-requested on one or two later runs before it
+settles; the benefit is that `backfill --to` at or near today is safe to run at any hour,
+and no trading day can be silently lost.
 
 ### Evening flow (phase 1)
 
