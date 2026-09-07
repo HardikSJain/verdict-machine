@@ -209,6 +209,7 @@ func newUniverseCmd() *cobra.Command {
 			lookback, _ := cmd.Flags().GetInt("lookback")
 			n, _ := cmd.Flags().GetInt("n")
 			source, _ := cmd.Flags().GetString("source")
+			allowStale, _ := cmd.Flags().GetBool("allow-stale")
 			asOf, err := time.Parse("2006-01-02", asOfS)
 			if err != nil {
 				return fmt.Errorf("--as-of: %w", err)
@@ -222,16 +223,27 @@ func newUniverseCmd() *cobra.Command {
 				return err
 			}
 			defer pool.Close()
-			u, err := market.NewStore(pool).UniverseAsOf(cmd.Context(), source, asOf, lookback, n, time.Now())
+			var opts []market.UniverseOption
+			if allowStale {
+				opts = append(opts, market.AllowStaleMembers())
+			}
+			u, err := market.NewStore(pool).UniverseAsOf(cmd.Context(), source, asOf, lookback, n, time.Now(), opts...)
 			if err != nil {
 				return err
 			}
 			w := cmd.OutOrStdout()
+			// liveness names which membership rule actually ran, because
+			// RequiredLastSession is the only thing distinguishing "no halted
+			// names qualified" from "--allow-stale was silently ignored".
+			liveness := "last-session-required"
+			if !u.RequiredLastSession {
+				liveness = "allow-stale"
+			}
 			// The realised window comes first: a store that holds fewer than
 			// --lookback sessions ranks on what it has, and the rows below
 			// look exactly the same either way.
-			fmt.Fprintf(w, "# as-of %s, source %s, window %d of %d sessions requested, %d symbols\n",
-				asOf.Format("2006-01-02"), source, u.Sessions, lookback, len(u.Members))
+			fmt.Fprintf(w, "# as-of %s, source %s, window %d of %d sessions requested, %d symbols, liveness=%s\n",
+				asOf.Format("2006-01-02"), source, u.Sessions, lookback, len(u.Members), liveness)
 			fmt.Fprintf(w, "rank\tticker\tisin\tmedian_turnover_inr\tdays\n")
 			for i, m := range u.Members {
 				fmt.Fprintf(w, "%d\t%s\t%s\t%.0f\t%d\n", i+1, m.Ticker, m.ISIN, m.MedianTurnover, m.DaysPresent)
@@ -243,6 +255,7 @@ func newUniverseCmd() *cobra.Command {
 	cmd.Flags().Int("lookback", 125, "sessions in the ranking window (about six months)")
 	cmd.Flags().Int("n", 500, "universe size")
 	cmd.Flags().String("source", market.SourceBhavcopy, "bar source: nse-bhavcopy or eod2")
+	cmd.Flags().Bool("allow-stale", false, "keep names whose last bar predates the window's final session (halted/suspended names); default drops them")
 	cmd.Flags().String("database-url", "", "Postgres URL (default $VERDICT_DATABASE_URL)")
 	return cmd
 }

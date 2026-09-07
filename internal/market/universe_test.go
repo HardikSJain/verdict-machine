@@ -76,6 +76,69 @@ func TestUniverseAsOf_RequiresPresenceOn80PctOfDays(t *testing.T) {
 	require.False(t, tickers(u.Members)["DHFL"])
 }
 
+// newLivenessFixture seeds a 125-session window where ANCHOR trades every
+// session and STALESTEEL trades only the first 100, its last bar 25 sessions
+// before the window's end. STALESTEEL clears the 80% presence gate
+// (ceil(0.8*125) = 100) on row count alone, but never trades on the window's
+// final session -- exactly the shape of a dead ISIN (a succession, a
+// suspension) that the liveness guard exists to catch.
+// TestUniverseAsOf_ExcludesANameThatStoppedTrading and
+// TestUniverseAsOf_AllowStaleMembersKeepsIt share it to exercise the guard
+// from both sides of the same data.
+func newLivenessFixture(t *testing.T, ctx context.Context, store *market.Store) (asOf time.Time, lookbackDays int) {
+	t.Helper()
+	const window = 125
+	base := market.Day(2023, 1, 2)
+	sessions := make([]time.Time, window)
+	for i := range sessions {
+		sessions[i] = base.AddDate(0, 0, i)
+	}
+
+	var bars []market.Bar
+	for i, d := range sessions {
+		bars = append(bars, barAt("INE0000ANCHR", "ANCHOR", d, 100+float64(i)))
+	}
+	for i := 0; i < 100; i++ {
+		bars = append(bars, barAt("INE0000STALE", "STALESTEEL", sessions[i], 50+float64(i)))
+	}
+	_, err := store.InsertBars(ctx, market.SourceBhavcopy, bars)
+	require.NoError(t, err)
+	return sessions[window-1], window
+}
+
+func TestUniverseAsOf_ExcludesANameThatStoppedTrading(t *testing.T) {
+	ctx := context.Background()
+	store := market.NewStore(testutil.Pool(t))
+	asOf, lookback := newLivenessFixture(t, ctx, store)
+
+	u, err := store.UniverseAsOf(ctx, market.SourceBhavcopy, asOf, lookback, 500, time.Now())
+	require.NoError(t, err)
+	require.Equal(t, lookback, u.Sessions)
+	require.True(t, u.RequiredLastSession, "default rule requires presence on the window's final session")
+	require.False(t, tickers(u.Members)["STALESTEEL"],
+		"traded 100 of 125 sessions (clears the 80% gate) but its last bar is 25 sessions before the window's end; a dead instrument must not be returned as tradeable")
+	require.True(t, tickers(u.Members)["ANCHOR"])
+}
+
+func TestUniverseAsOf_AllowStaleMembersKeepsIt(t *testing.T) {
+	ctx := context.Background()
+	store := market.NewStore(testutil.Pool(t))
+	asOf, lookback := newLivenessFixture(t, ctx, store)
+
+	u, err := store.UniverseAsOf(ctx, market.SourceBhavcopy, asOf, lookback, 500, time.Now(), market.AllowStaleMembers())
+	require.NoError(t, err)
+	require.False(t, u.RequiredLastSession, "Universe.RequiredLastSession reports which membership rule actually ran")
+	require.True(t, tickers(u.Members)["STALESTEEL"], "the escape hatch must still surface a halted name for a study that wants it")
+	found := false
+	for _, m := range u.Members {
+		if m.Ticker == "STALESTEEL" {
+			found = true
+			require.Equal(t, 100, m.DaysPresent)
+		}
+	}
+	require.True(t, found)
+}
+
 // TestUniverseAsOf_AsOfIngestIsolatesRevisions is not in the brief's Step 1;
 // it is added because the brief's three tests all pass time.Now() as
 // asOfIngest and so never exercise UniverseAsOf's own point-in-time

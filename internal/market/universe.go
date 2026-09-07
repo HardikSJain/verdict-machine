@@ -25,7 +25,32 @@ type Universe struct {
 	// a two-session median is not a liquidity filter and the returned members
 	// look identical either way.
 	Sessions int
-	Members  []UniverseMember
+	// RequiredLastSession reports which membership rule actually produced
+	// these members: true when a symbol had to trade on the window's final
+	// session to qualify (the default), false when AllowStaleMembers relaxed
+	// that. A caller cannot otherwise tell "the option ran" from "the option
+	// silently did nothing".
+	RequiredLastSession bool
+	Members             []UniverseMember
+}
+
+// universeOptions holds UniverseAsOf's optional membership-rule overrides.
+type universeOptions struct {
+	allowStale bool
+}
+
+// UniverseOption customizes UniverseAsOf's membership rule.
+type UniverseOption func(*universeOptions)
+
+// AllowStaleMembers keeps a name whose most recent bar predates the window's
+// final session. The default is to drop it: the strategy this universe feeds
+// rebalances at the open on the prior close's signals, so a name absent from
+// the window's last session has no close to signal on and no price to size
+// from -- it is not tradeable that morning, whatever its turnover looked like
+// while it still traded. Pass this only for a study that deliberately wants
+// halted and suspended names in the panel.
+func AllowStaleMembers() UniverseOption {
+	return func(o *universeOptions) { o.allowStale = true }
 }
 
 // windowCTE defines the point-in-time window. The ranking and the realised
@@ -50,9 +75,13 @@ const windowCTE = `
 // UniverseAsOf ranks series-EQ symbols by median daily rupee turnover over the
 // last lookbackDays sessions ending at asOf, using only bar versions ingested
 // at or before asOfIngest, and returns the top n. A symbol must be present on
-// at least 80% of the window's sessions. Because it is computed from bars
-// alone, a name that traded then and was delisted since is still in the
-// universe for that date; no survivorship bias.
+// at least 80% of the window's sessions AND, by default, must have traded on
+// the window's final session -- see AllowStaleMembers. Because it is computed
+// from bars alone, a name that traded then and was delisted since is still in
+// the universe for that date; no survivorship bias. The liveness rule is
+// narrower than survivorship: it excludes a name that had already gone dark
+// by asOf (a succession that left the old ISIN untraded, a suspension), not
+// one that trades fine on asOf and is delisted only later.
 //
 // When the store holds fewer than lookbackDays sessions the window silently
 // shortens to what is there -- the 80% presence rule scales with it too -- so
@@ -63,13 +92,18 @@ const windowCTE = `
 // today's ticker; see symbolLabelLateral.
 //
 // For sources without a turnover column (eod2), close * volume stands in.
-func (s *Store) UniverseAsOf(ctx context.Context, source string, asOf time.Time, lookbackDays, n int, asOfIngest time.Time) (Universe, error) {
+func (s *Store) UniverseAsOf(ctx context.Context, source string, asOf time.Time, lookbackDays, n int, asOfIngest time.Time, opts ...UniverseOption) (Universe, error) {
 	if lookbackDays <= 0 || n <= 0 {
 		return Universe{}, fmt.Errorf("universe: lookbackDays and n must be positive")
 	}
 	if source != SourceBhavcopy && source != SourceEod2 {
 		return Universe{}, fmt.Errorf("universe: unknown source %q (want %q or %q)", source, SourceBhavcopy, SourceEod2)
 	}
+	var cfg universeOptions
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	requireLastSession := !cfg.allowStale
 	// Bound the scan: lookbackDays sessions never span more than 2x that in calendar days plus holidays.
 	since := asOf.AddDate(0, 0, -(lookbackDays*2 + 14))
 
@@ -86,8 +120,18 @@ func (s *Store) UniverseAsOf(ctx context.Context, source string, asOf time.Time,
 	// from "there is no window here". So `w` is the driving side and produces
 	// its row either way; the member columns come back NULL when `ranked` is
 	// empty, and that one row is skipped below.
+	// window_rows carries `date` (not just symbol_id/turnover) purely so the
+	// liveness term below has something to compare against max(days.date);
+	// the guard has to live in this CTE's HAVING because that is where the
+	// per-symbol aggregation happens, and it is the easiest thing in this
+	// query to apply to the wrong one.
+	//
+	// $7 is requireLastSession, not "allowStale": when it is false the OR
+	// short-circuits and the term is a no-op; when true, bool_or(...) demands
+	// that the symbol traded on the window's very last session. Getting the
+	// polarity backwards here would silently invert default and opt-in.
 	rows, err := s.pool.Query(ctx, windowCTE+`, window_rows AS (
-			SELECT l.symbol_id, COALESCE(l.turnover, l.close * l.volume)::float8 AS turnover
+			SELECT l.symbol_id, l.date, COALESCE(l.turnover, l.close * l.volume)::float8 AS turnover
 			FROM latest l JOIN days USING (date)
 			WHERE l.series = 'EQ'
 		), ranked AS (
@@ -97,13 +141,14 @@ func (s *Store) UniverseAsOf(ctx context.Context, source string, asOf time.Time,
 			FROM window_rows
 			GROUP BY symbol_id
 			HAVING count(*) >= ceil(0.8 * (SELECT count(*) FROM days))
+			   AND ($7 IS FALSE OR bool_or(date = (SELECT max(date) FROM days)))
 		)
 		SELECT w.sessions, r.symbol_id, sym.isin, sym.ticker, r.median_turnover, r.days_present
 		FROM (SELECT count(*)::int AS sessions FROM days) w
 		LEFT JOIN ranked r ON true
 		LEFT JOIN LATERAL `+symbolLabelLateral("r.symbol_id", "$2", "$4")+` sym ON true
 		ORDER BY r.median_turnover DESC NULLS LAST, sym.ticker
-		LIMIT $6`, source, asOf, since, asOfIngest, lookbackDays, n)
+		LIMIT $6`, source, asOf, since, asOfIngest, lookbackDays, n, requireLastSession)
 	if err != nil {
 		return Universe{}, fmt.Errorf("universe: %w", err)
 	}
@@ -130,5 +175,6 @@ func (s *Store) UniverseAsOf(ctx context.Context, source string, asOf time.Time,
 	if err := rows.Err(); err != nil {
 		return Universe{}, err
 	}
+	u.RequiredLastSession = requireLastSession
 	return u, nil
 }
