@@ -196,11 +196,18 @@ func (r *Roster) Marshal() ([]byte, error) {
 		return nil, err
 	}
 	r.Digest = hex.EncodeToString(d)
-	b, err := json.MarshalIndent(r, "", "  ")
-	if err != nil {
+	// HTML escaping is off: the file is read by people, and a serial written
+	// as "01-\u003e02" is noise in a diff. The digest is unaffected either
+	// way, because it is taken over the canonical form rather than over these
+	// bytes.
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(r); err != nil {
 		return nil, err
 	}
-	return append(b, '\n'), nil
+	return buf.Bytes(), nil
 }
 
 // Validate runs the gates over the roster's own recorded facts: G0-G6 on

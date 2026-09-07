@@ -287,10 +287,13 @@ func parseIngestPin(s string) (time.Time, error) {
 }
 
 // newEntitiesCmd groups the commands that operate on the canonical-entity
-// overlay. Only `check` exists so far, and deliberately: reading the map is
-// safe, minting it is not. `propose`, `link`, `apply` and `retract` land with
-// the seeder and the git-reviewed roster, because the decision that two ISINs
-// are one company is made in a reviewed file and not by a command.
+// overlay: `check` reads the map, `propose` proposes one, `link` edits the
+// file a human reviews, `apply` writes the rows and `retract` unwrites them.
+//
+// The split between propose and apply is the safety argument, not a
+// convenience. The decision that two ISINs are one company is made in a
+// reviewed file and not by a command, so nothing here runs automatically
+// after an ingest and nothing writes a link the roster does not contain.
 func newEntitiesCmd() *cobra.Command {
 	entities := &cobra.Command{
 		Use:   "entities",
@@ -363,6 +366,10 @@ func newEntitiesCmd() *cobra.Command {
 	check.Flags().String("as-of-ingest", "",
 		"evaluate the map as the store knew it at this ingest timestamp: RFC3339, or YYYY-MM-DD for midnight UTC (default now)")
 	entities.AddCommand(check)
+	entities.AddCommand(newEntitiesProposeCmd())
+	entities.AddCommand(newEntitiesLinkCmd())
+	entities.AddCommand(newEntitiesApplyCmd())
+	entities.AddCommand(newEntitiesRetractCmd())
 	return entities
 }
 

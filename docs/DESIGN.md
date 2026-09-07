@@ -692,3 +692,79 @@ table is not a rollback, it is permanent data loss — re-running `apply` mints 
 `ingested_at` values that are not the ones the snapshot hashed. A consequence to know before
 using it: because the table survives `Down`, migration 0004 is not re-runnable after one
 without dropping the table by hand.
+
+#### Stage 2 of the repair has landed (the seeder, the gates and the roster)
+
+`internal/market/entities` now holds the roster type, gates G0–G6, the RFC 8785 digest and
+the candidate generator, and `verdict entities propose|link|apply|retract` exist beside
+`check`. **The roster is generated and committed; it has NOT been applied to the live
+`verdict` database.** Writing ~444 merge rows into a store that cannot delete is a decision
+for a human who has read the diff, and this branch stops one step before it. `apply` was
+exercised against `verdict_test` instead, which is what test 8.14 requires.
+
+What the generator measured, read-only, against the live 13,792,595-bar store (archive
+2011-09-02..2026-09-07, 3,722 sessions, 4,089 symbols with bhavcopy bars):
+
+| | |
+|---|---|
+| candidates generated | 625 (573 issuer-prefix, 52 ticker-only) |
+| **auto-accepted (passed G0–G6)** | **444 links over 415 entities** |
+| quarantined | 181 |
+| first failure G0 (fund units, INF/IN9) | 52 |
+| first failure G3 (spans overlap) | 1 |
+| first failure G4 (live sessions in the gap) | 123 |
+| first failure G4b (5+ calendar days) | 1 |
+| first failure G6 (boundary ratio outside every band) | 4 |
+
+The four G6 failures are the four the design names
+(`INE052T01013`→`INE052T01021`, `INE726L01019`→`INE726L01027`,
+`INE688J01015`→`INE688J01023`, `INE528G01027`→`INE528G01035`), and the boundary-ratio
+distribution reproduces §5.3's table exactly (57 / 61 / 50 / 2 / 278 / 1 across the same
+bands). The count is **444 rather than the design's "about 445"** because G4b rejects
+`INE659A01015`→`INE659A01023`, a pair with zero sessions in its gap but six calendar days —
+which is the single disagreement §5.4 predicted between a session-counting and a
+calendar-counting generator. All eight top-of-book names are covered (HDFCBANK, ICICIBANK,
+SBIN, AXISBANK, BAJFINANCE, KOTAKBANK, TATASTEEL, BEL), 29 entities have three members, and
+0 of 444 predecessors hold any eod2 bar, which is the measurement that keeps eod2 as evidence
+and not as a gate.
+
+Four judgement calls made while implementing Stage 2, recorded here because each departs
+from something the design says or leaves open:
+
+1. **G4a's archive-wide refusal ignores the *pending tail*, and this is a real deviation.**
+   §5.3 says `propose` refuses "while any date inside the archive span is `'error'` or
+   carries no `ingest_log` row", and then reports the live store as having exactly one such
+   date (2026-09-06, a Sunday) while also saying `propose` "would run clean today". Both
+   cannot hold once the archive extends past that Sunday, and it now does: the span ends
+   2026-09-07 and the Sunday is inside it. The refusal therefore distinguishes two cases.
+   A **hole** is an unsettled date whose settlement horizon — midnight IST after the session,
+   plus `bhavcopy.noFileSettleLag` — had already passed when the last fetch for the source
+   ran: a run had its chance and the date is still not settled, which is exactly the state
+   G4a exists to refuse. A **pending** date is one no run could have settled yet, which is
+   `backfill.noFileSettled` working as designed rather than a gap in the archive. Pending
+   dates are still NOT settled for any individual candidate's own G4a, so a boundary landing
+   in the tail is quarantined either way — verified: one candidate
+   (`INE0OPA01019`→`INE0OPA01027`, successor's first bar 2026-09-07) fails G4a for exactly
+   this reason. Measured today: 0 holes, 1 pending. Without this distinction the roster
+   would be ungeneratable for a reason that is a clock rather than a gap in the data.
+2. **The roster carries two fields §5.1's example does not: `reason` and `digest`.**
+   `reason` is `succession` or `manual` and maps 1:1 to `symbol_links.reason`, which
+   otherwise had no way of ever being written. `digest` is the file's own statement of the
+   sha256 §5.1 defines, so `Load` can refuse a file edited after the digest was taken —
+   which is what §8.12's "`apply` refusing a roster whose digest does not match the file on
+   disk" requires something to compare against. An omitted `reason` reads as `succession`
+   and is normalised before hashing, so adding the word does not change the digest.
+   `overlap_dates` is measured per candidate and recorded in the review file rather than in
+   the roster's `gates` block, which stays exactly as §5.1 writes it.
+3. **A `manual` line is exempt from G0–G4b and G6, and must name a ratifier and a note.**
+   The design requires both that `Load` validate G0–G6 and that hand-written lines exist for
+   the 51 fund-unit pairs — where G1 is meaningless by §10's own account — so the two cannot
+   both apply to the same line. Manual lines are still held to G3 (disjoint spans), to G5
+   (the graph must be a path) and to the boundary being the successor's first bar, because
+   those are what the store itself will enforce or silently mis-answer.
+4. **`apply` warns about unratified lines rather than refusing them.** The generated roster
+   leaves `ratified_by` empty: `propose` cannot know who will ratify, and filling in a name
+   would be the machine asserting a human's approval. `apply` prints how many lines name no
+   ratifier and writes them anyway, because the provenance that matters — the sha256 of the
+   exact file, in every row — is recorded either way, and refusing would make a scratch
+   store unusable. A reviewer merging the roster PR is expected to fill the field in.

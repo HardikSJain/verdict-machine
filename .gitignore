@@ -1,6 +1,11 @@
 /bin/
 /verdict
-/data/
+# data/ holds local backfill logs, which are noise. The succession review file
+# is the exception: design 5.6 makes it the only material a reviewer can
+# disagree with about a roster line, so it is tracked. A directory that is
+# excluded cannot have a file re-included, hence /data/* rather than /data/.
+/data/*
+!/data/succession-review.jsonl
 .env
 .env.*
 !.env.example
