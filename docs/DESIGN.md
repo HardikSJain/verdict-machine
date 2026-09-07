@@ -468,8 +468,18 @@ this document after that round and have not been re-reviewed.
   implementation. Idempotency (`inserted 0` on the second run) holds exactly as
   specified.
 - **Task 6 (point-in-time universe, `universe.go`/`universe_test.go`):** `universe.go`
-  and the `universe` command are exactly as the brief specifies, no changes. One test
-  beyond the brief's Step 1 listing was added:
+  and the `universe` command are exactly as the brief specifies, no changes, **except
+  one fix-round-1 addition**: `UniverseAsOf` now rejects an unrecognized `source` before
+  querying (`if source != SourceBhavcopy && source != SourceEod2 { return nil,
+  fmt.Errorf(...) }`, inserted right after the existing `lookbackDays`/`n` validation, no
+  SQL or signature change). Without it, `verdict universe --source <typo>` printed only
+  the header row and exited 0 — a silently "successful" but meaningless result
+  indistinguishable from "no symbols qualify this window", since `source` is a free-form
+  flag with no allow-list anywhere in the brief's given code. Placed in `UniverseAsOf`
+  itself (not the CLI command) so every current and future caller gets the check, not
+  just `newUniverseCmd`. This is a deviation from the brief's verbatim Step 3 listing,
+  disclosed here per the fix-round instructions; it doesn't touch the brief's SQL or
+  `UniverseAsOf`'s signature. One test beyond the brief's Step 1 listing was added:
   `TestUniverseAsOf_AsOfIngestIsolatesRevisions`. The brief's three given tests all pass
   `time.Now()` as `asOfIngest`, so none of them exercises `UniverseAsOf`'s own
   point-in-time parameter — the `ingested_at <= $5` predicate that is this project's
@@ -480,7 +490,7 @@ this document after that round and have not been re-reviewed.
   `bars` (2 versions for that symbol/date/source). Confirmed to actually discriminate by
   temporarily flipping the two expected values and watching the test fail on the correct
   values before reverting. No SQL, signature, or naming from the brief was touched.
-- **Task 6 (pre-existing test-infra finding, not fixed here):** `go test ./...` (the
+- **Task 6 (pre-existing test-infra finding, mitigated in fix round 1):** `go test ./...` (the
   Makefile's `test` target) is intermittently flaky with a `duplicate key value violates
   unique constraint "bars_pkey"` error from `InsertBars`, reproducing on roughly half of
   attempts once `universe_test.go` exists. Root cause: `internal/db/db_test.go`,
@@ -502,12 +512,35 @@ this document after that round and have not been re-reviewed.
   Confirmed by: (a) running the exact pre-Task-6 tree repeatedly — clean every time; (b)
   running with Task 6's files added — fails on roughly half of attempts; (c) running
   `go test -p 1 ./...` (forcing sequential package execution) with Task 6's files present
-  — clean every time. Nothing in `universe.go`, `store.go`, or `testutil/testdb.go` was
-  changed to address this; it is out of Task 6's file scope (`universe.go`,
-  `universe_test.go`, `main.go` only) and touches shared infrastructure other tasks
-  depend on. Recommend a follow-up task: either wrap `EnsureSymbols`'s per-ISIN inserts
-  in one statement/transaction, or give each test package (or each test) its own schema,
-  or pin `-p 1` for the database-touching test run in the Makefile and CI.
+  — clean every time. **Fix round 1 update:** three independent re-reviews flagged that
+  disclosure alone left the repository's documented, default test command
+  (`go test ./...` / `make test`) broken for anyone who clones this repo, and that this
+  is not acceptable to ship unmitigated. Rather than the reviews' `-p 1`-in-the-Makefile
+  suggestion (which only protects invocations that go through `make test`, and forces
+  every *other*, non-database package to run sequentially too), landed the reviews'
+  other explicitly-offered alternative — "serialize the DB-touching packages" — directly
+  in the code every one of them already shares: `testutil.Pool` (`internal/testutil/testdb.go`)
+  now acquires a fixed-key Postgres session advisory lock (`pg_advisory_lock`) on a
+  dedicated connection before its `TRUNCATE`, and holds it for that `Pool`'s whole
+  lifetime (released, via `t.Cleanup`, only after the test's pool closes). Every
+  `Pool(t)`-backed test across every package now serializes against every other one,
+  regardless of how `go test` is invoked, closing the gap a Makefile-only fix would have
+  left (a bare `go test ./...`, an IDE test run, or a differently-invoked CI step would
+  all still race). `internal/db/db_test.go` — the third culprit named above, which never
+  used `testutil.Pool` and ran its own ad hoc `TRUNCATE` — was changed to call
+  `testutil.Pool(t)` for its connection and truncate too (its explicit double-`db.Migrate`
+  call, which exists to assert `Migrate` is idempotent, is unchanged; `testutil.Pool`
+  migrating a third time inside is a harmless no-op that reinforces the same assertion),
+  so all three original culprits now route through the one locked path. `EnsureSymbols`'s
+  underlying non-transactional per-ISIN insert loop is untouched and still not itself
+  race-free in the abstract — this closes the concurrency the race depends on within this
+  repository's own test suite, it does not make `EnsureSymbols` safe against arbitrary
+  concurrent external callers, which was never Task 6's job to fix. Verified with the
+  reviews' own reproduction method: `VERDICT_TEST_DATABASE_URL=... go test -count=1 ./...`
+  (the bare, Makefile-bypassing command that failed 2/3 runs before this fix) run 8
+  consecutive times after it, clean every time (see the fix-round-1 report). Follow-up
+  recommendation for the underlying non-transactional loop itself still stands: wrap
+  `EnsureSymbols`'s per-ISIN inserts in one statement/transaction.
 
 ## What I noticed about how you think
 

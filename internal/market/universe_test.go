@@ -152,3 +152,19 @@ func TestUniverseAsOf_Eod2SourceIsSurvivorOnly(t *testing.T) {
 	require.Equal(t, "TATASTEEL", members[0].Ticker)
 	require.Greater(t, members[0].MedianTurnover, 0.0, "eod2 has no turnover column; close*volume stands in")
 }
+
+// TestUniverseAsOf_RejectsUnknownSource is not in the brief's Step 1; it is
+// added for a fix-round-1 finding: source is a free-form string with no
+// allow-list anywhere in the brief's given code, so a typo of "nse-bhavcopy"
+// or "eod2" (e.g. from the CLI's --source flag) silently matched zero rows
+// and returned an empty, err == nil universe -- indistinguishable from "no
+// symbols qualify this window". No bars are inserted here: the check must
+// reject before ever querying, so an empty store still proves it.
+func TestUniverseAsOf_RejectsUnknownSource(t *testing.T) {
+	ctx := context.Background()
+	store := market.NewStore(testutil.Pool(t))
+
+	members, err := store.UniverseAsOf(ctx, "bogus", market.Day(2015, 6, 30), 2, 500, time.Now())
+	require.ErrorContains(t, err, `unknown source "bogus"`)
+	require.Nil(t, members)
+}

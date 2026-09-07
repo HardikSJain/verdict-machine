@@ -27,6 +27,9 @@ func (s *Store) UniverseAsOf(ctx context.Context, source string, asOf time.Time,
 	if lookbackDays <= 0 || n <= 0 {
 		return nil, fmt.Errorf("universe: lookbackDays and n must be positive")
 	}
+	if source != SourceBhavcopy && source != SourceEod2 {
+		return nil, fmt.Errorf("universe: unknown source %q (want %q or %q)", source, SourceBhavcopy, SourceEod2)
+	}
 	// Bound the scan: lookbackDays sessions never span more than 2x that in calendar days plus holidays.
 	since := asOf.AddDate(0, 0, -(lookbackDays*2 + 14))
 	rows, err := s.pool.Query(ctx, `

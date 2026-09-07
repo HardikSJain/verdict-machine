@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/HardikSJain/verdict-machine/internal/db"
+	"github.com/HardikSJain/verdict-machine/internal/testutil"
 )
 
 func testURL(t *testing.T) string {
@@ -28,9 +29,12 @@ func TestMigrateCreatesInsertOnlyMarketTables(t *testing.T) {
 	require.NoError(t, db.Migrate(ctx, url))
 	require.NoError(t, db.Migrate(ctx, url), "migrate must be idempotent")
 
-	pool, err := db.Connect(ctx, url)
-	require.NoError(t, err)
-	defer pool.Close()
+	// testutil.Pool migrates (again; idempotent, see above), connects, and
+	// truncates under the shared cross-package advisory lock — the same path
+	// every other package's database test uses, so this test's own TRUNCATE
+	// can never interleave with another package's symbol_id-assigning insert
+	// loop. See testutil.Pool's doc comment.
+	pool := testutil.Pool(t)
 
 	for _, table := range []string{"symbols", "bars", "ingest_log"} {
 		var exists bool
@@ -39,9 +43,7 @@ func TestMigrateCreatesInsertOnlyMarketTables(t *testing.T) {
 		require.True(t, exists, "table %s", table)
 	}
 
-	_, err = pool.Exec(ctx, "TRUNCATE bars, symbols RESTART IDENTITY")
-	require.NoError(t, err)
-	_, err = pool.Exec(ctx, "INSERT INTO symbols (isin, ticker) VALUES ('INE081A01020', 'TATASTEEL')")
+	_, err := pool.Exec(ctx, "INSERT INTO symbols (isin, ticker) VALUES ('INE081A01020', 'TATASTEEL')")
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, "UPDATE symbols SET ticker = 'X' WHERE isin = 'INE081A01020'")
 	require.ErrorContains(t, err, "insert-only")
