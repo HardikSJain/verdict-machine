@@ -866,3 +866,46 @@ func TestEntityInvariantsCatchABogusLink_Disjoint(t *testing.T) {
 	require.Equal(t, 2, m.Fragments)
 	require.NotNil(t, m.LastBreak)
 }
+
+// TestEntityMapAt_ResolvesEverySymbolAtThePin covers the Go door onto the
+// function §8.15 pins in SQL.
+//
+// `verdict entities check` has to answer "is this candidate pair already
+// linked?" for every accepted candidate the generator produces, and the
+// answer must be read at the caller's pin -- the monthly run checks the map
+// as of a moment, and a check that resolved through entity_map_now would
+// report a pair as unlinked (or as linked) on the strength of a row the
+// pinned read cannot see. Routing it through the published entity_map_at
+// rather than a fourth hand-rolled DISTINCT ON also means the CLI and a
+// notebook resolve identity through one definition, which is the claim the
+// notebook documentation makes.
+func TestEntityMapAt_ResolvesEverySymbolAtThePin(t *testing.T) {
+	ctx := context.Background()
+	store := market.NewStore(testutil.Pool(t))
+
+	ids, err := store.EnsureSymbols(ctx, []market.Bar{
+		{ISIN: "INE081A01012", Ticker: "TATASTEEL", Date: market.Day(2015, 1, 2)},
+		{ISIN: "INE081A01020", Ticker: "TATASTEEL", Date: market.Day(2022, 10, 31)},
+		{ISIN: "INE002A01018", Ticker: "RELIANCE", Date: market.Day(2015, 1, 2)},
+	})
+	require.NoError(t, err)
+	pred, succ, other := ids["INE081A01012"], ids["INE081A01020"], ids["INE002A01018"]
+
+	before, err := store.EntityMapAt(ctx, time.Now())
+	require.NoError(t, err)
+	require.Equal(t, map[int64]int64{pred: pred, succ: succ, other: other}, before,
+		"with no link rows every symbol is its own entity, and every registered symbol appears: an absent key would read as 'unlinked' by accident")
+
+	t0 := time.Now()
+	time.Sleep(10 * time.Millisecond)
+	linkRow(t, store.Pool(), succ, pred, market.Day(2022, 7, 29))
+
+	after, err := store.EntityMapAt(ctx, time.Now())
+	require.NoError(t, err)
+	require.Equal(t, map[int64]int64{pred: pred, succ: pred, other: other}, after)
+
+	pinned, err := store.EntityMapAt(ctx, t0)
+	require.NoError(t, err)
+	require.Equal(t, succ, pinned[succ],
+		"pinned before the link was ingested the successor is still its own entity; this is the ingested_at bound, and it is the easiest thing here to drop by accident")
+}

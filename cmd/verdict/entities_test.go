@@ -73,6 +73,11 @@ func TestEntitiesCommandsDeclareTheirFlags(t *testing.T) {
 		{"link", []string{"pred", "succ", "note", "ratified-by", "roster"}},
 		{"apply", []string{"roster", "dry-run", "seeded-by"}},
 		{"retract", []string{"entity", "symbol", "note"}},
+		// check grew --skip-candidates in stage 3: the candidate scan is on
+		// by default, because a monthly item that has to be asked for is one
+		// that gets run without it and reports "no violations" from a store
+		// that is missing four hundred links.
+		{"check", []string{"as-of-ingest", "skip-candidates"}},
 	} {
 		root := newRootCmd()
 		entities, _, err := root.Find([]string{"entities", tc.cmd})

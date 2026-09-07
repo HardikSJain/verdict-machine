@@ -1,16 +1,20 @@
 package main
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/spf13/cobra"
 
 	"github.com/HardikSJain/verdict-machine/internal/db"
+	"github.com/HardikSJain/verdict-machine/internal/market"
 	"github.com/HardikSJain/verdict-machine/internal/market/entities"
 )
 
@@ -349,4 +353,35 @@ func newEntitiesRetractCmd() *cobra.Command {
 	cmd.Flags().String("symbol", "", "single linked member to detach: a symbol_id or an ISIN")
 	cmd.Flags().String("note", "", "why")
 	return cmd
+}
+
+// scanCandidates runs the generator read-only at the pin and reports what the
+// map does not carry. It returns the number of accepted candidates missing
+// from the map, which is what makes `check` exit non-zero.
+//
+// propose's own G4a refusal is deliberately not softened here. It fires when
+// a date inside the archive span is neither 'ok' nor 'no-file' in
+// ingest_log, and it means the candidate set cannot be trusted: G4 counts
+// sessions out of bars, so a real NSE session the store never fetched reads
+// as "zero sessions between" and a demerger passes every gate. A monthly
+// check that answered "no new candidates" from an archive with a hole in it
+// would be worse than no check at all, so the hole IS the finding and the
+// command fails on it.
+func scanCandidates(ctx context.Context, pool *pgxpool.Pool, store *market.Store, asOfIngest time.Time, w io.Writer) (int, error) {
+	_, cands, _, err := entities.Propose(ctx, pool, entities.ProposeOptions{AsOfIngest: asOfIngest})
+	if err != nil {
+		return 0, fmt.Errorf("candidate scan: %w", err)
+	}
+	entityOf, err := store.EntityMapAt(ctx, asOfIngest)
+	if err != nil {
+		return 0, err
+	}
+	gaps, queue := entities.UnlinkedCandidates(cands, entityOf)
+	for _, c := range gaps {
+		fmt.Fprintf(w, "UNLINKED\tcandidate\t%s -> %s\t%s\tboundary %s\n",
+			c.Predecessor, c.Successor, c.TickerAfter, c.SuccessorSpn[0])
+	}
+	fmt.Fprintf(w, "# %d accepted candidate(s) the map does not carry, %d quarantined candidate(s) it does not carry either"+
+		" (the queue: reported, not a defect), %d candidate(s) generated\n", len(gaps), len(queue), len(cands))
+	return len(gaps), nil
 }

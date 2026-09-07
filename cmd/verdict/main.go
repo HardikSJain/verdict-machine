@@ -346,12 +346,24 @@ func newEntitiesCmd() *cobra.Command {
 
 	check := &cobra.Command{
 		Use:   "check",
-		Short: "Run the entity invariants: I1 flatness, I2 disjointness, I3 issuer agreement",
-		Long: "Run the entity invariants against the current map.\n\n" +
+		Short: "Run the entity invariants and report succession candidates the map does not carry",
+		Long: "Run the entity invariants against the current map, then look for successions\n" +
+			"the map has not been told about. This is the monthly ops item.\n\n" +
 			"I1 (flatness) and I2 (disjointness) are defects and exit non-zero. I3 (issuer\n" +
 			"agreement) is advisory and is printed without failing the command: a face-value\n" +
 			"split keeps the NSDL issuer code, so a mismatch is a question for a human rather\n" +
 			"than a proven error.\n\n" +
+			"The candidate scan re-runs the generator read-only and reports every pair the\n" +
+			"gates would accept that the map does not already carry. An accepted candidate\n" +
+			"missing from the map exits non-zero: NSE reissues an ISIN 30 to 40 times a year\n" +
+			"and each one drops a name out of the point-in-time universe around its boundary\n" +
+			"until a roster PR is merged and applied. Quarantined pairs are printed as a\n" +
+			"count and do not fail the command -- that queue is 181 deep and is not going to\n" +
+			"be worked. The scan inherits G4a, so it also exits non-zero while any date\n" +
+			"inside the archive span is unsettled in ingest_log: with a hole in the archive\n" +
+			"a demerger reads as adjacent and 'no new candidates' would be a false negative.\n" +
+			"--skip-candidates runs the invariants alone, which is the right thing mid-backfill\n" +
+			"and on a store with no bars.\n\n" +
 			"What this cannot do: a wrong-but-DISJOINT merge -- a reverse-merger shell, a\n" +
 			"freed ticker reused by a different company -- is undetectable from inside the\n" +
 			"store, and no exit code here should be read as saying otherwise.\n\n" +
@@ -367,6 +379,7 @@ func newEntitiesCmd() *cobra.Command {
 			// Parsed before the database URL is resolved, so a mistyped pin
 			// is reported as a mistyped pin rather than as a missing URL.
 			asOfIngestS, _ := cmd.Flags().GetString("as-of-ingest")
+			skipCandidates, _ := cmd.Flags().GetBool("skip-candidates")
 			asOfIngest, err := parseIngestPin(asOfIngestS)
 			if err != nil {
 				return fmt.Errorf("--as-of-ingest: %w", err)
@@ -381,7 +394,8 @@ func newEntitiesCmd() *cobra.Command {
 			}
 			defer pool.Close()
 
-			violations, err := market.NewStore(pool).CheckEntityInvariants(cmd.Context(), asOfIngest)
+			store := market.NewStore(pool)
+			violations, err := store.CheckEntityInvariants(cmd.Context(), asOfIngest)
 			if err != nil {
 				return err
 			}
@@ -400,14 +414,35 @@ func newEntitiesCmd() *cobra.Command {
 			// has to be able to tell WHICH map came back clean.
 			fmt.Fprintf(w, "# %d violations, %d advisory, map as of ingest %s\n",
 				fatal, len(violations)-fatal, asOfIngest.Format(time.RFC3339))
-			if fatal > 0 {
+
+			// The invariant report is printed BEFORE the candidate scan runs
+			// and before it can fail. The scan takes about five seconds and
+			// refuses outright on an unsettled archive; neither is a reason
+			// to withhold an answer about the map that was already computed.
+			gaps := 0
+			if !skipCandidates {
+				if gaps, err = scanCandidates(cmd.Context(), pool, store, asOfIngest, w); err != nil {
+					return fmt.Errorf("entities check: %w", err)
+				}
+			} else {
+				fmt.Fprintln(w, "# candidate scan skipped (--skip-candidates): this run says nothing about successions the map is missing")
+			}
+
+			switch {
+			case fatal > 0 && gaps > 0:
+				return fmt.Errorf("entities check: %d entity invariant violations, and %d accepted candidate(s) the map does not carry", fatal, gaps)
+			case fatal > 0:
 				return fmt.Errorf("entities check: %d entity invariant violations", fatal)
+			case gaps > 0:
+				return fmt.Errorf("entities check: %d accepted candidate(s) the map does not carry; regenerate the roster with `verdict entities propose`, review the diff, then apply it", gaps)
 			}
 			return nil
 		},
 	}
 	check.Flags().String("as-of-ingest", "",
 		"evaluate the map as the store knew it at this ingest timestamp: RFC3339, or YYYY-MM-DD for midnight UTC (default now)")
+	check.Flags().Bool("skip-candidates", false,
+		"run the invariants only, without re-generating succession candidates (use mid-backfill, or on a store with no bars)")
 	entities.AddCommand(check)
 	entities.AddCommand(newEntitiesProposeCmd())
 	entities.AddCommand(newEntitiesLinkCmd())

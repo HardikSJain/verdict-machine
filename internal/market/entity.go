@@ -173,6 +173,36 @@ func (s *Store) EntityBoundaries(ctx context.Context, entityIDs []int64, asOfIng
 	return out, rows.Err()
 }
 
+// EntityMapAt returns the whole symbol_id -> entity_id map as the store knew
+// it at asOfIngest, including the symbols that resolve to themselves.
+//
+// It reads the PUBLISHED entity_map_at(ts) function rather than repeating the
+// resolution SQL, and that is half the reason it exists: the function is what
+// migration 0004 publishes for a notebook, so a Go caller going through the
+// same door keeps the documented join and the shipped one from drifting
+// apart. entity_map_now is deliberately not reachable from here -- a map
+// resolved at now() answers a question nobody pinned.
+//
+// Every registered symbol is a key. A caller asking "are these two symbols
+// already one entity?" compares two values, so a missing key would silently
+// read as "unlinked" rather than as "unknown".
+func (s *Store) EntityMapAt(ctx context.Context, asOfIngest time.Time) (map[int64]int64, error) {
+	rows, err := s.pool.Query(ctx, `SELECT symbol_id, entity_id FROM entity_map_at($1)`, asOfIngest)
+	if err != nil {
+		return nil, fmt.Errorf("entity map at %s: %w", asOfIngest.Format(time.RFC3339), err)
+	}
+	defer rows.Close()
+	out := map[int64]int64{}
+	for rows.Next() {
+		var symbolID, entityID int64
+		if err := rows.Scan(&symbolID, &entityID); err != nil {
+			return nil, err
+		}
+		out[symbolID] = entityID
+	}
+	return out, rows.Err()
+}
+
 // Violation is one failed entity invariant.
 type Violation struct {
 	Kind     string // "flatness" | "overlap" | "issuer"
