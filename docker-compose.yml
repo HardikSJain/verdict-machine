@@ -7,7 +7,18 @@ services:
       POSTGRES_PASSWORD: verdict
       POSTGRES_DB: verdict
     ports:
-      - "5433:5432"
+      # Loopback only. Compose's short syntax defaults the host IP to 0.0.0.0,
+      # which published this port on every interface -- with the role created
+      # by POSTGRES_USER (a superuser), the password written three lines above
+      # in this public file, and sslmode=disable on every DSN in the repo. A
+      # superuser session can COPY ... FROM PROGRAM, so that was arbitrary
+      # command execution in the container, not just a read of public market
+      # data, and DESIGN.md names this same file as the phase-1 VPS deployment
+      # mechanism. Nothing here connects from another host: every DSN in the
+      # repository already says localhost. Remote access, if a later milestone
+      # needs it, arrives with a password from the environment and
+      # sslmode=require, recorded as a decision in DESIGN.md.
+      - "127.0.0.1:5433:5432"
     volumes:
       - verdict-pgdata:/var/lib/postgresql
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
