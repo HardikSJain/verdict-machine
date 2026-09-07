@@ -72,7 +72,7 @@ func Pool(t *testing.T) *pgxpool.Pool {
 	t.Cleanup(pool.Close)
 
 	// TRUNCATE does not fire row-level triggers, so the insert-only guard does not block it.
-	_, err = pool.Exec(ctx, "TRUNCATE bars, symbols, ingest_log RESTART IDENTITY")
+	_, err = pool.Exec(ctx, "TRUNCATE bars, symbols, symbol_links, ingest_log RESTART IDENTITY")
 	require.NoError(t, err)
 	return pool
 }
