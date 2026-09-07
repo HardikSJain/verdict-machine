@@ -64,4 +64,14 @@ func TestMigrateCreatesInsertOnlyMarketTables(t *testing.T) {
 	require.ErrorContains(t, err, "insert-only")
 	_, err = pool.Exec(ctx, "DELETE FROM bars WHERE symbol_id = 1")
 	require.ErrorContains(t, err, "insert-only")
+
+	// source names the price convention a row-set carries (eod2 adjusted in
+	// place, nse-bhavcopy unadjusted), so a value outside the allow-list is a
+	// row-set with no stated convention. bars is insert-only: such a row could
+	// never be corrected, only superseded, so the schema rejects it.
+	_, err = pool.Exec(ctx,
+		`INSERT INTO bars (symbol_id, date, source, series, open, high, low, close, volume, content_hash)
+		 VALUES (1, '2024-01-02', 'nse-bhavcopyy', 'EQ', 100, 105, 95, 102, 1000, $1)`,
+		[]byte{0})
+	require.ErrorContains(t, err, "bars_source_check")
 }
