@@ -11,8 +11,11 @@ The design, including every decision and its reason, is in
 ## Status
 
 M0 scaffold: Postgres schema, two data loaders (eod2 adjusted daily CSVs and
-raw NSE bhavcopy archives), an insert-only versioned bar store, and a
-point-in-time turnover-ranked universe.
+raw NSE bhavcopy archives), an insert-only versioned bar store, a
+point-in-time turnover-ranked universe, and the canonical-entity overlay that
+keeps a company whole across an ISIN change. The overlay ships with its map
+empty: the reviewed roster is committed but applying it to a store that cannot
+delete is a human's decision.
 
 ## Quick start
 
@@ -39,7 +42,14 @@ export EOD2_DIR=$HOME/.local/share/eod2
 - `bin/verdict ingest eod2 --dir $EOD2_DIR/src/eod2_data` loads the adjusted series.
 - `bin/verdict backfill --from 2011-09-01` pulls raw NSE bhavcopy archives, which
   still contain delisted names, so the universe has no survivorship bias.
-- `bin/verdict universe --as-of 2015-06-30` prints the top 500 by median turnover.
+- `bin/verdict universe --as-of 2015-06-30` prints the top 500 by median turnover. The
+  `last_break` column is the date a name's ISIN changed (a face-value split): its prices
+  are unadjusted on both sides of it, so a return computed across one is wrong by the split
+  factor.
+- `bin/verdict entities check` runs the canonical-entity invariants and reports successions
+  the map has not been told about. It is a monthly item and exits non-zero on either, and on
+  an incomplete archive. NSE reissues an ISIN on a split, so one company owns several
+  `symbol_id`s; `docs/DESIGN.md` has the whole story under "ISIN succession".
 
 The `mkdir -p` below is not decoration: the shell sets up the `>>` redirection
 before it runs anything, so on a machine where eod2 has never been cloned the
@@ -59,6 +69,7 @@ internal/db/             connection + embedded goose migrations
 internal/market/         Bar, Store (insert-only, versioned), universe
 internal/market/eod2/    eod2 CSV loader
 internal/market/bhavcopy/ NSE bhavcopy archive loader + backfill
+internal/market/entities/ succession candidates, the gates, the reviewed roster
 scripts/                 eod2 producer
 docs/                    DESIGN.md and plans
 ```

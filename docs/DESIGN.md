@@ -229,6 +229,16 @@ Kite Connect execution is the third Broker implementation and arrives in phase 2
   themselves, which is what the insert-only rule already gives. `valid_from` is the session
   date the ticker was observed for, so a read can ask "what was this called on this date"
   (market time) independently of "what did we believe then" (`ingested_at`, audit time).
+- `symbol_links(symbol_id, entity_id, reason, boundary, predecessor, evidence, roster_sha,
+  seeded_by, note, ingested_at)` version key `symbol_id`, insert-only, added by migration
+  0004. NSE reissues an ISIN on a face-value split, so one company owns several
+  `symbol_id`s; this is the overlay that names the canonical entity, and both readers
+  resolve identity through it. An entity is a FLAT equivalence class -- resolution is one
+  hop, never transitive -- enforced by a write-time trigger, because the resolver does not
+  walk and a two-hop map would silently split one entity in two with no error. A symbol
+  with no row is its own entity, which is the default for the ~3,600 symbols that never
+  changed ISIN. A wrong merge is corrected by inserting one more row (`reason =
+  'retraction'`), never by a delete: see the succession section below.
 - `bars(symbol_id, date, open, high, low, close, volume, delivery_qty, source, ingested_at)`
   version key `(symbol_id, date, source)`; the run config names the source; a revised
   bhavcopy adds a row, never updates one.
@@ -258,10 +268,29 @@ Kite Connect execution is the third Broker implementation and arrives in phase 2
   change_note)`
 - Positions and P&L are read models rebuilt from `events`, never a source of truth.
 
-`snapshot_id` = sha256 over every `bars`, `adjustments`, `symbols`, `holidays` and
-`charge_schedule` row with `ingested_at <= run.started_at`, taking the latest version of
-each key, iterated in sorted key order; `replay` applies the same predicate, so a later
-backfill or a revised bhavcopy cannot change what an old run saw. `runs.ledger_head_seq`
+`snapshot_id` = sha256 over every `bars`, `adjustments`, `symbols`, `symbol_links`,
+`holidays` and `charge_schedule` row with `ingested_at <= run.started_at`, taking the latest
+version of each key, iterated in sorted key order; `replay` applies the same predicate, so a
+later backfill or a revised bhavcopy cannot change what an old run saw. **`symbol_links` is
+in that row set because the link map decides every answer as surely as `adjustments` does**:
+without it, a hand-written link row inserted with a backdated `ingested_at` would change an
+old run's answer with nothing in the snapshot able to notice, and with it, replay detects the
+tampering. The **roster digest** -- the sha256 of `internal/market/entities/roster.json` over
+its RFC 8785 canonical form -- folds into `config_hash` instead, not into `snapshot_id`: a
+roster line for a company with no bars must not change every snapshot, but which reviewed
+roster was in force is worth recording even when a re-run is a no-op.
+
+**Two consequences of that inclusion, and the second one is destructive if it is forgotten.**
+First, migration 0004's `Down` drops the read surface only -- the view, `entity_map_at`, the
+flatness trigger and its function -- and deliberately **does not drop `symbol_links` or its
+rows**; every read reverts to per-symbol identity anyway, because `entity_map`'s `COALESCE`
+degrades to `symbol_id` once the Go side stops asking. Second, **once any run has recorded a
+`snapshot_id`, removing those rows is unavailable**: dropping the table then is not a
+rollback but permanent data loss, because re-running `entities apply` mints fresh
+`ingested_at` values that are not the ones the snapshot hashed, and every recorded run
+becomes irreproducible while the operation advertises itself as a revert. Removing the rows
+is a separate, deliberate act with no undo. (A practical consequence of the table surviving
+`Down`: 0004 is not re-runnable after one without dropping the table by hand.) `runs.ledger_head_seq`
 records the last event the run could see, and `replay` rebuilds positions from `events`
 with `seq <= ledger_head_seq`. Everything hashed uses RFC 8785 canonical JSON, map
 iteration is sorted, and wall-clock timestamps are excluded from hashed payloads. Together
@@ -322,6 +351,49 @@ cannot be trusted with a cron). If it must run on the Mac, launchd plus a `pmset
    next evening if the intent still holds; it is never chased.
 6. `replay --date T` regenerates step 2 from snapshot_id + git_sha and diffs byte-for-byte.
 7. `verify` evaluates the promotion gate and kill criteria from the ledger, weekly.
+
+### Monthly: `verdict entities check` (the entity map)
+
+The one recurring ops item this change adds, and it exists because the failure it looks for
+is silent. NSE reissues an ISIN 30 to 40 times a year; each reissue the map has not been told
+about fragments that company's history at the boundary and drops it out of the point-in-time
+universe for months, with no error, no missing row and no invariant violation -- the universe
+is simply short one large cap. The only way to notice is to re-run the generator and compare
+it against the map.
+
+§9 names the item as the pair `verdict entities propose` + `verdict entities check`. In
+practice `check` runs the read-only half of `propose` itself, so the monthly run is one
+command and `propose` is what you run afterwards, when there is something to write.
+
+Monthly, on a settled archive:
+
+1. `verdict entities check` -- runs I1/I2/I3 against the map, then re-generates candidates
+   read-only and reports every pair the gates would accept that the map does not carry.
+   **It exits non-zero on any accepted candidate the map is missing, and on any unsettled
+   `ingest_log` date inside the archive span** (it inherits gate G4a from `propose`: with a
+   hole in the archive a demerger reads as adjacent, and "no new candidates" from an
+   incomplete archive is a false negative rather than an answer). Quarantined pairs are
+   printed as a count and do not fail the run -- that queue is 181 deep and is not going to
+   be worked, and a permanently red check is one an operator stops reading. Advisory I3
+   findings likewise print without failing.
+2. If it fires on a missing link: `verdict entities propose --out internal/market/entities/roster.json`,
+   read `data/succession-review.jsonl` for the new pair, and open a PR. **The reviewer is
+   checking the generator, not 444 independent facts** (design §5.5), so a regression in
+   `propose` would be ratified wholesale over irreversible rows; review the diff in that
+   light.
+3. After the PR merges: `verdict entities apply --roster internal/market/entities/roster.json`.
+   Rows are stamped with the reviewed roster's sha256. If a link later turns out to be wrong,
+   `verdict entities retract --entity <id|isin> --note "..."` writes one more row and every
+   answer given while the wrong link stood stays replayable at its own timestamp.
+
+Two rules for when it may run. `propose` and the candidate half of `check` are **read-only
+but must not be run mid-backfill** -- G4 counts sessions out of `bars`, so a real session the
+store has not fetched reads as "zero sessions between" -- and `--skip-candidates` runs the
+invariants alone, which is the right thing during a backfill or on a store with no bars.
+`apply` and `retract` are the opposite: they take their own advisory lock (84031179), write
+under a second to a table nothing else writes, and are safe while a backfill is in flight.
+Budget about five seconds a run against the live store; it is one `DISTINCT ON` pass over the
+bhavcopy rows plus a few hundred probes.
 
 ### Backtest flow
 
@@ -419,7 +491,20 @@ only while `verify` stays green. A one-page runbook.
 - **M0, scaffold (week 0):** new public repo, go.mod, Postgres compose, goose (sqlc deferred to M2, when typed read models over the ledger arrive), Go toolchain as go.mod declares (pgx and goose enter go.mod when first imported), eod2
   producer cron, `ingest` for 15 years across the turnover-ranked universe. Tests: a known
   split day reconciles, and the 2015 universe contains a since-delisted name. No CI yet.
-- **M1, verdict (weeks 1 to 2):** `internal/cost` with the golden contract-note test;
+- **M1, verdict (weeks 1 to 2) -- read this before writing the engine.** Two hard
+  prerequisites, both from the ISIN succession change that landed in M0 and both easy to
+  miss because nothing fails loudly when they are skipped:
+  **(a) M1's first PR must call `EntityBoundaries` and must refuse to compute a return
+  across a boundary while `adjustments` is unbuilt.** After that change a company's series
+  is continuous in identity and still discontinuous in level -- `nse-bhavcopy` is unadjusted
+  -- so a 12-1 momentum signal crossing a 1:10 split reads -90% and looks like a number.
+  Before the change the two halves were disjoint and could not be differenced by accident;
+  now they can. `UniverseMember.LastBreak` carries the most recent boundary at or before
+  `asOf` and `verdict universe` prints it as `last_break`.
+  **(b) `runs` must record `snapshot_id` computed over the amended row set including
+  `symbol_links`, and `config_hash` including the roster digest.** See the data model and
+  the succession section for both.
+  Then the milestone itself: `internal/cost` with the golden contract-note test;
   `internal/risk` (max_positions, min notional, stock and book caps) wired into backtest
   sizing; engine + SimClock + Paper broker; both strategies registered, the 200-DMA ETF
   control paper-only; CI green with the frozen-fixture golden backtest; register the first
@@ -600,29 +685,144 @@ this document after that round and have not been re-reviewed.
   Remote access, if a later milestone needs it, arrives with a password from the environment
   and `sslmode=require`, recorded here as a decision.
 
-### Known limitation: ISIN succession (open, M1)
+### ISIN succession: the entity lens (built M0; the live map is empty until a human seeds it)
 
 `symbols` keys identity on ISIN, but NSE reissues an ISIN on a face-value split, so one
 company becomes several disjoint `symbol_id`s: Tata Steel is `INE081A01012` before its 2022
-1:10 split and `INE081A01020` after, and 534 of 4,092 tickers in the working database already
-hold more than one `symbol_id`. The consequences are real. History fragments at the split
-date; the 80%-presence rule in `UniverseAsOf` then drops a large cap out of the point-in-time
-universe for roughly six months around each change; and the two sources disagree about
-identity for the same company on the same date, which is precisely the cross-check two
-independent implementations are meant to buy.
+1:10 split and `INE081A01020` after. Measured against the working database today (4,100
+`symbol_id`s, 4,089 of them carrying `nse-bhavcopy` bars, 13,792,595 bars over 3,722
+sessions from 2011-09-02 to 2026-09-07): **491 tickers hold more than one `symbol_id`, and
+1,017 `symbol_id`s sit in such a group**. The consequences were real and are the reason this
+was repaired rather than noted. History fragments at the split date; the 80%-presence rule
+in `UniverseAsOf` then drops a large cap out of the point-in-time universe for roughly six
+months around each change -- with the liveness guard (stage 0) it drops the dead half
+immediately instead; and the two sources disagree about identity for the same company on the
+same date, which is precisely the cross-check two independent implementations are meant to
+buy.
 
-This was left open deliberately rather than patched. Preventing new fragmentation is the
-easy half (an insert-only `isin_aliases(symbol_id, isin, ingested_at)` table consulted before
-a `symbol_id` is minted). Repairing the existing half is not: `bars` rows carry the
-`symbol_id` assigned at insert time and the table is insert-only, so a retroactive merge
-needs either a full re-ingest or a canonical-entity layer resolved at read time through both
-readers -- a change to what every read means, and one that has to be seeded from a heuristic
-(an old ISIN whose bars stop on session N and a new ISIN under the same ticker whose bars
-start on session N+1) whose false positives would merge two different companies
-irreversibly. That belongs in its own change with its own review, before M1's engine reads
-`bars`. Until it lands, the "no survivorship bias" claim holds for every name that never
-changed its ISIN, and the M0 exit criterion (DHFL and JETAIRWAYS in a 2015 universe) is
-unaffected -- neither ever split.
+**An earlier revision of this section said "534 of 4,092 tickers", and the difference is worth
+more than the correction.** Neither number is reproducible against this store at any
+`ingested_at` pin -- the whole `symbols` table was written on 2026-09-07 and the count sweeps 0
+-> 497 -> 491 across that day without passing through 534 -- so the old figure was measured
+against a working database that no longer exists, and its "4,092" was a `symbol_id` count
+wearing the word "tickers". But the count also **went down while the archive grew**, and that
+is not a measurement error: pinned at 2026-09-07 11:00 UTC it is 497 and pinned at 14:00 UTC it
+is 490, with 283 `symbols` rows and 11,788 bars written in between by the weekend backfill run
+(644 rows and 30,680 bars by the time it finished at 14:12). `symbols` is insert-only and
+nothing was deleted; what changed is that a *rename* moves a `symbol_id` out of a shared-ticker
+group. `CADILAHC` is the clean example: `symbol_id` 1295 (`INE010B01019`) and 3056
+(`INE010B01027`) shared the ticker at 11:00, a later bhavcopy file renamed 3056 to `ZYDUSLIFE`,
+and the group vanished from the count -- while the two ids remain exactly as fragmented as they
+were, and the roster links them as a genuine succession with boundary 2015-10-07. **A
+ticker-keyed count measures naming, not fragmentation**, which is why the seeder is ISIN-keyed
+(design §5.2) and why the number that means something is the roster's: **625 candidates, 444
+auto-accepted links over 415 entities, 181 quarantined.** The stable structural count is that
+**525 NSDL issuer prefixes (`left(isin, 9)`) cover more than one `symbol_id`.**
+
+**What landed.** The canonical-entity layer exists: migration 0004 adds `symbol_links`, an
+insert-only overlay from physical `symbol_id` to canonical `entity_id` versioned on the same
+`ingested_at` axis as `bars` and `symbols`, and both readers resolve identity through it. The
+liveness guard drops a name whose last bar predates the window's final session. The seeder
+(`verdict entities propose|link|apply|retract|check`) generates candidates, runs gates G0-G6,
+and writes a reviewed roster to the store stamping its sha256 into every row. `bars` was not
+touched: not one of the 13,792,595 rows is rewritten, re-versioned or re-ingested, and a
+wrong merge is corrected by inserting one more row rather than by a rebuild. The full design,
+its staging and its test plan are in
+`.superpowers/sdd/2026-09-07-m0-scaffold/isin-design.md`.
+
+**What has not happened, and is a human's call.** `internal/market/entities/roster.json` is
+generated and committed; **it has not been applied to the live `verdict` database, and
+migration 0004 has not been run there either** (the live store is on 0003, so a binary built
+from this branch cannot read it until `verdict migrate` is run). Writing 444 irreversible
+merge rows into a store that cannot delete is a decision for someone who has read the diff,
+and this work stops one step before it. Until both happen, every symbol is its own entity,
+the read path answers exactly what it answered before, and the fragmentation above is still
+live.
+
+#### The hard prerequisite for M1
+
+**M1's first PR must call `EntityBoundaries`, and must refuse to compute a return across a
+boundary while `adjustments` is unbuilt.** This is a gate on M1, not a convention, and design
+§10 names it as the most likely thing in the whole change to be forgotten.
+
+The reason is that this repair makes unadjusted prices *more* dangerous, not less. Before it,
+a split gave the engine two disjoint series and it could not difference across the split by
+accident. Now the series is continuous in **identity** and still discontinuous in **level**,
+because `nse-bhavcopy` is unadjusted and the read-time `adjustments` layer does not exist: a
+12-1 momentum signal crossing a 1:10 split reads -90%, and it looks like a number rather than
+an error. The factor is not recoverable from the boundary either -- at the TATASTEEL boundary
+the ex-split session is 2022-07-27/28 (close 959.40 then 100.35) while the ISIN changes on
+07-29, so a ratio taken at the boundary reads 100.35 -> 107.60 and concludes "no split",
+wrong by 10x. That is why `symbol_links` carries no factor column.
+
+`Store.EntityBoundaries(entityIDs, asOfIngest)` returns every boundary inside each entity at
+the caller's pin, and `UniverseMember.LastBreak` carries the most recent one at or before
+`asOf`; `verdict universe` prints it as `last_break` with a header line counting the members
+that have one. Until `adjustments` exists the only safe use of them is to **refuse**.
+
+M1's `runs` table must also record `snapshot_id` computed over the amended row set including
+`symbol_links`, and `config_hash` including the roster digest -- see the data model above.
+
+#### Reading the map from a notebook: `entity_map_at(ts)`, never `entity_map_now`
+
+Migration 0004 publishes the resolution rule as a function so a Python notebook gets entities
+without reimplementing the Go CTEs. **The pinned form is the only one valid for replay:**
+
+```sql
+-- Every bar of one company, across every ISIN it has ever had, resolved at the SAME
+-- ingest pin the run recorded. Both bounds are the same timestamp on purpose.
+WITH pin AS (SELECT TIMESTAMPTZ '2026-09-07 18:30:00+05:30' AS ts)
+SELECT b.date, b.close, b.symbol_id, m.entity_id
+FROM bars b
+JOIN pin ON true
+JOIN entity_map_at(pin.ts) m ON m.symbol_id = b.symbol_id
+WHERE m.entity_id = 326            -- UniverseMember.EntityID from a run pinned at the same ts
+  AND b.source = 'nse-bhavcopy'
+  AND b.ingested_at <= pin.ts
+ORDER BY b.date;
+```
+
+`entity_map_now` is the interactive convenience and is **never valid for replay**. It carries
+no `ingested_at` bound at all, so a caller who pinned `UniverseAsOf` at T and joins its
+`EntityID` back to `bars` through `entity_map_now` reads T-resolved entity ids through a
+`now()`-resolved map. The two agree until the next split extends an entity or the next
+retraction dissolves one, and then they disagree silently -- and `snapshot_id` cannot catch
+it, because the row set is unchanged and only the view's resolution moved. The name is the
+only warning the join itself gives, which is why the function and not the view is what this
+document names. `market.Store.EntityMapAt` is the Go door onto the same function, so the CLI
+and a notebook resolve identity through one definition.
+
+#### What this does not fix, permanently
+
+- **Succession is 100% of the identity problem and roughly 39% of the price problem.** A
+  measurement taken while designing this change (isin-design.md §10) found 379 persistent
+  adjustment steps (>5%, held at least three sessions) across 290 distinct `symbol_id`s
+  **inside a single ISIN** -- bonus issues,
+  rights, demergers -- against 241 succession price steps. "ISIN succession: solved" must not
+  be read as "the bhavcopy series is now continuous". It is not.
+- **A wrong-but-disjoint merge cannot be detected from inside the store, and no amount of
+  invariant work changes that.** I2 fires only on date overlap, which gate G3 already forbids
+  at seed time, and I3 is a tautology on the set G1 admits. A reverse merger into a listed
+  shell, or a freed ticker reused by a different company, is correct by identity and wrong by
+  economics, and it passes every check this repository can run. G6 narrows the target; it
+  does not close it. The gates plus **one human review pass over 444 near-identical rows** are
+  the entire defence against the outcome the design names as the worst available, and
+  `TestEntityInvariantsCatchABogusLink_Disjoint` -- which asserts that nothing fires --
+  exists to keep that hole visible after this paragraph is forgotten.
+- **Replay reproduces the answer, not the judgement.** An alert produced while a bad link
+  stood was produced on a chimera, and the hash-chained ledger records that faithfully and
+  permanently. The three windows -- fragmented, merged, corrected -- each replay exactly at
+  their own timestamp, which is the most any design can offer here.
+- **The quarantine will not be worked.** 181 candidates today, 30-40 new splits a year, and
+  no forcing function. `verdict entities check` reports them as a count and deliberately does
+  not fail on them; only an *accepted* candidate the map does not carry fails the run.
+- **The 52 fund-unit (`INF`/`IN9`) pairs have no principled answer**, and the hole is live the
+  moment M1 puts an ETF in the universe. G1 is meaningless for `INF` -- one issuer code
+  covers dozens of unrelated schemes -- so the only route is a hand-written `manual` roster
+  line, which is exactly where a false positive would originate.
+- **Every read pays 15-30% forever** for a correction that matters to about 12% of symbols.
+  The ~3,600 symbols that never changed ISIN fund the fix for the 491 that did, on every
+  query.
 
 #### Stage 1 of the repair has landed (migration 0004, `symbol_links`)
 
@@ -642,10 +842,13 @@ in `.superpowers/sdd/2026-09-07-m0-scaffold/isin-design.md`.
 Two judgement calls made while implementing Stage 1, recorded here because they resolve
 places where that document says two things:
 
-1. **`verdict entities check` reports the three invariants only.** §4.6 describes the
+1. **`verdict entities check` reported the three invariants only.** §4.6 describes the
    command as "I1/I2/I3 plus unlinked candidates", but the candidate SQL and the G0–G6 gates
-   it runs are assigned to Stage 2 in §9, with the seeder. The candidate half is therefore
-   absent rather than half-built, and `CheckEntityInvariants` says so in its doc comment.
+   it runs are assigned to Stage 2 in §9, with the seeder. The candidate half was therefore
+   absent rather than half-built. *(Superseded in Stage 3, which added it once the generator
+   existed; `CheckEntityInvariants` is still invariants-only, and the candidate half sits in
+   the CLI, above both packages, because `internal/market/entities` imports
+   `internal/market` and the reverse would be a cycle.)*
 2. **I3 (issuer agreement) does not fail the command.** §4.6 calls I3 "advisory, non-fatal"
    while the CLI table beside it says `check` "exits non-zero on any violation". The more
    specific statement wins: I1 and I2 exit non-zero, I3 prints and does not. A face-value
@@ -685,13 +888,10 @@ about what the SQL guarantees, so the claim is what changed.
    the shape of §8.7b — a test that asserts nothing fires — and
    `TestSymbolLinksRejectsATwoHopMap`'s doc comment no longer claims the general rule.
 
-The rollback caveat from the migration is worth repeating here: 0004's `Down` drops the read
-surface (the view, `entity_map_at`, the flatness trigger) and deliberately **not** the table
-or its rows. Once any run records a `snapshot_id` computed over `symbol_links`, dropping the
-table is not a rollback, it is permanent data loss — re-running `apply` mints fresh
-`ingested_at` values that are not the ones the snapshot hashed. A consequence to know before
-using it: because the table survives `Down`, migration 0004 is not re-runnable after one
-without dropping the table by hand.
+The rollback caveat from the migration now lives with the row set it belongs to: see the
+`snapshot_id` paragraph in the data model above. In short, 0004's `Down` drops the read
+surface and deliberately not the table or its rows, and once any run has recorded a
+`snapshot_id` removing them is data loss rather than a rollback.
 
 #### Stage 2 of the repair has landed (the seeder, the gates and the roster)
 
@@ -870,3 +1070,60 @@ design says, leaves open, or claims.
     **degrades to no retraction memory when it does not**, which is the live store's state
     today (§0). It says which of the two it did on every run, because a report that stayed
     silent would be claiming a check it never ran.
+
+#### Stage 3 has landed (the fence and the docs)
+
+The last stage of the succession change adds no new behaviour to the read path. It makes the
+change legible -- the sections above are its output -- and it fences the one way M1 could
+silently produce wrong returns. Six judgement calls and one measurement, recorded here in the
+same spirit as the two stages before it.
+
+1. **`verdict entities check` gained the candidate half, and it is on by default.** §4.6
+   specifies it and §9 makes the pair of commands the monthly ops item; Stage 1 deferred it
+   because the generator did not exist. It lives in `cmd/verdict` rather than in
+   `market.CheckEntityInvariants`, because the generator is in `internal/market/entities`
+   which imports `internal/market`, and putting the scan in the store would be an import
+   cycle. `--skip-candidates` exists for a mid-backfill run or a store with no bars; it is
+   opt-out rather than opt-in because a monthly item that has to be asked for is one that
+   gets run without it and reports "no violations" from a store missing four hundred links.
+2. **A quarantined candidate does not fail the command. This is a deviation from a literal
+   reading of §4.6** ("exits non-zero on any violation or any new candidate"), taken for the
+   reason §4.6 itself gives about I3: 181 quarantined pairs exist today, §10 says plainly
+   that the queue will not be worked, and a check that is red every month regardless of what
+   happened is a check an operator learns to skip. Only an *accepted* candidate the map does
+   not carry -- a link the gates would make, that nothing has made -- fails the run. The
+   quarantined count is printed on every run so the queue stays visible.
+3. **The candidate scan inherits G4a rather than softening it**, so `check` also exits
+   non-zero while any date inside the archive span is unsettled in `ingest_log`. That is the
+   second half of §9's parenthetical, and it means one command covers both conditions the
+   monthly item names. The invariant report is printed *before* the scan runs, so a
+   mid-backfill refusal does not withhold an answer that was already computed.
+4. **`Store.EntityMapAt` is new and is not in the design's method list.** It reads the
+   published `entity_map_at(ts)` function rather than a fourth hand-rolled `DISTINCT ON`, so
+   the CLI, the tests and the notebook documentation resolve identity through one definition
+   -- which is the claim the notebook section above makes, and it would be an empty claim if
+   nothing in the repository went through that door. A pair counts as already linked only
+   when *both* symbols are present in the map and resolve to the same entity: a bare map
+   lookup would give two unknown symbols entity 0, compare 0 == 0, and report the pair as
+   safely linked.
+5. **`verdict universe` prints `last_break`, and prints the count even when it is zero.**
+   A field nothing prints is a fence nobody knows to call. The count line ("0 of 2,127
+   members carry a succession boundary at or before as-of") is the operator's evidence that
+   the map was consulted and came back empty, which is a different statement from the fence
+   not being wired at all -- and with the live map unseeded, empty is exactly what it says
+   today. The warning sentence about split factors appears only when the count is non-zero.
+6. **The stale numbers were resolved rather than overwritten**, as §10 required. The
+   measurement is in the section above: a ticker-keyed count is not monotone in the archive,
+   because `symbols` is insert-only but a *rename* moves a `symbol_id` out of a shared-ticker
+   group, and the count fell 497 -> 490 on 2026-09-07 between 11:00 and 14:00 UTC while 644
+   `symbols` rows and 31k bars were added and nothing was deleted. `CADILAHC` -> `ZYDUSLIFE`
+   is the worked example. The old "534 of 4,092" is not reproducible at any pin in this
+   store and was measured against a database that no longer exists.
+
+**The state of the live store after this branch, stated plainly because it is the thing most
+likely to be assumed rather than checked:** the `verdict` database is on migration **0003**.
+`symbol_links` does not exist there, the roster has not been applied, and a binary built from
+this branch cannot read that store at all until `verdict migrate` is run against it (both
+readers join `entity_map`, which needs the table). Applying 0004 is safe during a run -- a
+binary built before it simply never reads the table -- and it is a human's call, as is the
+`apply` that follows it.
