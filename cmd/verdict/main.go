@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -232,23 +233,7 @@ func newUniverseCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			w := cmd.OutOrStdout()
-			// liveness names which membership rule actually ran, because
-			// RequiredLastSession is the only thing distinguishing "no halted
-			// names qualified" from "--allow-stale was silently ignored".
-			liveness := "last-session-required"
-			if !u.RequiredLastSession {
-				liveness = "allow-stale"
-			}
-			// The realised window comes first: a store that holds fewer than
-			// --lookback sessions ranks on what it has, and the rows below
-			// look exactly the same either way.
-			fmt.Fprintf(w, "# as-of %s, source %s, window %d of %d sessions requested, %d symbols, liveness=%s\n",
-				asOf.Format("2006-01-02"), source, u.Sessions, lookback, len(u.Members), liveness)
-			fmt.Fprintf(w, "rank\tticker\tisin\tmedian_turnover_inr\tdays\n")
-			for i, m := range u.Members {
-				fmt.Fprintf(w, "%d\t%s\t%s\t%.0f\t%d\n", i+1, m.Ticker, m.ISIN, m.MedianTurnover, m.DaysPresent)
-			}
+			writeUniverse(cmd.OutOrStdout(), u, asOf, source, lookback)
 			return nil
 		},
 	}
@@ -259,6 +244,64 @@ func newUniverseCmd() *cobra.Command {
 	cmd.Flags().Bool("allow-stale", false, "keep names whose last bar predates the window's final session (halted/suspended names); default drops them")
 	cmd.Flags().String("database-url", "", "Postgres URL (default $VERDICT_DATABASE_URL)")
 	return cmd
+}
+
+// writeUniverse renders one universe, and it is a separate function so the
+// header can be asserted on without a database.
+//
+// The last_break column is the fence. After the entity change a company that
+// changed ISIN comes back as ONE member with a continuous 125-session
+// window, which is the whole point -- and is exactly what makes the prices
+// more dangerous than they were: nse-bhavcopy is unadjusted and no
+// adjustments layer exists, so the series is continuous in identity and
+// discontinuous in LEVEL. Before this change the two halves were separate
+// members and nothing could difference across the split by accident. Now a
+// 12-1 momentum reading across a 1:10 split returns -90% and looks like a
+// number. The factor is not recoverable from the boundary either: at the
+// TATASTEEL boundary the ex-split session falls one session BEFORE the ISIN
+// changes, so the boundary ratio reads 100.35 -> 107.60 and says "no split".
+// So the column names the date and the header says what it costs.
+//
+// The count line prints even at zero. The live store's map is empty until a
+// human applies the roster, and "0 of N" is the operator's evidence that the
+// map was consulted and came back empty -- a different statement from the
+// fence not being wired at all.
+func writeUniverse(w io.Writer, u market.Universe, asOf time.Time, source string, lookback int) {
+	// liveness names which membership rule actually ran, because
+	// RequiredLastSession is the only thing distinguishing "no halted
+	// names qualified" from "--allow-stale was silently ignored".
+	liveness := "last-session-required"
+	if !u.RequiredLastSession {
+		liveness = "allow-stale"
+	}
+	// The realised window comes first: a store that holds fewer than
+	// --lookback sessions ranks on what it has, and the rows below
+	// look exactly the same either way.
+	fmt.Fprintf(w, "# as-of %s, source %s, window %d of %d sessions requested, %d symbols, liveness=%s\n",
+		asOf.Format("2006-01-02"), source, u.Sessions, lookback, len(u.Members), liveness)
+	broken := 0
+	for _, m := range u.Members {
+		if m.LastBreak != nil {
+			broken++
+		}
+	}
+	fmt.Fprintf(w, "# succession: %d of %d members carry a succession boundary at or before as-of\n",
+		broken, len(u.Members))
+	if broken > 0 {
+		fmt.Fprintln(w, "# a return computed across last_break is wrong by the split factor: nse-bhavcopy prices are"+
+			" unadjusted and the read-time adjustments layer does not exist. Call EntityBoundaries and refuse the return.")
+	}
+	fmt.Fprintf(w, "rank\tticker\tisin\tmedian_turnover_inr\tdays\tlast_break\n")
+	for i, m := range u.Members {
+		// A dash, not an empty cell: a blank field in a tab-separated row
+		// reads as a parse error rather than as "no boundary".
+		lastBreak := "-"
+		if m.LastBreak != nil {
+			lastBreak = m.LastBreak.Format("2006-01-02")
+		}
+		fmt.Fprintf(w, "%d\t%s\t%s\t%.0f\t%d\t%s\n",
+			i+1, m.Ticker, m.ISIN, m.MedianTurnover, m.DaysPresent, lastBreak)
+	}
 }
 
 // parseIngestPin turns `--as-of-ingest` into the ingested_at pin every store
