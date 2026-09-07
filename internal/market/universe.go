@@ -6,13 +6,34 @@ import (
 	"time"
 )
 
-// UniverseMember is one row of a point-in-time universe ranking.
+// UniverseMember is one row of a point-in-time universe ranking. It names an
+// ENTITY -- a company -- not a physical symbol_id, because NSE reissues an
+// ISIN on a face-value split and neither half of a split company can clear
+// the 80% presence gate for roughly six months around the change.
 type UniverseMember struct {
+	// EntityID is the canonical company and the key a caller must join back
+	// to bars on -- through entity_map_at(the same asOfIngest that produced
+	// this row), never through entity_map_now. Resolving a pinned read's
+	// entity ids at now() is the replay leak: the row set is unchanged and
+	// only the resolution moves, so nothing downstream can notice.
+	EntityID int64
+	// SymbolID is the member whose label is in force on asOf: post-split for
+	// a present-day query, pre-split for a 2015 one. It is NOT a safe join
+	// key for the window -- see Fragments.
 	SymbolID       int64
 	ISIN           string
 	Ticker         string
 	MedianTurnover float64 // rupees per day, median over the lookback window
-	DaysPresent    int
+	// DaysPresent counts distinct SESSIONS the entity traded on, not rows.
+	DaysPresent int
+	// Fragments is how many physical symbol_ids contributed to this window.
+	// Greater than one means joining SymbolID straight back to bars.symbol_id
+	// would silently miss part of the window.
+	Fragments int
+	// LastBreak is the most recent succession boundary at or before asOf, if
+	// any. A return computed across it on unadjusted bhavcopy prices is wrong
+	// by the split factor; see EntityBoundaries.
+	LastBreak *time.Time
 }
 
 // Universe is one point-in-time universe: the ranked members, and the number
@@ -72,24 +93,42 @@ const windowCTE = `
 		SELECT DISTINCT date FROM latest ORDER BY date DESC LIMIT $5
 	)`
 
-// UniverseAsOf ranks series-EQ symbols by median daily rupee turnover over the
-// last lookbackDays sessions ending at asOf, using only bar versions ingested
-// at or before asOfIngest, and returns the top n. A symbol must be present on
-// at least 80% of the window's sessions AND, by default, must have traded on
-// the window's final session -- see AllowStaleMembers. Because it is computed
-// from bars alone, a name that traded then and was delisted since is still in
-// the universe for that date; no survivorship bias. The liveness rule is
-// narrower than survivorship: it excludes a name that had already gone dark
-// by asOf (a succession that left the old ISIN untraded, a suspension), not
-// one that trades fine on asOf and is delisted only later.
+// UniverseAsOf ranks series-EQ ENTITIES by median daily rupee turnover over
+// the last lookbackDays sessions ending at asOf, using only bar versions
+// ingested at or before asOfIngest, and returns the top n. An entity must be
+// present on at least 80% of the window's sessions AND, by default, must have
+// traded on the window's final session -- see AllowStaleMembers. Because it
+// is computed from bars alone, a name that traded then and was delisted since
+// is still in the universe for that date; no survivorship bias. The liveness
+// rule is narrower than survivorship: it excludes a name that had already
+// gone dark by asOf (a succession that left the old ISIN untraded, a
+// suspension), not one that trades fine on asOf and is delisted only later.
+//
+// Grouping on entity rather than symbol_id is what this whole layer exists
+// for. NSE reissues an ISIN on a face-value split, so a split company is two
+// disjoint symbol_ids and NEITHER can clear the 80% gate for roughly six
+// months around the change: measured on the live store at asOf 2022-10-31
+// with a 125-session lookback, TATASTEEL's two halves hold 62 and 63 of 125
+// sessions where 100 are needed, so India's 28th most traded name is absent
+// from its own point-in-time universe for that entire window and then
+// reappears as a stranger with no history. 491 tickers in the live database
+// already hold more than one symbol_id and 101 of them are in today's top 500
+// by median turnover. Presence is therefore counted in distinct SESSIONS
+// across the entity's members, not in rows.
+//
+// DaysPresent is a semantic change from the per-symbol version and old and
+// new values are not guaranteed to match. When an entity's members overlap on
+// a session -- which is only possible through a wrong link -- this returns an
+// error rather than a ranking; see the member_rows check below.
 //
 // When the store holds fewer than lookbackDays sessions the window silently
 // shortens to what is there -- the 80% presence rule scales with it too -- so
 // the realised session count comes back in Universe.Sessions rather than
 // leaving a two-session ranking indistinguishable from a six-month one.
 //
-// Each member is labelled with the ticker its symbol carried on asOf, not
-// today's ticker; see symbolLabelLateral.
+// Each member is labelled with the ISIN and ticker its ENTITY carried on asOf
+// -- the member in force on that date, then that member's label in force on
+// that date; see entityMemberCTE and symbolLabelLateral.
 //
 // For sources without a turnover column (eod2), close * volume stands in.
 func (s *Store) UniverseAsOf(ctx context.Context, source string, asOf time.Time, lookbackDays, n int, asOfIngest time.Time, opts ...UniverseOption) (Universe, error) {
@@ -130,24 +169,44 @@ func (s *Store) UniverseAsOf(ctx context.Context, source string, asOf time.Time,
 	// short-circuits and the term is a no-op; when true, bool_or(...) demands
 	// that the symbol traded on the window's very last session. Getting the
 	// polarity backwards here would silently invert default and opt-in.
-	rows, err := s.pool.Query(ctx, windowCTE+`, window_rows AS (
-			SELECT l.symbol_id, l.date, COALESCE(l.turnover, l.close * l.volume)::float8 AS turnover
-			FROM latest l JOIN days USING (date)
+	rows, err := s.pool.Query(ctx, windowCTE+`, `+
+		entityMapCTE("$4")+`, `+
+		entityMemberCTE("$2", "$4")+`, `+
+		entityLabelCTE("$2", "$4")+`, window_rows AS (
+			SELECT m.entity_id, l.symbol_id, l.date,
+			       COALESCE(l.turnover, l.close * l.volume)::float8 AS turnover
+			FROM latest l
+			JOIN days USING (date)
+			JOIN entity_map m ON m.symbol_id = l.symbol_id
 			WHERE l.series = 'EQ'
 		), ranked AS (
-			SELECT symbol_id,
+			SELECT entity_id,
 			       percentile_cont(0.5) WITHIN GROUP (ORDER BY turnover)::float8 AS median_turnover,
-			       count(*)::int AS days_present
+			       count(DISTINCT date)::int      AS days_present,
+			       count(*)::int                  AS member_rows,
+			       count(DISTINCT symbol_id)::int AS fragments
 			FROM window_rows
-			GROUP BY symbol_id
-			HAVING count(*) >= ceil(0.8 * (SELECT count(*) FROM days))
+			GROUP BY entity_id
+			HAVING count(DISTINCT date) >= ceil(0.8 * (SELECT count(*) FROM days))
 			   AND ($7 IS FALSE OR bool_or(date = (SELECT max(date) FROM days)))
+		), entity_break AS (
+			SELECT m.entity_id, max(k.boundary) AS last_break
+			FROM entity_map m
+			JOIN LATERAL (
+				SELECT boundary FROM symbol_links
+				WHERE symbol_id = m.symbol_id AND ingested_at <= $4
+				ORDER BY ingested_at DESC LIMIT 1
+			) k ON true
+			WHERE k.boundary IS NOT NULL AND k.boundary <= $2
+			GROUP BY m.entity_id
 		)
-		SELECT w.sessions, r.symbol_id, sym.isin, sym.ticker, r.median_turnover, r.days_present
+		SELECT w.sessions, r.entity_id, el.symbol_id, el.isin, el.ticker,
+		       r.median_turnover, r.days_present, r.member_rows, r.fragments, eb.last_break
 		FROM (SELECT count(*)::int AS sessions FROM days) w
 		LEFT JOIN ranked r ON true
-		LEFT JOIN LATERAL `+symbolLabelLateral("r.symbol_id", "$2", "$4")+` sym ON true
-		ORDER BY r.median_turnover DESC NULLS LAST, sym.ticker
+		LEFT JOIN entity_label el ON el.entity_id = r.entity_id
+		LEFT JOIN entity_break eb ON eb.entity_id = r.entity_id
+		ORDER BY r.median_turnover DESC NULLS LAST, el.ticker
 		LIMIT $6`, source, asOf, since, asOfIngest, lookbackDays, n, requireLastSession)
 	if err != nil {
 		return Universe{}, fmt.Errorf("universe: %w", err)
@@ -158,18 +217,44 @@ func (s *Store) UniverseAsOf(ctx context.Context, source string, asOf time.Time,
 		var m UniverseMember
 		// Nullable only for the no-members row described above; when `ranked`
 		// has anything at all, every one of these is present on every row.
-		var symbolID *int64
+		var entityID, symbolID *int64
 		var isin, ticker *string
 		var median *float64
-		var daysPresent *int
-		if err := rows.Scan(&u.Sessions, &symbolID, &isin, &ticker, &median, &daysPresent); err != nil {
+		var daysPresent, memberRows, fragments *int
+		var lastBreak *time.Time
+		if err := rows.Scan(&u.Sessions, &entityID, &symbolID, &isin, &ticker, &median,
+			&daysPresent, &memberRows, &fragments, &lastBreak); err != nil {
 			return Universe{}, err
 		}
-		if symbolID == nil {
+		if entityID == nil {
 			continue
 		}
-		m.SymbolID, m.ISIN, m.Ticker = *symbolID, *isin, *ticker
-		m.MedianTurnover, m.DaysPresent = *median, *daysPresent
+		// `latest` is DISTINCT ON (symbol_id, date), so within one entity
+		// member_rows > days_present says two members traded the same
+		// session: two genuinely different companies merged by a bad link,
+		// in a store that cannot delete. Absorbed silently it would return a
+		// median over two companies' turnovers and inflate the entity past
+		// the 80% gate, with no error anywhere. This is the only overlap
+		// detector on the read M1 actually calls -- BarsForDate has zero
+		// non-test callers -- so it is the one that has to fire.
+		if *memberRows > *daysPresent {
+			return Universe{}, fmt.Errorf(
+				"universe: entity %d has %d member rows over %d distinct sessions in the %d-session %s window "+
+					"ending %s; two members of one entity traded the same session, so the link joining them "+
+					"merges two different companies -- run `verdict entities check` before trusting this universe",
+				*entityID, *memberRows, *daysPresent, u.Sessions, source, asOf.Format("2006-01-02"))
+		}
+		if symbolID == nil || isin == nil || ticker == nil {
+			return Universe{}, fmt.Errorf(
+				"universe: entity %d ranked but has no label in force on %s; entity_member lost a member",
+				*entityID, asOf.Format("2006-01-02"))
+		}
+		m.EntityID, m.SymbolID, m.ISIN, m.Ticker = *entityID, *symbolID, *isin, *ticker
+		m.MedianTurnover, m.DaysPresent, m.Fragments = *median, *daysPresent, *fragments
+		if lastBreak != nil {
+			d := Day(lastBreak.Year(), lastBreak.Month(), lastBreak.Day())
+			m.LastBreak = &d
+		}
 		u.Members = append(u.Members, m)
 	}
 	if err := rows.Err(); err != nil {

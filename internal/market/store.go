@@ -359,29 +359,88 @@ func symbolLabelLateral(idExpr, dateExpr, ingestExpr string) string {
 	)`
 }
 
+// StoredBar is a bar plus the store identity it was read under. Bar itself
+// stays a pure value type built by parsers that know nothing about the store.
+//
+// SymbolID is the physical row's own symbol -- what bars.symbol_id holds and
+// what a version key is built from. EntityID is the canonical company it
+// belongs to, and the two differ for every member of a succession. A caller
+// grouping a company's history must group on EntityID; a caller writing bars
+// must use SymbolID.
+type StoredBar struct {
+	Bar
+	SymbolID int64
+	EntityID int64
+}
+
 // BarsForDate returns the latest version of every bar for one source and date,
 // as it was known at asOfIngest (rows ingested later are invisible). Each bar
-// carries the ticker its symbol held on that session date, not today's.
-func (s *Store) BarsForDate(ctx context.Context, source string, date, asOfIngest time.Time) ([]Bar, error) {
-	rows, err := s.pool.Query(ctx, `
-		SELECT DISTINCT ON (b.symbol_id) sym.isin, sym.ticker, b.series, b.date,
-		       b.open::float8, b.high::float8, b.low::float8, b.close::float8, b.volume,
-		       b.turnover::float8, b.delivery_qty
-		FROM bars b
-		JOIN LATERAL `+symbolLabelLateral("b.symbol_id", "b.date", "$3")+` sym ON true
-		WHERE b.source = $1 AND b.date = $2 AND b.ingested_at <= $3
-		ORDER BY b.symbol_id, b.ingested_at DESC`, source, date, asOfIngest)
+// carries the label its ENTITY held on that session date -- the member in
+// force on it, per entityMemberCTE -- not today's, and not necessarily the
+// label of the symbol the row is physically filed under.
+//
+// That last clause is a deliberate change of answer and is worth stating
+// plainly: eod2.LoadDir files a ticker's whole CSV under today's ISIN, so an
+// eod2 bar for Tata Steel on 2015-01-02 is physically the post-2022 symbol's
+// row. It now comes back as INE081A01012 / TATASTEEL, because on that session
+// the ISIN really was INE081A01012. It is a move toward market time, not away
+// from it, and it applies only to eod2 rows and only to queries pinned at or
+// after a seed.
+//
+// The identity restored is IDENTITY ONLY. eod2 bars are split-adjusted in
+// place and nse-bhavcopy bars are not, so for every pre-boundary session the
+// two sources' closes for one entity differ by the cumulative succession
+// factor (TATASTEEL on 2015-01-02: eod2 41.10, bhavcopy 410.75, exactly
+// 1:10). A cross-source price comparator built on this without the read-time
+// adjustments layer would read a 10x disagreement as a data error.
+//
+// It errors rather than returning rows when two members of one entity hold a
+// bar for this source and date. That is the catastrophic false positive -- a
+// roster line merging two genuinely different companies, in a store with no
+// DELETE -- and collapsing it silently would halve one company's truth while
+// looking exactly like a normal read. Cross-SOURCE coexistence is expected
+// and untouched, because this read filters by source.
+func (s *Store) BarsForDate(ctx context.Context, source string, date, asOfIngest time.Time) ([]StoredBar, error) {
+	rows, err := s.pool.Query(ctx, `WITH `+
+		entityMapCTE("$3")+`, `+
+		entityMemberCTE("$2", "$3")+`, `+
+		entityLabelCTE("$2", "$3")+`,
+		latest AS (
+			SELECT DISTINCT ON (b.symbol_id)
+			       b.symbol_id, b.series, b.date, b.open, b.high, b.low, b.close,
+			       b.volume, b.turnover, b.delivery_qty
+			FROM bars b
+			WHERE b.source = $1 AND b.date = $2 AND b.ingested_at <= $3
+			ORDER BY b.symbol_id, b.ingested_at DESC
+		)
+		SELECT m.entity_id, l.symbol_id, el.isin, el.ticker, l.series, l.date,
+		       l.open::float8, l.high::float8, l.low::float8, l.close::float8, l.volume,
+		       l.turnover::float8, l.delivery_qty,
+		       count(*) OVER (PARTITION BY m.entity_id) AS members_on_date
+		FROM latest l
+		JOIN entity_map m    ON m.symbol_id = l.symbol_id
+		JOIN entity_label el ON el.entity_id = m.entity_id
+		ORDER BY el.ticker, l.symbol_id`, source, date, asOfIngest)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("bars: %w", err)
 	}
 	defer rows.Close()
-	var out []Bar
+	var out []StoredBar
 	for rows.Next() {
-		var b Bar
+		var b StoredBar
 		var d time.Time
-		if err := rows.Scan(&b.ISIN, &b.Ticker, &b.Series, &d, &b.Open, &b.High, &b.Low, &b.Close, &b.Volume,
-			&b.Turnover, &b.DeliveryQty); err != nil {
+		var membersOnDate int64
+		if err := rows.Scan(&b.EntityID, &b.SymbolID, &b.ISIN, &b.Ticker, &b.Series, &d,
+			&b.Open, &b.High, &b.Low, &b.Close, &b.Volume, &b.Turnover, &b.DeliveryQty,
+			&membersOnDate); err != nil {
 			return nil, err
+		}
+		if membersOnDate > 1 {
+			return nil, fmt.Errorf(
+				"bars: entity %d has %d members holding a %s bar on %s; two members of one entity cannot "+
+					"trade the same session, so the link joining them merges two different companies -- "+
+					"run `verdict entities check` and retract the link before trusting this read",
+				b.EntityID, membersOnDate, source, date.Format("2006-01-02"))
 		}
 		b.Date = Day(d.Year(), d.Month(), d.Day())
 		out = append(out, b)

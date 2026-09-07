@@ -154,7 +154,7 @@ func TestIngestLog(t *testing.T) {
 	require.False(t, done[market.Day(2015, 6, 27)], "errors are retried, so they are not done")
 }
 
-func closeOf(bars []market.Bar, ticker string) float64 {
+func closeOf(bars []market.StoredBar, ticker string) float64 {
 	for _, b := range bars {
 		if b.Ticker == ticker {
 			return b.Close
