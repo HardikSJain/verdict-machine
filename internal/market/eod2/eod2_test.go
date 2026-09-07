@@ -133,3 +133,33 @@ func TestLoadDir_MatchesUpperCaseCSVExtension(t *testing.T) {
 	require.Len(t, got, 2, "reliance.CSV should have been loaded despite its upper-case extension")
 	require.Equal(t, "INE002A01018", got[0].ISIN)
 }
+
+// TestParseDaily_RejectsNonFiniteNumbers covers the gap that strconv leaves
+// open: ParseFloat("nan"/"inf"/"-inf") returns a value with a nil error, pgx
+// encodes those into a numeric column as Postgres NaN / Infinity rather than
+// failing, and Postgres sorts NaN above every real number -- so one poisoned
+// close in one third-party CSV would rank first in the turnover-ranked
+// universe. The integer cases cover the second half of the same escape:
+// int64(NaN) is 0 and int64(+Inf) is maxint in Go, so a nonsense quantity
+// would become a plausible-looking one with no error anywhere.
+func TestParseDaily_RejectsNonFiniteNumbers(t *testing.T) {
+	for _, tc := range []struct {
+		name, row, want string
+	}{
+		{"nan close", "2022-07-28,98.1,102.0,97.15,nan,137156107,EQ,628262.0,218.31,52403544.0", "Close is NaN"},
+		{"inf open", "2022-07-28,inf,102.0,97.15,100.35,137156107,EQ,628262.0,218.31,52403544.0", "Open is +Inf"},
+		{"-inf low", "2022-07-28,98.1,102.0,-inf,100.35,137156107,EQ,628262.0,218.31,52403544.0", "Low is -Inf"},
+		{"nan volume", "2022-07-28,98.1,102.0,97.15,100.35,nan,EQ,628262.0,218.31,52403544.0", "Volume is NaN"},
+		{"nan delivery qty", "2022-07-28,98.1,102.0,97.15,100.35,137156107,EQ,628262.0,218.31,nan", "DLV_QTY is NaN"},
+		{"volume past int64", "2022-07-28,98.1,102.0,97.15,100.35,1e19,EQ,628262.0,218.31,52403544.0",
+			"outside the range of a 64-bit integer"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bars, err := ParseDaily(strings.NewReader(eod2Header+"\n"+tc.row+"\n"), "TATASTEEL", "INE081A01020")
+			require.Error(t, err, "a non-finite or out-of-range number must not become a bar")
+			require.Nil(t, bars)
+			require.Contains(t, err.Error(), tc.want)
+			require.Contains(t, err.Error(), "line 2")
+		})
+	}
+}

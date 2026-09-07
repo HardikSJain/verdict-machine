@@ -86,21 +86,27 @@ func ParseDaily(r io.Reader, ticker, isin string) ([]market.Bar, error) {
 		b := market.Bar{ISIN: isin, Ticker: ticker, Series: strings.TrimSpace(rec[col["Series"]]),
 			Date: market.Day(date.Year(), date.Month(), date.Day())}
 		var perr error
-		b.Open, perr = number(rec[col["Open"]], perr)
-		b.High, perr = number(rec[col["High"]], perr)
-		b.Low, perr = number(rec[col["Low"]], perr)
-		b.Close, perr = number(rec[col["Close"]], perr)
-		vol, perr := number(rec[col["Volume"]], perr)
+		b.Open, perr = number("Open", rec[col["Open"]], perr)
+		b.High, perr = number("High", rec[col["High"]], perr)
+		b.Low, perr = number("Low", rec[col["Low"]], perr)
+		b.Close, perr = number("Close", rec[col["Close"]], perr)
+		vol, perr := number("Volume", rec[col["Volume"]], perr)
 		if perr != nil {
 			return nil, fmt.Errorf("eod2 %s line %d: %w", ticker, line, perr)
 		}
-		b.Volume = int64(vol)
+		b.Volume, perr = market.Count("Volume", vol)
+		if perr != nil {
+			return nil, fmt.Errorf("eod2 %s line %d: %w", ticker, line, perr)
+		}
 		if i, ok := col["DLV_QTY"]; ok && i < len(rec) && strings.TrimSpace(rec[i]) != "" {
-			dlv, err := strconv.ParseFloat(strings.TrimSpace(rec[i]), 64)
+			dlv, err := number("DLV_QTY", rec[i], nil)
 			if err != nil {
-				return nil, fmt.Errorf("eod2 %s line %d: DLV_QTY: %w", ticker, line, err)
+				return nil, fmt.Errorf("eod2 %s line %d: %w", ticker, line, err)
 			}
-			q := int64(dlv)
+			q, err := market.Count("DLV_QTY", dlv)
+			if err != nil {
+				return nil, fmt.Errorf("eod2 %s line %d: %w", ticker, line, err)
+			}
 			b.DeliveryQty = &q
 		}
 		bars = append(bars, b)
@@ -109,12 +115,19 @@ func ParseDaily(r io.Reader, ticker, isin string) ([]market.Bar, error) {
 }
 
 // number parses a float field, threading a prior error so callers check once.
-func number(s string, prev error) (float64, error) {
+// field names the column in the error message. A non-finite value is rejected
+// here rather than stored: strconv.ParseFloat accepts "nan", "inf" and "-inf"
+// with a nil error, and these CSVs are produced by a third-party process this
+// repository does not control. See market.Finite.
+func number(field, s string, prev error) (float64, error) {
 	if prev != nil {
 		return 0, prev
 	}
 	v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
 	if err != nil {
+		return 0, fmt.Errorf("%s: %w", field, err)
+	}
+	if err := market.Finite(field, v); err != nil {
 		return 0, err
 	}
 	return v, nil

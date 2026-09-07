@@ -113,10 +113,18 @@ func parseRows(name string, cr *csv.Reader, l layout, col map[string]int) ([]mar
 			if err != nil {
 				return nil, fmt.Errorf("bhavcopy %s line %d: %s %q: %w", name, line, c, field(rec, c), err)
 			}
+			// ParseFloat accepts "nan"/"inf" with a nil error; see market.Finite.
+			if err := market.Finite(c, v); err != nil {
+				return nil, fmt.Errorf("bhavcopy %s line %d: %w", name, line, err)
+			}
 			nums[i] = v
 		}
 		b.Open, b.High, b.Low, b.Close = nums[0], nums[1], nums[2], nums[3]
-		b.Volume = int64(nums[4])
+		vol, err := market.Count(l.volume, nums[4])
+		if err != nil {
+			return nil, fmt.Errorf("bhavcopy %s line %d: %w", name, line, err)
+		}
+		b.Volume = vol
 		turnover := nums[5]
 		b.Turnover = &turnover
 		if b.ISIN == "" {

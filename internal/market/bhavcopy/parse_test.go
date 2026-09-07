@@ -2,6 +2,7 @@ package bhavcopy
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -96,4 +97,32 @@ func TestURLFor_SwitchesFormatOn2024_07_08(t *testing.T) {
 	require.Equal(t,
 		"https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_20240708_F_0000.csv.zip",
 		URLFor(time.Date(2024, 7, 8, 0, 0, 0, 0, time.UTC)))
+}
+
+// TestParse_RejectsNonFiniteNumbers is the bhavcopy half of the same guard as
+// eod2's TestParseDaily_RejectsNonFiniteNumbers: strconv.ParseFloat accepts
+// "nan", "inf" and "-inf" with a nil error, pgx writes those into a numeric
+// column, and Postgres orders NaN above every real number, so one poisoned
+// price would rank first in the point-in-time universe. int64(NaN) is 0 and
+// int64(+Inf) is maxint, so the quantity columns need a range check too.
+func TestParse_RejectsNonFiniteNumbers(t *testing.T) {
+	const header = "SYMBOL,SERIES,OPEN,HIGH,LOW,CLOSE,TOTTRDQTY,TOTTRDVAL,TIMESTAMP,ISIN\n"
+	for _, tc := range []struct {
+		name, row, want string
+	}{
+		{"nan close", "TESTCO,EQ,100.00,110.00,90.00,nan,1000,105000.00,30-Jun-2015,TESTISIN0001", "CLOSE is NaN"},
+		{"inf high", "TESTCO,EQ,100.00,inf,90.00,105.00,1000,105000.00,30-Jun-2015,TESTISIN0001", "HIGH is +Inf"},
+		{"-inf turnover", "TESTCO,EQ,100.00,110.00,90.00,105.00,1000,-inf,30-Jun-2015,TESTISIN0001", "TOTTRDVAL is -Inf"},
+		{"nan volume", "TESTCO,EQ,100.00,110.00,90.00,105.00,nan,105000.00,30-Jun-2015,TESTISIN0001", "TOTTRDQTY is NaN"},
+		{"volume past int64", "TESTCO,EQ,100.00,110.00,90.00,105.00,1e19,105000.00,30-Jun-2015,TESTISIN0001",
+			"outside the range of a 64-bit integer"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bars, err := Parse("poisoned.csv", strings.NewReader(header+tc.row+"\n"))
+			require.Error(t, err, "a non-finite or out-of-range number must not become a bar")
+			require.Nil(t, bars)
+			require.Contains(t, err.Error(), tc.want)
+			require.Contains(t, err.Error(), "line 2")
+		})
+	}
 }
