@@ -15,7 +15,10 @@
 -- they take 0001-01-01: every one of them applies to every bar date, and ties
 -- among them still break on ingested_at DESC, which is exactly how they were
 -- read before. The default is then dropped so every new version has to state
--- the date it was observed for.
+-- the date it was observed for. (Consequence worth knowing before running this
+-- against a live database: a `verdict` binary built before this migration
+-- inserts symbols rows without valid_from and will fail to register a new
+-- ISIN once it is applied, so apply it between runs, not during one.)
 ALTER TABLE symbols ADD COLUMN valid_from date NOT NULL DEFAULT DATE '0001-01-01';
 ALTER TABLE symbols ALTER COLUMN valid_from DROP DEFAULT;
 CREATE INDEX symbols_symbol_id_valid_from_idx ON symbols (symbol_id, valid_from DESC, ingested_at DESC);
