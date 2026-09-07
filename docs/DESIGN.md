@@ -410,6 +410,30 @@ round (reference-table versioning keys, the `tick` runtime replacing a oneshot t
 risk/gate/control-strategy milestone placement, a mechanical refusal rule) were applied to
 this document after that round and have not been re-reviewed.
 
+## Implementation Notes
+
+- **Task 2 (db package):** `go mod tidy` against goose/v3's latest release (v3.28.0)
+  bumps go.mod's `go` line to `1.26.0` because that release's own go.mod requires
+  go >= 1.26.0, and the locally installed toolchain is go1.25.6. To honour "keep the
+  go 1.25 line," goose was pinned to v3.27.0 (its go.mod requires exactly go 1.25.0)
+  via `go get github.com/pressly/goose/v3@v3.27.0` before running `go mod tidy` — an
+  explicit, checksum-verified version selection via the `go` tool, not a hand-edit of
+  the require block. One unavoidable side effect: `go mod tidy` still rewrites the `go`
+  line from the shorthand `go 1.25` to the canonical `go 1.25.0`, because both pgx v5.10.0
+  and goose v3.27.0 declare `go 1.25.0` in their own go.mod and Go's tooling normalizes
+  to that literal string even though `1.25` and `1.25.0` denote the same minimum
+  version. No toolchain upgrade occurs; `go1.25.6` builds and runs everything. If a
+  future task needs a newer goose, revisit whether the go1.26 toolchain bump is
+  acceptable then.
+- **Task 2 (db package):** `db.Migrate` adds one line not in the brief's listing —
+  `goose.SetLogger(goose.NopLogger())` before `goose.SetBaseFS`. Without it, goose
+  writes plain `log` lines ("OK 0001_market.sql ...", "goose: successfully migrated
+  database to version: 1") straight to stdout on every call, which fails the "test
+  output must be pristine, no stray logs" bar (`go test -v` output would otherwise carry
+  them). The line changes no signature, no SQL, no schema, and no other behaviour; it
+  only silences goose's own informational logging. `newMigrateCmd` still prints its own
+  "migrations applied" line on success, so the CLI keeps useful output.
+
 ## What I noticed about how you think
 
 - You did not say "make it good". You said "very strong architecture and a super solid
