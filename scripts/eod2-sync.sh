@@ -21,8 +21,19 @@ cd "$EOD2_DIR"
 git pull --ff-only
 git submodule update --init --remote --merge
 
-if [ ! -x .venv/bin/python ]; then
-  "$EOD2_PYTHON" -m venv .venv
+# Guard on pip, not on the interpreter: `python -m venv` writes .venv/bin/python
+# before it bootstraps pip, so the ensurepip failure described above leaves an
+# executable interpreter behind with no pip next to it. Keying the guard on
+# .venv/bin/python would skip recreation forever and every later run would die
+# on the pip calls below. Wipe the directory before rebuilding, and again if the
+# rebuild fails, so a half-built venv never survives into the next run.
+if [ ! -x .venv/bin/pip ]; then
+  rm -rf .venv
+  if ! "$EOD2_PYTHON" -m venv .venv || [ ! -x .venv/bin/pip ]; then
+    rm -rf .venv
+    echo "eod2-sync: $EOD2_PYTHON could not build a venv with a working pip; set EOD2_PYTHON to an interpreter whose ensurepip works" >&2
+    exit 1
+  fi
 fi
 .venv/bin/pip install --quiet --upgrade pip
 .venv/bin/pip install --quiet -r requirements.txt
