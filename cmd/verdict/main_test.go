@@ -97,3 +97,20 @@ func TestMigrateCommand_MissingDatabaseURLReturnsError(t *testing.T) {
 	err := root.Execute()
 	require.EqualError(t, err, "set --database-url or VERDICT_DATABASE_URL")
 }
+
+// TestBackfillCommand_MissingDatabaseURLReturnsError mirrors
+// TestMigrateCommand_MissingDatabaseURLReturnsError: newBackfillCmd's RunE
+// has the identical shape (parse flags, then resolve database URL, then
+// connect), and must return databaseURL's error before ever calling
+// db.Connect, so this never touches a real database or the network.
+func TestBackfillCommand_MissingDatabaseURLReturnsError(t *testing.T) {
+	t.Setenv("VERDICT_DATABASE_URL", "")
+	root := newRootCmd()
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&out)
+	root.SetArgs([]string{"backfill"})
+
+	err := root.Execute()
+	require.EqualError(t, err, "set --database-url or VERDICT_DATABASE_URL")
+}
