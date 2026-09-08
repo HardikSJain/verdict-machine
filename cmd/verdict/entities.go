@@ -34,8 +34,9 @@ func newEntitiesProposeCmd() *cobra.Command {
 		Long: "Generate candidate successions and run gates G0-G6 over them.\n\n" +
 			"Read-only. It writes two files and nothing to the store: the roster of lines\n" +
 			"that passed every gate, and a review file with one record per candidate --\n" +
-			"accepted or quarantined -- carrying every gate result and the close, turnover\n" +
-			"and delivery ratios across the boundary.\n\n" +
+			"accepted or quarantined -- carrying every gate result and the close and\n" +
+			"turnover ratios across the boundary, behind a header line saying what the file\n" +
+			"does and does not measure.\n\n" +
 			"It refuses to emit anything at all while the archive span holds an unsettled\n" +
 			"date (G4a). G4 counts sessions out of bars, so a real NSE session the store\n" +
 			"has not fetched reads as \"zero sessions between\" -- and the 2017 Tube\n" +
@@ -112,7 +113,7 @@ func newEntitiesProposeCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(w, "# wrote %s (%d links, sha256 %s) and %s (%d records) in %s\n",
+			fmt.Fprintf(w, "# wrote %s (%d links, sha256 %s) and %s (a header line, then %d candidate records) in %s\n",
 				out, len(roster.Links), hex.EncodeToString(digest), reviewPath, len(candidates),
 				time.Since(started).Round(time.Millisecond))
 			fmt.Fprintf(w, "# nothing was written to the store. Review the diff, then run `verdict entities apply --roster %s`.\n", out)

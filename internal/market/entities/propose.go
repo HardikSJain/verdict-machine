@@ -92,8 +92,6 @@ type symbolFacts struct {
 	LastClose   float64
 	FirstTurn   *float64
 	LastTurn    *float64
-	FirstDeliv  *int64
-	LastDeliv   *int64
 	FirstTicker string
 	LastTicker  string
 	Eod2Bars    int
@@ -115,7 +113,7 @@ type Candidate struct {
 	OverlapDates   int        `json:"overlap_dates"`
 	BoundaryClose  [2]float64 `json:"boundary_close"`
 	TurnoverRatio  *float64   `json:"boundary_turnover_ratio"`
-	DeliveryRatio  *float64   `json:"boundary_delivery_ratio"`
+	// There is deliberately no boundary_delivery_ratio. See ReviewHeader.
 
 	Gates             Gates             `json:"gates"`
 	EvidenceNotGating EvidenceNotGating `json:"evidence_not_gating"`
@@ -352,7 +350,6 @@ func newCandidate(generator string, p, s *symbolFacts) *Candidate {
 		SuccessorSpn:   [2]string{day(s.FirstDate), day(s.LastDate)},
 		BoundaryClose:  [2]float64{p.LastClose, s.FirstClose},
 		TurnoverRatio:  ratio(s.FirstTurn, p.LastTurn),
-		DeliveryRatio:  intRatio(s.FirstDeliv, p.LastDeliv),
 	}
 	c.Gates = Gates{
 		CheckDigit:         CheckDigitOK(p.ISIN) && CheckDigitOK(s.ISIN),
@@ -565,25 +562,79 @@ func ratio(a, b *float64) *float64 {
 	return &r
 }
 
-func intRatio(a, b *int64) *float64 {
-	if a == nil || b == nil || *b == 0 {
-		return nil
-	}
-	r := round4(float64(*a) / float64(*b))
-	return &r
+// ReviewFileVersion is the shape of the review file's first line. It exists
+// so a reader can tell a headed file from the headless one Stage 2 shipped.
+const ReviewFileVersion = 1
+
+// ReviewHeader is the review file's first line: what the records below hold,
+// and -- the reason it exists at all -- what they deliberately do not.
+//
+// Design 5.6 names the review file's content as "the close ratio, the
+// turnover ratio and the delivery ratio across the boundary". This file
+// carries the first two. It carried a `boundary_delivery_ratio` key as well
+// until fix round 2, null on all 625 records and structurally always so:
+// bhavcopy's parser never reads DELIV_QTY, so `bars.delivery_qty` is NULL on
+// all 6,031,245 nse-bhavcopy rows, and the eod2 source that does carry
+// delivery files a ticker's whole CSV under today's ISIN -- so of the 625
+// boundaries, the DEAD predecessor side has an eod2 delivery figure on 1, and
+// both sides on 0. A column that is always null is not an absent measurement
+// a reviewer can allow for; it reads as "delivery was flat across the
+// boundary", which is a claim nothing here made. The key is gone and this
+// says why, in the file itself, where the reviewer is.
+type ReviewHeader struct {
+	Record      string   `json:"record"`
+	Version     int      `json:"review_file_version"`
+	Candidates  int      `json:"candidates"`
+	Accepted    int      `json:"accepted"`
+	Quarantined int      `json:"quarantined"`
+	Measures    []string `json:"boundary_measures"`
+	Notes       []string `json:"notes"`
 }
 
-// WriteReview writes the boundary-continuity report: one JSON object per
-// candidate, accepted or not.
+// The header carries no timestamp on purpose: the review file stays a pure
+// function of the store it was generated from, so the monthly ops diff shows
+// a changed candidate and never a changed clock.
+func reviewHeader(candidates []Candidate) ReviewHeader {
+	h := ReviewHeader{
+		Record:     "header",
+		Version:    ReviewFileVersion,
+		Candidates: len(candidates),
+		Measures:   []string{"boundary_close", "boundary_turnover_ratio", "gates.boundary_close_ratio"},
+		Notes: []string{
+			"Every line after this one is one candidate pair, accepted or quarantined, in (predecessor, successor) order.",
+			"There is no boundary_delivery_ratio: bhavcopy does not parse DELIV_QTY, so delivery_qty is NULL on every " +
+				"nse-bhavcopy bar, and eod2 -- which does carry delivery -- files a ticker's CSV under its CURRENT ISIN, " +
+				"so the dead predecessor side of a boundary has no eod2 row. Delivery across a boundary is not measurable " +
+				"here and is not reported as null.",
+			"The gates are a filter on the GENERATOR, not a proof about NSE (design 5.5): reviewing this file is reviewing " +
+				"how these lines were decided, not 444 independent facts.",
+			"G6, the only non-structural gate, admits an arbitrary cross-company price splice 41.5% of the time as measured " +
+				"against this archive. See docs/DESIGN.md, Stage 2. Treat boundary_ratio_matches as weak evidence.",
+		},
+	}
+	for i := range candidates {
+		if candidates[i].Accepted() {
+			h.Accepted++
+		} else {
+			h.Quarantined++
+		}
+	}
+	return h
+}
+
+// WriteReview writes the boundary-continuity report: a header line, then one
+// JSON object per candidate, accepted or not.
 //
 // It exists because 449 uniform structural rows are not something a reviewer
-// can disagree with. The close, turnover and delivery ratios across the
-// boundary are non-gating, and they are the only material in the whole
-// process that lets a human say "that one looks wrong" about a line the gates
-// were happy with.
+// can disagree with. The close and turnover ratios across the boundary are
+// non-gating, and they are the only material in the whole process that lets a
+// human say "that one looks wrong" about a line the gates were happy with.
 func WriteReview(w io.Writer, candidates []Candidate) error {
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)
+	if err := enc.Encode(reviewHeader(candidates)); err != nil {
+		return err
+	}
 	for i := range candidates {
 		if err := enc.Encode(candidates[i]); err != nil {
 			return err
@@ -607,7 +658,7 @@ func loadSymbolFacts(ctx context.Context, pool *pgxpool.Pool, asOfIngest time.Ti
 		LIMIT 1)`
 	q := fmt.Sprintf(`
 		WITH latest AS (
-			SELECT DISTINCT ON (symbol_id, date) symbol_id, date, close, turnover, delivery_qty
+			SELECT DISTINCT ON (symbol_id, date) symbol_id, date, close, turnover
 			FROM bars
 			WHERE source = $1 AND ingested_at <= $2
 			ORDER BY symbol_id, date, ingested_at DESC
@@ -616,8 +667,8 @@ func loadSymbolFacts(ctx context.Context, pool *pgxpool.Pool, asOfIngest time.Ti
 			FROM latest GROUP BY symbol_id
 		)
 		SELECT e.symbol_id, sy.isin, e.first_date, e.last_date, e.bars,
-		       f.close::float8, f.turnover::float8, f.delivery_qty,
-		       l.close::float8, l.turnover::float8, l.delivery_qty,
+		       f.close::float8, f.turnover::float8,
+		       l.close::float8, l.turnover::float8,
 		       %s, %s
 		FROM e
 		JOIN (SELECT DISTINCT symbol_id, isin FROM symbols WHERE ingested_at <= $2) sy ON sy.symbol_id = e.symbol_id
@@ -635,8 +686,8 @@ func loadSymbolFacts(ctx context.Context, pool *pgxpool.Pool, asOfIngest time.Ti
 	for rows.Next() {
 		f := &symbolFacts{}
 		if err := rows.Scan(&f.SymbolID, &f.ISIN, &f.FirstDate, &f.LastDate, &f.Bars,
-			&f.FirstClose, &f.FirstTurn, &f.FirstDeliv,
-			&f.LastClose, &f.LastTurn, &f.LastDeliv,
+			&f.FirstClose, &f.FirstTurn,
+			&f.LastClose, &f.LastTurn,
 			&f.FirstTicker, &f.LastTicker); err != nil {
 			return nil, err
 		}

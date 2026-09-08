@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -153,15 +154,39 @@ func TestProposeAcceptsACleanSplitAndQuarantinesNothingElse(t *testing.T) {
 	require.Zero(t, c.OverlapDates)
 	require.Equal(t, "issuer-prefix", c.Generator)
 
-	// The review file carries one record per candidate, accepted or not: it
-	// is the only material in the whole process a reviewer can disagree with.
+	// The review file carries a header, then one record per candidate,
+	// accepted or not: it is the only material in the whole process a
+	// reviewer can disagree with.
 	var buf bytes.Buffer
 	require.NoError(t, entities.WriteReview(&buf, cands))
+	lines := bytes.Split(bytes.TrimSpace(buf.Bytes()), []byte("\n"))
+	require.Len(t, lines, 2, "the header line, then one record for the one candidate")
+
+	var header entities.ReviewHeader
+	require.NoError(t, json.Unmarshal(lines[0], &header))
+	require.Equal(t, "header", header.Record)
+	require.Equal(t, entities.ReviewFileVersion, header.Version)
+	require.Equal(t, 1, header.Candidates)
+	require.Equal(t, 1, header.Accepted)
+	require.Zero(t, header.Quarantined)
+
 	var back entities.Candidate
-	require.NoError(t, json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &back))
+	require.NoError(t, json.Unmarshal(lines[1], &back))
 	require.Equal(t, c.Successor, back.Successor)
-	require.Nil(t, back.DeliveryRatio,
-		"bhavcopy's parser never reads DELIV_QTY, so the delivery ratio is null on every record; see docs/DESIGN.md")
+
+	// boundary_delivery_ratio is GONE rather than null. It was null on all
+	// 625 records of the shipped review file and structurally always would
+	// be -- bhavcopy never parses DELIV_QTY, and eod2, which does carry
+	// delivery, files a ticker's CSV under its CURRENT ISIN so the dead
+	// predecessor side of a boundary has no row. A permanently null column
+	// does not read as "not measured", it reads as "flat", which is a claim
+	// nothing here made. The header says so where the reviewer is.
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(lines[1], &raw))
+	require.NotContains(t, raw, "boundary_delivery_ratio")
+	require.Contains(t, raw, "boundary_turnover_ratio", "the ratio that IS measurable stays")
+	require.Contains(t, strings.Join(header.Notes, " "), "boundary_delivery_ratio",
+		"and the file says in itself why the third ratio design 5.6 names is absent")
 }
 
 func TestProposeQuarantinesADemergerOnG4(t *testing.T) {
