@@ -610,6 +610,11 @@ func reviewHeader(candidates []Candidate) ReviewHeader {
 				"how these lines were decided, not 444 independent facts.",
 			"G6, the only non-structural gate, admits an arbitrary cross-company price splice 41.5% of the time as measured " +
 				"against this archive. See docs/DESIGN.md, Stage 2. Treat boundary_ratio_matches as weak evidence.",
+			"Spot-check protocol (design 5.5), because uniform structural rows are not something a reviewer can disagree " +
+				"with: the eight top-500 names by rank, every chain of length >= 3, every line whose " +
+				"boundary_ticker_unchanged is false, and every line whose boundary_close_ratio is not within 10% of 1 or " +
+				"of the face-value factor implied by the serial change. Generated lines carry an empty ratified_by; " +
+				"filling it in changes the roster's digest, which is what apply stamps into every row.",
 		},
 	}
 	for i := range candidates {

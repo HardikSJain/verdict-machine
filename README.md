@@ -50,7 +50,9 @@ export EOD2_DIR=$HOME/.local/share/eod2
   the map has not been told about. It is a monthly item, and it exits non-zero on an I1/I2
   violation, on an *accepted* succession the map does not carry, and on a hole in the archive
   the candidates were read from; quarantined pairs and advisory I3 findings print without
-  failing. Against the live store it exits non-zero today with 444 missing links, which is the
+  failing. It also re-runs the gates against the links the map already holds and prints a
+  `STALE` line for every merged pair they no longer accept -- reported, not fatal, because an
+  applied hand-written line fails a gate by construction. Against the live store it exits non-zero today with 444 missing links, which is the
   control reporting a roster that is committed and not yet applied. NSE reissues an ISIN on a
   split, so one company owns several `symbol_id`s; `docs/DESIGN.md` has the whole story under
   "ISIN succession".

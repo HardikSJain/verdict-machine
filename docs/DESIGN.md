@@ -399,6 +399,28 @@ Monthly, on a settled archive:
    arbitrary cross-company price splice **41.5% of the time** on this archive (judgement
    call 5 below, with the SQL). It is weak evidence, not near-certain rejection, and it is
    the only thing between a wrong-but-disjoint merge and 444 irreversible rows.
+
+   **What to actually look at, from design §5.5's spot-check protocol.** 444 uniform
+   structural rows are not something a reviewer can disagree with, so the design names four
+   selectors rather than asking for a read-through: **the eight top-500 names by rank; every
+   chain of length ≥ 3; every line whose `boundary_ticker_unchanged` is false (the 121
+   same-session ticker+ISIN changes in the archive); and every line whose
+   `boundary_close_ratio` is not within 10% of 1 or of the exact face-value factor implied by
+   the serial change.** Against the roster committed today that is **29 chains of three or
+   more ISINs out of 415, 17 lines with `boundary_ticker_unchanged` false, and 40 lines more
+   than 10% off the band they matched** — about eighty lines, not 444. `verdict entities
+   check` now also re-runs the gates against the links the map already holds and prints a
+   `STALE` line for each pair they no longer accept, which is the re-checkability §5.5 leans
+   on; it is reported and does not fail the run, because an applied hand-written line fails a
+   gate by construction.
+
+   **All 444 committed lines carry an empty `ratified_by`, so `apply` will warn.** `propose`
+   cannot know who will ratify and filling the field in would be the machine asserting a
+   human's approval, so it prints `# WARNING: 444 of 444 roster lines name no ratifier` and
+   writes the rows anyway (judgement call 4 below). Filling in `ratified_by`/`ratified_at` is
+   the reviewer's job and it is **not a free edit**: both fields are inside the digest, so the
+   file's `digest` must be recomputed with them — `Load` refuses a roster whose stated digest
+   does not match its contents, and the new hash is what lands in every row's `roster_sha`.
 3. After the PR merges: `verdict entities apply --roster internal/market/entities/roster.json`.
    Rows are stamped with the reviewed roster's sha256. If a link later turns out to be wrong,
    `verdict entities retract --entity <id|isin> --note "..."` writes one more row and every
@@ -896,18 +918,36 @@ both places.
   moment M1 puts an ETF in the universe. G1 is meaningless for `INF` -- one issuer code
   covers dozens of unrelated schemes -- so the only route is a hand-written `manual` roster
   line, which is exactly where a false positive would originate.
-- **Every read pays for the overlay, forever, and the bill is now measured rather than
-  guessed.** Medians of six warm runs each against the live store, `nse-bhavcopy`,
-  `--as-of 2026-09-04 --lookback 125 --n 500`, running the exact SQL the Go builders emit with
-  `symbol_links` shadowed as an empty CTE because the table did not exist there yet (Stage 1's
-  report, `.superpowers/sdd/2026-09-07-m0-scaffold/stage1-report.md`):
-  **`UniverseAsOf` 578 ms → 625 ms, +47 ms, about +8%**; **`BarsForDate` 12.4 ms → 27.3 ms,
-  about 2.2x, +15 ms** — the ~4,100 `symbolLabelLateral` evaluations `entity_label` now makes
-  per call against the ~2,600 the old query made for the symbols that actually held a bar.
-  The "15–30%" this bullet used to state as a fact was never a measurement: it is
-  isin-design.md §4.7's *expectation*, written against revision 1's `entity_label` and marked
-  stale in the same paragraph by the design itself. It was too pessimistic for `UniverseAsOf`
-  and far too optimistic for `BarsForDate`, which it had never timed at all.
+- **Every read pays for the overlay, forever, and what the shipping path costs is measured
+  against the real table.** `go run ./scripts/read-cost --database-url …` runs the shipping Go
+  builders — not a transcription of their SQL — against whatever store it is pointed at and
+  prints every sample beside the median; it is committed for the same reason judgement call 5
+  below publishes its query, so the next reader can re-run this instead of believing it.
+  Against the live store on 2026-09-08, `nse-bhavcopy`, `--as-of 2026-09-04 --lookback 125
+  --n 500`, with `symbol_links` present and empty: **`UniverseAsOf` 352/351/358/351 ms on the
+  first four executions and 432–438 ms from the sixth onward, median of twelve 435 ms**;
+  **`BarsForDate` (2,633 bars) median 14 ms over twelve**. End to end, `verdict universe
+  --as-of 2026-09-04 --lookback 125 --n 500` is **0.37 s of wall clock** over six runs after a
+  0.94 s cold first one. The step in the middle of the `UniverseAsOf` series is not noise and
+  is worth knowing before quoting any single number here: pgx prepares the statement, and
+  Postgres's default `plan_cache_mode = auto` switches from a custom plan to a generic one
+  after five executions, so a process that issues this read once pays ~355 ms and one that
+  loops on it settles at ~435 ms.
+  **The earlier pair, `UniverseAsOf` 578 ms → 625 ms and `BarsForDate` 12.4 ms → 27.3 ms, is
+  superseded and should not be quoted.** It was a before/after *delta* rather than a cost, and
+  it was taken with `symbol_links` shadowed as an empty CTE because the table did not exist on
+  `verdict` at the time (Stage 1's report,
+  `.superpowers/sdd/2026-09-07-m0-scaffold/stage1-report.md`, flags the proxy itself: an empty
+  CTE is not an empty table with two indexes). Migration 0004 has since been applied there, so
+  the shadow is no longer needed — and measured without it the post-change path is *faster*
+  than that proxy's pre-change baseline, which is as much as the delta can honestly be said to
+  have established. Re-measuring the delta would mean running SQL this branch no longer emits;
+  the absolute costs above are what this document stands behind. The mechanism the delta was
+  reaching for is still real and unmeasured: `entity_label` evaluates `symbolLabelLateral` for
+  every registered symbol (~4,100) where the old query evaluated it only for the ~2,600 that
+  held a bar. The "15–30%" this bullet stated as a fact before either measurement was never one
+  at all: it is isin-design.md §4.7's *expectation*, written against revision 1's
+  `entity_label` and marked stale in the same paragraph by the design itself.
 - **The many fund the fix for the few, and the two counts are in different units.** In
   **symbols**: the store registers 4,100, the committed roster's 444 links would pull **859**
   of them (21%) into 415 multi-member entities, and the remaining **3,241** (79%) would stay
@@ -1106,9 +1146,18 @@ design says, leaves open, or claims.
    space); **±15% loses 23 lines**, which is well past §5.4's budget.
 
    The measurement is reproducible, and it should be re-run rather than believed. Re-measured
-   in fix round 2 against the same store: 9,311,610 ratios, **3,859,657 accepted at ±25%
-   (41.45%)** and 3,242,676 at ±20% (34.82%) — the tiny drift from the figures above is the
-   `DISTINCT ON` tie-break on a handful of duplicate-ingest rows, not a different answer.
+   in fix round 2 against the same store, and again on 2026-09-08: 9,311,610 ratios,
+   **3,859,657 accepted at ±25% (41.45%)** and 3,242,676 at ±20% (34.82%). The drift from the
+   3,859,740 first quoted is **arithmetic, not data**: the earlier figure did the division in
+   `numeric` and the query below casts both closes to `float8`, and **exactly 83 of the
+   9,311,610 ratios sit close enough to a band edge that the two disagree** (83 accepted by
+   `numeric` and rejected by `float8`, none the other way). Running the published query with
+   `bar.close::float8` changed back to `bar.close` returns 3,859,740 on the nose. An earlier
+   revision of this paragraph blamed the `DISTINCT ON` tie-break on duplicate-ingest rows,
+   which is wrong twice over: there are none to break. On all eight dates the query touches,
+   `count(*)` equals `count(DISTINCT symbol_id)` — 1192, 1186, 1518, 1526, 1520, 1523, 1808,
+   1810 — so the tie-break never fires, and removing both `DISTINCT ON` clauses returns the
+   same two numbers. The headline figures and the SQL are unaffected.
 
    ```sql
    WITH b(d) AS (VALUES ('2014-07-30'::date), ('2016-09-09'), ('2019-09-20'), ('2022-07-29')),
@@ -1221,9 +1270,13 @@ design says, leaves open, or claims.
     refuses because §8.4 requires re-linking after a retraction to stay possible; `apply`
     still writes the link back and now says, per row, that it is undoing an undo.
     Consequence worth stating: `propose` reads `symbol_links` when the table exists and
-    **degrades to no retraction memory when it does not**, which is the live store's state
-    today (§0). It says which of the two it did on every run, because a report that stayed
-    silent would be claiming a check it never ran.
+    **degrades to no retraction memory when it does not** — a store still on migration 0003.
+    That is no longer the live store: `verdict` is at `goose_db_version` 4 and carries
+    `symbol_links` with 0 rows (§0, re-verified read-only 2026-09-08), so today's monthly run
+    takes the other branch and does consult the retraction memory. The degradation is the
+    general rule, not a description of the store in front of you. `propose` says which of the
+    two branches it took on every run, because a report that stayed silent would be claiming a
+    check it never ran.
 
 #### Stage 2, fix round 2: two more judgement calls
 
@@ -1249,6 +1302,27 @@ design says, leaves open, or claims.
     is wrong is not a machine's call; and a roster file that will not load is not a file to
     overwrite quietly. `--discard-manual` is the deliberate drop and the way past an
     unloadable file, and it reports how many lines it is not carrying.
+
+    **Corrected in Stage 3.** The first of those three was too generous, in the one direction
+    that writes a wrong answer with no error. Keeping the hand-written line kept its
+    `effective_from` as well, and that is what `apply` puts into `symbol_links.boundary` —
+    §4.3's column deciding which member of an entity labels a session. A hand-written boundary
+    that disagreed with the one the generator had just measured off `bars` therefore won
+    silently, mislabelling every session between the true first bar and the stale date; the
+    monthly diff showed nothing because the surviving line was byte-identical to last month's,
+    and `Apply`'s `differsFrom` refusal could not help because by then the *planned* row
+    already carried the stale value. The mechanism is ordinary: `bars` is insert-only but a
+    backfill can add EARLIER sessions, which moves a successor's first bar — and filling that
+    gap is also the usual reason a hand-written pair becomes generator-acceptable at all, so
+    the two arrive together. `AdoptManual` now compares `effective_from`,
+    `gates.successor_first_bar` and `gates.predecessor_last_bar` before superseding and
+    **refuses naming both dates** when they disagree, the way the endpoint-collision branch
+    already did. The three moving gate figures (`sessions_between`, the bar counts, the close
+    ratio) are deliberately not compared: they change every month as the archive grows, and
+    refusing on them would refuse on noise. The operator-facing line was split at the same
+    time — "the generator cannot reproduce it" is printed only for a line with no generated
+    twin, and the supersede case gets its own line saying a generated twin was dropped and at
+    which boundary.
 12. **The generator's chaining and determinism are now pinned by tests, because §5.5 makes
     them the deliverable.** §5.5 says the reviewer of the roster PR "is checking the
     GENERATOR, not 449 independent facts", and `Roster.Validate` is no defence against a
@@ -1268,7 +1342,7 @@ design says, leaves open, or claims.
 
 The last stage of the succession change adds no new behaviour to the read path. It makes the
 change legible -- the sections above are its output -- and it fences the one way M1 could
-silently produce wrong returns. Six judgement calls and one measurement, recorded here in the
+silently produce wrong returns. Seven judgement calls and one measurement, recorded here in the
 same spirit as the two stages before it.
 
 1. **`verdict entities check` gained the candidate half, and it is on by default.** §4.6
@@ -1322,6 +1396,24 @@ same spirit as the two stages before it.
    `symbols` rows and 31k bars were added and nothing was deleted. `CADILAHC` -> `ZYDUSLIFE`
    is the worked example. The old "534 of 4,092" is not reproducible at any pin in this
    store and was measured against a database that no longer exists.
+7. **`check` re-runs the gates against the links the map ALREADY holds, and reports rather
+   than fails on the ones that stopped passing.** §5.5 makes ratifying 444 irreversible merges
+   wholesale acceptable on two grounds, and the second is that "every gate is independently
+   re-checkable (`verdict entities check` re-evaluates them against the store)". It was not:
+   `UnlinkedCandidates` returned on `p == s` before it ever consulted `Accepted()`, so a pair
+   the store had merged whose gates the archive now rejects was neither an "accepted candidate
+   the map does not carry" nor a reported quarantine entry -- it was dropped in silence, and
+   §5.6 establishes there is no other detector. The class that went missing is the one G4
+   exists for: §5.3 calls it "the gate that kills demergers" and names Tube Investments as a
+   real pair that would have merged two economically different securities, and G4 counts
+   sessions out of `bars`, so a backfill filling a hole inside a boundary gap flips a standing
+   link from accepted to rejected without touching a row of `symbol_links`. The function now
+   returns a third category and `check` prints it as `STALE  linked pair  … gates now
+   failing: [...]`. **It does not change the exit code**, which is the judgement call: an
+   applied hand-written line fails a gate by construction -- the 52 `INF` fund-unit transfers
+   fail G0 and G1, which is precisely why a human had to write them -- so failing on this
+   category would turn the monthly item permanently red for a state that is correct, the same
+   reasoning as call 2 above. `--skip-candidates` now says it is skipping this leg too.
 
 **The state of the live store, stated plainly because it is the thing most likely to be
 assumed rather than checked** (re-verified read-only 2026-09-08): the `verdict` database is at
@@ -1332,9 +1424,10 @@ reads the store: `verdict universe --as-of 2026-09-04 --lookback 125 --n 100000`
 as-of`. What has **not** happened is the `apply`, and the monthly item says so out loud --
 `verdict entities check` against that store today prints 444 `UNLINKED candidate` lines and
 exits non-zero with "444 accepted candidate(s) the map does not carry" (181 quarantined, 625
-generated, about five seconds). That is the control working, not a fault: the roster is
-committed and unapplied, and writing 444 irreversible merge rows into a store that cannot
-delete is a human's call. *(An earlier revision of this paragraph said the store was on
+generated, about five seconds), plus "0 linked pair(s) the gates no longer accept" -- trivially
+zero, because the map holds no links at all yet. That is the control working, not a fault: the
+roster is committed and unapplied, and writing 444 irreversible merge rows into a store that
+cannot delete is a human's call. *(An earlier revision of this paragraph said the store was on
 migration 0003 and that a binary from this branch could not read it at all. That was true when
 it was written and stopped being true when 0004 was applied. Applying 0004 is safe during a
 run -- a binary built before it simply never reads the table.)*
