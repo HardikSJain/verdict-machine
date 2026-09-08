@@ -387,7 +387,13 @@ Monthly, on a settled archive:
    read `data/succession-review.jsonl` for the new pair, and open a PR. **The reviewer is
    checking the generator, not 444 independent facts** (design §5.5), so a regression in
    `propose` would be ratified wholesale over irreversible rows; review the diff in that
-   light.
+   light. Two things to know before reading that diff. Hand-written `manual` lines already
+   in the roster are **carried across** by this run and appear in its output as
+   `# kept hand-written line …`; `--discard-manual` is the only way to lose one, and it says
+   so. And `boundary_ratio_matches` — G6, the one non-gating-on-structure gate — admits an
+   arbitrary cross-company price splice **41.5% of the time** on this archive (judgement
+   call 5 below, with the SQL). It is weak evidence, not near-certain rejection, and it is
+   the only thing between a wrong-but-disjoint merge and 444 irreversible rows.
 3. After the PR merges: `verdict entities apply --roster internal/market/entities/roster.json`.
    Rows are stamped with the reviewed roster's sha256. If a link later turns out to be wrong,
    `verdict entities retract --entity <id|isin> --note "..."` writes one more row and every
@@ -738,11 +744,12 @@ its staging and its test plan are in
 `.superpowers/sdd/2026-09-07-m0-scaffold/isin-design.md`.
 
 **What has not happened, and is a human's call.** `internal/market/entities/roster.json` is
-generated and committed; **it has not been applied to the live `verdict` database, and
-migration 0004 has not been run there either** (the live store is on 0003, so a binary built
-from this branch cannot read it until `verdict migrate` is run). Writing 444 irreversible
+generated and committed; **it has not been applied to the live `verdict` database.**
+Migration 0004 *has* now been run there — the live store is at goose version 4 and
+`symbol_links` exists and holds **0 rows** — so reads work again and `propose` can consult
+the retraction memory, but not one merge row has been written. Writing 444 irreversible
 merge rows into a store that cannot delete is a decision for someone who has read the diff,
-and this work stops one step before it. Until both happen, every symbol is its own entity,
+and this work stops one step before it. Until it is taken, every symbol is its own entity,
 the read path answers exactly what it answered before, and the fragmentation above is still
 live.
 
@@ -1010,31 +1017,84 @@ design says, leaves open, or claims.
    444 accepted lines** (the one at ratio 0.605), breaks the fused interval into
    `[0.16,0.30] ∪ [0.32,0.60]`, and drops the false-accept rate to 34.8% (59% in log
    space); **±15% loses 23 lines**, which is well past §5.4's budget.
-6. **`boundary_delivery_ratio` is `null` on all 625 records in
-   `data/succession-review.jsonl`, and structurally always will be.** §5.6's second
-   consequence names the review file's content as "the close ratio, the turnover ratio and
-   the delivery ratio across the boundary", so a third of the material is inert. The cause
-   is not a data gap that might close: `SELECT count(*) FILTER (WHERE delivery_qty IS NOT
-   NULL) FROM bars WHERE source='nse-bhavcopy'` is **0 of 6,031,245** because the bhavcopy
-   parser never reads `DELIV_QTY` (`internal/market/bhavcopy/parse_test.go` pins
-   `require.Nil(t, dhfl.DeliveryQty)`). The field is kept rather than dropped so the record
-   shape does not change under a reviewer mid-review, but **the review file carries close
-   and turnover only**, and a reviewer must not read a null there as "delivery was flat".
-7. **§4.1's growth path for an OLDER predecessor is not implementable against §4.2's
-   CHECK, and `apply` now refuses that roster instead of failing inside a trigger.** §4.1
-   says a predecessor older than the current root "joins by pointing at the existing
-   `entity_id` rather than renaming the entity". `plan` derives every row's entity from the
-   roster's own chain root, so a roster that gains such a predecessor renames the entity —
-   and migration 0004's flatness trigger then rejects the insert with `symbol_links: N is
-   the entity of other symbols; re-point every member or none`, which is advice §4.1 and
-   §10 both forbid taking. The row §4.1 wants is `(symbol P, entity A)` with **no
-   predecessor to record**, and §4.2's CHECK requires `predecessor IS NOT NULL` on every
-   non-retraction row, so the two sections are not compatible and this is reported back to
-   the design rather than improvised around. What changed in the code is only the failure:
-   `apply` runs both flatness guards before the INSERT and refuses with an error that names
-   the entity, its members and the contradiction. **The backward-extension path stays
-   unavailable until the design settles the row shape**; forward extension (a fresh split)
-   is unaffected and works.
+
+   The measurement is reproducible, and it should be re-run rather than believed. Re-measured
+   in fix round 2 against the same store: 9,311,610 ratios, **3,859,657 accepted at ±25%
+   (41.45%)** and 3,242,676 at ±20% (34.82%) — the tiny drift from the figures above is the
+   `DISTINCT ON` tie-break on a handful of duplicate-ingest rows, not a different answer.
+
+   ```sql
+   WITH b(d) AS (VALUES ('2014-07-30'::date), ('2016-09-09'), ('2019-09-20'), ('2022-07-29')),
+   prior AS (SELECT b.d, max(x.date) AS p FROM b
+             JOIN (SELECT DISTINCT date FROM bars WHERE source='nse-bhavcopy') x ON x.date < b.d
+             GROUP BY b.d),
+   onday AS (SELECT DISTINCT ON (b.d, bar.symbol_id) b.d, bar.symbol_id, bar.close::float8 AS c
+             FROM b JOIN bars bar ON bar.date = b.d AND bar.source='nse-bhavcopy'
+             ORDER BY b.d, bar.symbol_id, bar.ingested_at DESC),
+   onprior AS (SELECT DISTINCT ON (prior.d, bar.symbol_id) prior.d, bar.symbol_id, bar.close::float8 AS c
+               FROM prior JOIN bars bar ON bar.date = prior.p AND bar.source='nse-bhavcopy'
+               ORDER BY prior.d, bar.symbol_id, bar.ingested_at DESC),
+   r AS (SELECT s.c / p.c AS ratio FROM onday s
+         JOIN onprior p ON p.d = s.d AND p.symbol_id <> s.symbol_id
+         WHERE p.c > 0 AND s.c > 0)
+   SELECT count(*) AS ratios,
+          count(*) FILTER (WHERE ratio BETWEEN 0.0075 AND 0.0125 OR ratio BETWEEN 0.015 AND 0.025
+                              OR ratio BETWEEN 0.0375 AND 0.0625 OR ratio BETWEEN 0.075 AND 0.125
+                              OR ratio BETWEEN 0.15 AND 0.625 OR ratio BETWEEN 0.75 AND 1.25) AS accept_25
+   FROM r;
+   ```
+
+   The figure is repeated in the review file's own header, because that is the file the
+   person deciding whether to run `apply` is actually reading.
+6. **`boundary_delivery_ratio` is gone from the review file, and the file now says so in
+   its own header.** §5.6's second consequence names the review file's content as "the close
+   ratio, the turnover ratio and the delivery ratio across the boundary". The delivery ratio
+   was `null` on all 625 records, and a permanently null column is worse than an absent one:
+   it does not read as "not measured", it reads as "delivery was flat across this boundary",
+   which is a claim nothing here made. It is not a data gap that might close. `SELECT
+   count(*) FILTER (WHERE delivery_qty IS NOT NULL) FROM bars WHERE source='nse-bhavcopy'`
+   is **0 of 6,031,245**, because the bhavcopy parser never reads `DELIV_QTY`
+   (`internal/market/bhavcopy/parse_test.go` pins `require.Nil(t, dhfl.DeliveryQty)`). The
+   `eod2` source *does* carry delivery — 3,459,101 of its 7,761,350 rows — but
+   `eod2.LoadDir` files a ticker's whole CSV under that ticker's **current** ISIN, so the
+   dead predecessor side of a boundary has no `eod2` row at its own last date. Measured
+   read-only over the 625 candidates: the predecessor side has an `eod2` delivery figure on
+   **1**, and both sides on **0**. There is no boundary in this archive where the ratio is
+   computable. So the key was removed rather than kept-and-footnoted, and the file gained a
+   first line — `{"record":"header", …}` — carrying the counts, the boundary measures it
+   *does* hold, and the reason the third one §5.6 names is absent. The header carries no
+   timestamp, so the review file stays a pure function of the store and the monthly diff
+   shows a changed candidate rather than a changed clock. **The review file carries close
+   and turnover only, and now says so where the reviewer is reading.**
+7. **§4.1's two growth paths are not the same problem, and only one of them is a design
+   contradiction.** §4.1 makes two statements about `entity_id`. Forward: "extending a chain
+   (a fresh split in 2027) is one INSERT pointing the new successor at the **existing**
+   `entity_id`, with no re-pointing of anything." Backward: a predecessor older than the
+   current root "joins by pointing at the existing `entity_id` rather than renaming the
+   entity."
+
+   *Forward is implemented, as of fix round 2.* `plan` used to derive every row's entity by
+   walking the roster's own map to a chain root, never consulting the store. A roster does
+   not have to carry the whole history to be applied — `entities link` writes a one-line
+   file, and a reviewer may prune a diff to the pair that changed — so a roster holding only
+   `B → C`, applied to a store that already resolves `B` to `A`, planned the row
+   `(C, entity B)`: one company across two entity ids. Migration 0004's flatness trigger
+   stopped it, but the operator was handed `symbol_links: B is the entity of other symbols;
+   re-point every member or none`, which is advice §4.1 and §10 both forbid taking, over a
+   roster that asked for nothing wrong. `Apply` now reads the current map under the lock
+   *before* it plans, and the roster's own root is the entity only where the store does not
+   already hold one — so the row written is `(C, entity A, predecessor B)`, which is §4.1's
+   sentence and satisfies §4.2's CHECK in full. A retraction row sets
+   `entity_id = symbol_id`, so a retracted root resolves to itself and falls through to the
+   roster's answer, which is correct: it is its own entity again.
+
+   *Backward is still a design contradiction and still refuses.* The row §4.1 wants there is
+   `(symbol P, entity A)` with **no predecessor to record**, and §4.2's CHECK requires
+   `predecessor IS NOT NULL` on every non-retraction row. `apply` runs migration 0004's
+   flatness guards before the INSERT and refuses with an error naming the entity, its
+   members and the contradiction, rather than improvising a row shape the design does not
+   define. **The backward-extension path stays unavailable until the design settles the row
+   shape.**
 8. **`apply` refuses a roster whose `boundary` or `predecessor` disagrees with the row
    already in the store, instead of reporting "already linked".** Deciding "already linked"
    on `entity_id` alone made a re-apply of a CORRECTED roster a silent no-op — and since §0
@@ -1077,6 +1137,45 @@ design says, leaves open, or claims.
     **degrades to no retraction memory when it does not**, which is the live store's state
     today (§0). It says which of the two it did on every run, because a report that stayed
     silent would be claiming a check it never ran.
+
+#### Stage 2, fix round 2: two more judgement calls
+
+11. **`propose` carries the roster's hand-written lines across a regenerate, and refuses
+    rather than guessing when one contradicts the generator.** The monthly runbook below
+    names `verdict entities propose --out internal/market/entities/roster.json`, and that
+    run rebuilt the file from the generator alone and wrote it over the target. Every
+    `entities link` line is invisible to the generator by construction — it exists precisely
+    because no gate admitted it: the 51 `INF` fund-unit transfers where the whole ISIN
+    changes so no prefix rule can see them, the long-gap relistings, each one naming a
+    ratifier and an NSE circular §5.6 requires. The monthly run deleted them all, silently,
+    and handed the reviewer a diff of removals with no reason attached. `symbol_links` has
+    no DELETE so rows already applied survived; what was lost was the **file**, which §5.1
+    says is where identity is decided, plus any line not yet applied. `propose` now reads
+    the roster it is about to overwrite *before* it opens a connection, and carries the
+    `manual` lines into the new one. Only the manual half: last month's generated lines are
+    not carried, because the generator is the source of truth for those and carrying them
+    would let a line the store no longer supports survive a regenerate that dropped it.
+    Three cases are decided rather than left to fall out — a manual line whose exact pair
+    the generator now proposes keeps the **hand-written** line and drops the generated twin
+    (only one of them names the person who decided it); a manual line sharing one endpoint
+    with a different generated line is a G5 branch and is refused naming both, because which
+    is wrong is not a machine's call; and a roster file that will not load is not a file to
+    overwrite quietly. `--discard-manual` is the deliberate drop and the way past an
+    unloadable file, and it reports how many lines it is not carrying.
+12. **The generator's chaining and determinism are now pinned by tests, because §5.5 makes
+    them the deliverable.** §5.5 says the reviewer of the roster PR "is checking the
+    GENERATOR, not 449 independent facts", and `Roster.Validate` is no defence against a
+    generator bug — it re-reads the numbers the generator itself wrote. Two properties had
+    nothing standing behind them. *Chaining:* a three-ISIN company must produce
+    first→second and second→third and never first→third. A first-to-third link passes G1
+    (same issuer), G2 (`01→03` increases), G3 (disjoint spans) and G6 whenever the closes
+    happen to land in a band; only G4 stops it, on the accident that the middle ISIN traded
+    in the gap. It would then reach G5 as a second claim on the third ISIN and quarantine the
+    **genuine** second→third link with it — one bad pair silently removing a real company
+    from the map. *Determinism:* the roster's sha256 is stamped into every row and is the
+    only thing pointing an irreversible merge back at a reviewed diff, and `generate` starts
+    from a map whose iteration order Go randomises on every range. Both are now RED under
+    mutation where the whole suite was previously green.
 
 #### Stage 3 has landed (the fence and the docs)
 
