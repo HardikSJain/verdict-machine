@@ -336,3 +336,68 @@ func TestApplySkipsAGenuineRepeatOfTheSameLine(t *testing.T) {
 	require.Empty(t, res.Rows)
 	require.Len(t, res.Skipped, 1)
 }
+
+func TestApplyExtendsAChainAtTheEntityTheStoreAlreadyHolds(t *testing.T) {
+	// Design 4.1's named growth case: "extending a chain (a fresh split in
+	// 2027) is one INSERT pointing the new successor at the EXISTING
+	// entity_id, with no re-pointing of anything."
+	//
+	// A roster does not have to carry the whole history to be applied --
+	// `entities link` writes a one-line file, and a reviewer may prune a diff
+	// to the pair that changed -- so the roster in hand can be B -> C alone.
+	// Deriving the entity from the roster's own chain root then names B, and
+	// B already resolves to A: one company across two entity ids. The
+	// flatness trigger does stop it, but only with "B is the entity of other
+	// symbols; re-point every member or none", which is the advice design 4.1
+	// and 10 both forbid taking, over a roster that asked for nothing wrong.
+	ctx := context.Background()
+	pool := chainFixture(t)
+	store := market.NewStore(pool)
+
+	first, d1 := chainRoster(t, chainLink(chainA, chainB, "01->02", "2019-05-26", "2019-05-27"))
+	_, err := entities.Apply(ctx, pool, first, d1, "", false)
+	require.NoError(t, err)
+	ids := symbolIDs(t, pool)
+
+	// The 2027 split, as its own roster. Nothing in this file mentions A.
+	grown, d2 := chainRoster(t, chainLink(chainB, chainC, "02->03", "2022-01-02", "2022-01-03"))
+	res, err := entities.Apply(ctx, pool, grown, d2, "", false)
+	require.NoError(t, err, "a fresh split is one INSERT, not a re-point of anything")
+	require.Len(t, res.Rows, 1)
+	require.Equal(t, ids[chainA], res.Rows[0].EntityID,
+		"the entity is the one the store already holds, not the root this roster happens to walk to")
+	require.Equal(t, chainA, res.Rows[0].EntityISIN,
+		"and it is named by an ISIN this roster never mentions, so apply had to look it up")
+
+	entityOf := func(isin string) int64 {
+		t.Helper()
+		var id int64
+		require.NoError(t, pool.QueryRow(ctx, `
+			SELECT entity_id FROM symbol_links WHERE symbol_id = $1 ORDER BY ingested_at DESC LIMIT 1`,
+			ids[isin]).Scan(&id))
+		return id
+	}
+	require.Equal(t, ids[chainA], entityOf(chainB))
+	require.Equal(t, ids[chainA], entityOf(chainC), "one company, one entity id")
+	violations, err := store.CheckEntityInvariants(ctx, time.Now())
+	require.NoError(t, err)
+	require.Empty(t, violations)
+
+	// Re-applying the same one-line roster is still a skip, because the row
+	// it plans is the row that is already there.
+	again, err := entities.Apply(ctx, pool, grown, d2, "", false)
+	require.NoError(t, err)
+	require.Empty(t, again.Rows)
+	require.Len(t, again.Skipped, 1)
+
+	// And a retracted root falls back to the roster's answer, which is
+	// correct: a retraction row sets entity_id = symbol_id, so B is its own
+	// entity again and a B -> C roster roots at B.
+	_, err = entities.Retract(ctx, pool, itoa(ids[chainA]), "two different companies", "", false)
+	require.NoError(t, err)
+	res, err = entities.Apply(ctx, pool, grown, d2, "", false)
+	require.NoError(t, err)
+	require.Len(t, res.Rows, 1)
+	require.Equal(t, ids[chainB], res.Rows[0].EntityID,
+		"B resolves to itself after the retraction, so it is the entity again")
+}

@@ -82,11 +82,6 @@ func Apply(ctx context.Context, pool *pgxpool.Pool, r *Roster, digest []byte, se
 	if seededBy == "" {
 		seededBy = SeededBy
 	}
-	rows, err := plan(ctx, pool, r)
-	if err != nil {
-		return nil, err
-	}
-
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -95,7 +90,15 @@ func Apply(ctx context.Context, pool *pgxpool.Pool, r *Roster, digest []byte, se
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", linkLockKey); err != nil {
 		return nil, err
 	}
+	// The map is read BEFORE the plan, and under the lock, because the plan
+	// depends on it: design 4.1's entity_id is the one the store already
+	// holds wherever it holds one, not the one the roster in hand happens to
+	// walk to.
 	current, err := currentMap(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := plan(ctx, tx, r, current)
 	if err != nil {
 		return nil, err
 	}
@@ -158,14 +161,31 @@ func nullable(s string) *string {
 }
 
 // plan turns roster lines into the rows the store will hold: it resolves every
-// ISIN to its symbol_id and every chain to its root.
+// ISIN to its symbol_id and every chain to its entity.
 //
 // entity_id is the chain ROOT's symbol_id and never changes afterwards, so
 // extending a chain later is one INSERT pointing the new successor at the
 // existing entity_id, with no re-pointing of anything. Resolution is one hop
 // and never transitive: A -> B -> C is two rows, both carrying entity_id = A.
-func plan(ctx context.Context, pool *pgxpool.Pool, r *Roster) ([]LinkRow, error) {
-	ids, err := resolveISINs(ctx, pool, r)
+//
+// The entity is read off the STORE, not off the roster, wherever the store
+// already holds one. Design 4.1's named growth case is exactly this: "a fresh
+// split in 2027 is one INSERT pointing the new successor at the EXISTING
+// entity_id". A roster does not have to be the whole history to be applied --
+// `entities link` writes a one-line file, and a reviewer may prune a diff to
+// the pair that changed -- so a roster holding only B -> C walks to root B
+// and, taking the roster's word for it, would write (C, entity B) while the
+// store already resolves B to A. That splits one company across two entity
+// ids. The flatness trigger does catch it, but only as a raw
+// "B is the entity of other symbols", which is the message design 4.1 and 10
+// both forbid acting on. Consulting the store makes the row the design's own:
+// (C, entity A, predecessor B).
+//
+// A retraction row sets entity_id = symbol_id, so a retracted root resolves
+// to itself and falls through to the roster's answer, which is correct: it is
+// its own entity again.
+func plan(ctx context.Context, q querier, r *Roster, current map[int64]linkState) ([]LinkRow, error) {
+	ids, err := resolveISINs(ctx, q, r)
 	if err != nil {
 		return nil, err
 	}
@@ -174,6 +194,7 @@ func plan(ctx context.Context, pool *pgxpool.Pool, r *Roster) ([]LinkRow, error)
 		predecessorOf[l.Successor] = l.Predecessor
 	}
 	var rows []LinkRow
+	adopted := map[int64]bool{} // entity ids taken from the store, not the roster
 	for _, l := range r.Links {
 		root := l.Predecessor
 		// The roster is already known to be a set of paths (G5), so this walk
@@ -184,6 +205,11 @@ func plan(ctx context.Context, pool *pgxpool.Pool, r *Roster) ([]LinkRow, error)
 				break
 			}
 			root = prev
+		}
+		entityID, entityISIN := ids[root], root
+		if st, ok := current[entityID]; ok && st.EntityID != entityID {
+			entityID, entityISIN = st.EntityID, ""
+			adopted[entityID] = true
 		}
 		boundary, err := parseDay(l.EffectiveFrom)
 		if err != nil {
@@ -201,7 +227,7 @@ func plan(ctx context.Context, pool *pgxpool.Pool, r *Roster) ([]LinkRow, error)
 		}
 		rows = append(rows, LinkRow{
 			SymbolID:       ids[l.Successor],
-			EntityID:       ids[root],
+			EntityID:       entityID,
 			PredecessorID:  ids[l.Predecessor],
 			Boundary:       boundary,
 			Reason:         reasonOf(l),
@@ -209,8 +235,27 @@ func plan(ctx context.Context, pool *pgxpool.Pool, r *Roster) ([]LinkRow, error)
 			Evidence:       evidence,
 			ISIN:           l.Successor,
 			PredecessorSIN: l.Predecessor,
-			EntityISIN:     root,
+			EntityISIN:     entityISIN,
 		})
+	}
+	// An entity taken from the store is named by a symbol the roster may not
+	// mention at all, so its ISIN has to be looked up before any error
+	// message can name it.
+	if len(adopted) > 0 {
+		want := make([]int64, 0, len(adopted))
+		for id := range adopted {
+			want = append(want, id)
+		}
+		sort.Slice(want, func(i, j int) bool { return want[i] < want[j] })
+		isins, err := isinsOf(ctx, q, want)
+		if err != nil {
+			return nil, err
+		}
+		for i := range rows {
+			if rows[i].EntityISIN == "" {
+				rows[i].EntityISIN = isins[rows[i].EntityID]
+			}
+		}
 	}
 	// Root-first, so a chain is written in the order it happened. The
 	// flatness trigger accepts either order -- every row points at a root
@@ -231,12 +276,12 @@ func plan(ctx context.Context, pool *pgxpool.Pool, r *Roster) ([]LinkRow, error)
 // means the roster is describing a company this store has no bars for, so the
 // link would be unverifiable by `entities check` and invisible to every read
 // -- a row asserting something nothing can contradict.
-func resolveISINs(ctx context.Context, pool *pgxpool.Pool, r *Roster) (map[string]int64, error) {
+func resolveISINs(ctx context.Context, q querier, r *Roster) (map[string]int64, error) {
 	want := make([]string, 0, 2*len(r.Links))
 	for _, l := range r.Links {
 		want = append(want, l.Predecessor, l.Successor)
 	}
-	rows, err := pool.Query(ctx, `SELECT DISTINCT isin, symbol_id FROM symbols WHERE isin = ANY($1)`, want)
+	rows, err := q.Query(ctx, `SELECT DISTINCT isin, symbol_id FROM symbols WHERE isin = ANY($1)`, want)
 	if err != nil {
 		return nil, err
 	}
@@ -346,18 +391,25 @@ func currentMap(ctx context.Context, q querier) (map[int64]linkState, error) {
 // checkEntityNames runs migration 0004's two flatness guards BEFORE the
 // insert, so the operator gets an error describing what they actually did.
 //
-// The trigger's own message for the first case is "re-point every member or
-// none", which is advice design 4.1 and 10 both forbid taking. The case it
-// fires on is real and reachable from the design's own ops flow: a backfill
-// that extends the archive backwards makes `propose` emit a predecessor OLDER
-// than the current chain root, `plan` then recomputes the root and the roster
-// asks for the entity to be RENAMED. Design 4.1 says such a predecessor
-// "joins by pointing at the existing entity_id rather than renaming the
-// entity" -- but the row it would need is (symbol P, entity A) with no
-// predecessor to record, and design 4.2's CHECK requires predecessor IS NOT
-// NULL on every non-retraction row. The two are not compatible, so this
-// refuses and says so rather than improvising a row shape the design does not
-// define. See docs/DESIGN.md, Stage 2.
+// The first guard is the one that still fires on a legitimate roster, and the
+// trigger's own message for it is "re-point every member or none", which is
+// advice design 4.1 and 10 both forbid taking. The case is real and reachable
+// from the design's own ops flow: a backfill that extends the archive
+// BACKWARDS makes `propose` emit a predecessor older than the current chain
+// root, and the roster then asks for the entity to be RENAMED. Design 4.1
+// says such a predecessor "joins by pointing at the existing entity_id rather
+// than renaming the entity" -- but the row that needs is (symbol P, entity A)
+// with no predecessor to record, and design 4.2's CHECK requires predecessor
+// IS NOT NULL on every non-retraction row. The two are not compatible, so
+// this refuses and says so rather than improvising a row shape the design
+// does not define. See docs/DESIGN.md, Stage 2.
+//
+// The second guard is now belt-and-braces. It fired on design 4.1's FORWARD
+// growth case -- a roster holding only B -> C, applied to a store that
+// already resolves B to A -- until `plan` learned to read the entity off the
+// store; that roster is now written as (C, entity A), which is what design
+// 4.1 asks for. What is left for this guard is a store whose map is not flat,
+// which the trigger already prevents.
 func checkEntityNames(rows []LinkRow, current map[int64]linkState) error {
 	membersOf := map[int64][]int64{}
 	for symbolID, st := range current {
