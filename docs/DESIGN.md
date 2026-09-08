@@ -807,18 +807,16 @@ the caller's pin, and `UniverseMember.LastBreak` carries the most recent one at 
 `asOf`; `verdict universe` prints it as `last_break` with a header line counting the members
 that have one. Until `adjustments` exists the only safe use of them is to **refuse**.
 
-**Both are INERT today, and the guard you write against them will not fire.** `symbol_links`
-is empty on the live store, so `EntityBoundaries` returns an empty map for every entity id it
-is handed and `LastBreak` is nil for every member: `verdict universe --as-of 2026-09-04
---lookback 125 --n 100000` prints `0 of 2127 members carry a succession boundary at or before
-as-of` (run 2026-09-08; the `--n` lifts the default top-500 limit so the count covers the whole
-ranking). One thing changes that, and it is not a code change: a human running
-`verdict entities apply` over the reviewed roster. Write the guard anyway — the alternative is
-finding it missing on the day the map is seeded, which is the day the danger starts — but do
-not read a green run against the live store as evidence that it works, because a guard that
-never fires and a guard that is not there produce identical output today. Exercise it against
-a seeded map instead: `internal/market/entities`' fixtures apply a real roster to
-`verdict_test`, and `TestEntityMapAt_ResolvesEverySymbolAtThePin` and
+**Both are LIVE, and a guard written today can be seen to fire.** They were inert until
+2026-09-08, when the reviewed roster was applied (444 links, 415 entities), and this paragraph
+said so; treat any copy of it that still does as stale. `verdict universe --as-of 2026-09-04
+--lookback 125 --n 100000` now prints `334 of 2141 members carry a succession boundary at or
+before as-of` (run 2026-09-08; the `--n` lifts the default top-500 limit so the count covers
+the whole ranking), and within the default top 500 the figure is 113. So a green run against
+the live store is now evidence of something — but only that the guard did not fire on the
+names it was handed, which is not the same as evidence that it fires when it should. Exercise
+the firing path against a seeded map: `internal/market/entities`' fixtures apply a real roster
+to `verdict_test`, and `TestEntityMapAt_ResolvesEverySymbolAtThePin` and
 `TestUnlinkedCandidates_GoesQuietOnceTheRosterIsApplied` show the shape.
 
 M1's `runs` table must also record `snapshot_id` computed over the amended row set including
