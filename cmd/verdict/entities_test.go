@@ -2,10 +2,14 @@ package main
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/HardikSJain/verdict-machine/internal/market/entities"
 )
 
 // The refusals that must happen before a database connection is opened. Each
@@ -69,7 +73,7 @@ func TestEntitiesCommandsDeclareTheirFlags(t *testing.T) {
 		cmd   string
 		flags []string
 	}{
-		{"propose", []string{"out", "review-out", "as-of-ingest", "ratified-by"}},
+		{"propose", []string{"out", "review-out", "as-of-ingest", "ratified-by", "discard-manual"}},
 		{"link", []string{"pred", "succ", "note", "ratified-by", "roster"}},
 		{"apply", []string{"roster", "dry-run", "seeded-by"}},
 		{"retract", []string{"entity", "symbol", "note"}},
@@ -96,4 +100,80 @@ func TestEntitiesCommandsDeclareTheirFlags(t *testing.T) {
 func TestRatifiedAtIsEmptyWithoutARatifier(t *testing.T) {
 	require.Empty(t, ratifiedAt(""))
 	require.NotEmpty(t, ratifiedAt("hardik"))
+}
+
+// TestProposeReadsTheManualLinesOutOfTheFileItIsAboutToOverwrite covers the
+// half of the manual-line rescue that lives in the CLI: the read happens
+// before a connection is opened, so a roster carrying a human's decision
+// cannot be lost to a run that then fails on the database.
+func TestProposeReadsTheManualLinesOutOfTheFileItIsAboutToOverwrite(t *testing.T) {
+	dir := t.TempDir()
+
+	// No file yet: the first ever run has nothing to carry and must not fail.
+	got, err := existingManualLines(filepath.Join(dir, "absent.json"), false)
+	require.NoError(t, err)
+	require.Empty(t, got)
+
+	// A roster with one hand-written line and one generated one: only the
+	// hand-written line comes back.
+	path := filepath.Join(dir, "roster.json")
+	r := &entities.Roster{Version: 1, Links: []entities.Link{manualCLILine(), generatedCLILine()}}
+	b, err := r.Marshal()
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, b, 0o644))
+
+	got, err = existingManualLines(path, false)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, "INF204KB14I2", got[0].Successor)
+
+	// A file that will not load is not a file to overwrite quietly: it may be
+	// mid-edit, and the only copy of a human decision is in it.
+	require.NoError(t, os.WriteFile(path, []byte("{\"version\": 1, \"links\": ["), 0o644))
+	_, err = existingManualLines(path, false)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "--discard-manual")
+
+	// And --discard-manual is the way past it, in both directions.
+	got, err = existingManualLines(path, true)
+	require.NoError(t, err)
+	require.Empty(t, got)
+}
+
+func manualCLILine() entities.Link {
+	return entities.Link{
+		Reason:           entities.ReasonManual,
+		Predecessor:      "INF732E01011",
+		Successor:        "INF204KB14I2",
+		TickerAtBoundary: "NIFTYBEES",
+		EffectiveFrom:    "2019-12-20",
+		Gates: entities.Gates{
+			CheckDigit:         true,
+			PredecessorLastBar: "2019-12-19",
+			SuccessorFirstBar:  "2019-12-20",
+		},
+		RatifiedBy: "hardik", RatifiedAt: "2026-09-08",
+		Note: "NSE circular: AMC transfer",
+	}
+}
+
+func generatedCLILine() entities.Link {
+	return entities.Link{
+		Reason:           entities.ReasonSuccession,
+		Predecessor:      "INE081A01012",
+		Successor:        "INE081A01020",
+		TickerAtBoundary: "TATASTEEL",
+		EffectiveFrom:    "2022-07-29",
+		Gates: entities.Gates{
+			CheckDigit:           true,
+			IssuerPrefix:         "INE081A01",
+			Serial:               "01->02",
+			PredecessorLastBar:   "2022-07-28",
+			SuccessorFirstBar:    "2022-07-29",
+			CalendarDaysBetween:  1,
+			GapDatesAllSettled:   true,
+			BoundaryCloseRatio:   1.0723,
+			BoundaryRatioMatches: "1/1",
+		},
+	}
 }

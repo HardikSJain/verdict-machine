@@ -502,3 +502,88 @@ func Load(path string) (*Roster, []byte, error) {
 	r.Sort()
 	return &r, digest, nil
 }
+
+// ManualLinks returns the roster's hand-written lines, in file order.
+func (r *Roster) ManualLinks() []Link {
+	var out []Link
+	for _, l := range r.Links {
+		if reasonOf(l) == ReasonManual {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// AdoptManual carries the hand-written lines of an existing roster into this
+// freshly generated one, and reports which lines it carried.
+//
+// It exists because `propose` regenerates the roster out of bars alone and
+// the CLI writes the result OVER the file named by `--out` -- which design
+// 9's monthly runbook points at the committed roster,
+// `internal/market/entities/roster.json`. Every `entities link` line in that
+// file -- the INF fund-unit transfers, the long-gap relistings, the pairs no
+// gate admits, each one carrying a ratifier and a note and none of them
+// reproducible by the generator -- was truncated away by that run without a
+// word. `symbol_links` has no DELETE, so rows already applied survived; what
+// was lost was the FILE, which is the reviewed artefact design 5.1 says
+// identity is decided in, plus any line not yet applied. A regenerate would
+// then hand the reviewer a diff that deletes a human's ratified decision and
+// says nothing about it.
+//
+// A manual line whose exact pair the generator now proposes keeps the
+// HAND-WRITTEN line and drops the generated twin: the two say the same thing
+// about the same pair, and only one of them names the person who decided it.
+// A manual line that shares one endpoint with a DIFFERENT generated line is a
+// G5 branch and is refused here rather than left for Validate, so the
+// operator is told which two lines disagree instead of reading a graph error.
+func (r *Roster) AdoptManual(existing []Link) ([]Link, error) {
+	generated := map[[2]string]bool{}
+	bySuccessor := map[string]Link{}
+	byPredecessor := map[string]Link{}
+	for _, l := range r.Links {
+		generated[[2]string{l.Predecessor, l.Successor}] = true
+		bySuccessor[l.Successor] = l
+		byPredecessor[l.Predecessor] = l
+	}
+	var kept []Link
+	superseded := map[[2]string]bool{}
+	for _, m := range existing {
+		if reasonOf(m) != ReasonManual {
+			continue
+		}
+		pair := [2]string{m.Predecessor, m.Successor}
+		switch {
+		case generated[pair]:
+			superseded[pair] = true
+		default:
+			if g, ok := bySuccessor[m.Successor]; ok {
+				return nil, fmt.Errorf(
+					"roster: the hand-written line %s -> %s and the generated line %s -> %s both claim %s as a successor; "+
+						"one of them is wrong and this run will not choose between them -- delete the hand-written line if the generator is now right, "+
+						"or re-run with --discard-manual once you have kept a copy",
+					m.Predecessor, m.Successor, g.Predecessor, g.Successor, m.Successor)
+			}
+			if g, ok := byPredecessor[m.Predecessor]; ok {
+				return nil, fmt.Errorf(
+					"roster: the hand-written line %s -> %s and the generated line %s -> %s both claim %s as a predecessor; "+
+						"one of them is wrong and this run will not choose between them -- delete the hand-written line if the generator is now right, "+
+						"or re-run with --discard-manual once you have kept a copy",
+					m.Predecessor, m.Successor, g.Predecessor, g.Successor, m.Predecessor)
+			}
+		}
+		kept = append(kept, m)
+	}
+	if len(kept) == 0 {
+		return nil, nil
+	}
+	links := make([]Link, 0, len(r.Links)+len(kept))
+	for _, l := range r.Links {
+		if superseded[[2]string{l.Predecessor, l.Successor}] {
+			continue
+		}
+		links = append(links, l)
+	}
+	r.Links = append(links, kept...)
+	r.Sort()
+	return kept, r.Validate()
+}

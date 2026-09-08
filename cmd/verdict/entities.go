@@ -37,6 +37,9 @@ func newEntitiesProposeCmd() *cobra.Command {
 			"accepted or quarantined -- carrying every gate result and the close and\n" +
 			"turnover ratios across the boundary, behind a header line saying what the file\n" +
 			"does and does not measure.\n\n" +
+			"Hand-written `manual` lines already in --out are carried into the new roster:\n" +
+			"the generator cannot reproduce them, and this command overwrites the file the\n" +
+			"monthly runbook names. --discard-manual drops them instead, deliberately.\n\n" +
 			"It refuses to emit anything at all while the archive span holds an unsettled\n" +
 			"date (G4a). G4 counts sessions out of bars, so a real NSE session the store\n" +
 			"has not fetched reads as \"zero sessions between\" -- and the 2017 Tube\n" +
@@ -47,10 +50,18 @@ func newEntitiesProposeCmd() *cobra.Command {
 			out, _ := cmd.Flags().GetString("out")
 			reviewPath, _ := cmd.Flags().GetString("review-out")
 			ratifiedBy, _ := cmd.Flags().GetString("ratified-by")
+			discardManual, _ := cmd.Flags().GetBool("discard-manual")
 			asOfIngestS, _ := cmd.Flags().GetString("as-of-ingest")
 			asOfIngest, err := parseIngestPin(asOfIngestS)
 			if err != nil {
 				return fmt.Errorf("--as-of-ingest: %w", err)
+			}
+			// Read the file this run is about to overwrite BEFORE opening a
+			// connection, so a roster carrying hand-written lines cannot be
+			// lost to a run that then fails on something else.
+			existing, err := existingManualLines(out, discardManual)
+			if err != nil {
+				return err
 			}
 			url, err := databaseURL(cmd)
 			if err != nil {
@@ -90,6 +101,21 @@ func newEntitiesProposeCmd() *cobra.Command {
 				fmt.Fprintf(w, "  %-24s rejected %4d  (first failure for %d)\n", g, counts.AnyFailure[g], counts.FirstFailure[g])
 			}
 
+			if discardManual {
+				if len(existing) > 0 {
+					fmt.Fprintf(w, "# --discard-manual: %d hand-written line(s) in %s are NOT carried into this roster\n", len(existing), out)
+				}
+				existing = nil
+			}
+			kept, err := roster.AdoptManual(existing)
+			if err != nil {
+				return err
+			}
+			for _, l := range kept {
+				fmt.Fprintf(w, "# kept hand-written line %s -> %s (ratified by %s): the generator cannot reproduce it and this run would otherwise have deleted it\n",
+					l.Predecessor, l.Successor, l.RatifiedBy)
+			}
+
 			if err := writeFile(out, func(path string) error {
 				b, err := roster.Marshal()
 				if err != nil {
@@ -121,6 +147,7 @@ func newEntitiesProposeCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().String("out", "roster.json", "where to write the roster")
+	cmd.Flags().Bool("discard-manual", false, "overwrite --out even though it holds hand-written `manual` lines, dropping them")
 	cmd.Flags().String("review-out", filepath.Join("data", "succession-review.jsonl"), "where to write the per-candidate review file")
 	cmd.Flags().String("ratified-by", "", "handle to record as the ratifier on every generated line (default: unratified)")
 	cmd.Flags().String("as-of-ingest", "", "pin every read at this ingest timestamp: RFC3339, or YYYY-MM-DD for midnight UTC (default now)")
@@ -134,6 +161,37 @@ func ratifiedAt(ratifiedBy string) string {
 		return ""
 	}
 	return time.Now().UTC().Format("2006-01-02")
+}
+
+// existingManualLines reads the hand-written lines out of the roster this run
+// is about to overwrite.
+//
+// It is deliberately strict. A roster file that will not load is not a file
+// to overwrite quietly: it may be mid-edit, or a `manual` line may have been
+// mistyped, and the only copy of a human decision is in it. --discard-manual
+// is the way past that, and under it a file that will not load is reported as
+// unreadable rather than refused, so a corrupt roster cannot block a
+// regenerate either.
+func existingManualLines(path string, discard bool) ([]entities.Link, error) {
+	if path == "" {
+		return nil, nil
+	}
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	r, _, err := entities.Load(path)
+	if err != nil {
+		if discard {
+			return nil, nil
+		}
+		return nil, fmt.Errorf(
+			"%w\n\n%s is the file this run overwrites, and it does not load, so its hand-written lines cannot be carried across. "+
+				"Fix it, or re-run with --discard-manual once you have kept a copy", err, path)
+	}
+	return r.ManualLinks(), nil
 }
 
 func writeFile(path string, write func(string) error) error {

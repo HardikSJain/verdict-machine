@@ -466,3 +466,111 @@ func TestCanonicalJSONFollowsRFC8785(t *testing.T) {
 
 // math0 returns negative zero, which RFC 8785 serializes as "0".
 func math0() float64 { z := 0.0; return -z }
+
+// fundUnit is the hand-written line design 5.4 sends to the quarantine queue
+// and design 5.6 says only a human with an NSE circular may promote: an AMC
+// transfer, where the whole ISIN changes so no prefix rule can ever see it.
+// The generator cannot reproduce it, this month or any month.
+func fundUnit() entities.Link {
+	return entities.Link{
+		Reason:           entities.ReasonManual,
+		Predecessor:      "INF732E01011",
+		Successor:        "INF204KB14I2",
+		TickerAtBoundary: "NIFTYBEES",
+		EffectiveFrom:    "2019-12-20",
+		Gates: entities.Gates{
+			CheckDigit:         true,
+			PredecessorLastBar: "2019-12-19",
+			SuccessorFirstBar:  "2019-12-20",
+		},
+		RatifiedBy: "hardik", RatifiedAt: "2026-09-08",
+		Note: "NSE circular: AMC transfer, Goldman Sachs MF to Nippon India MF",
+	}
+}
+
+func TestAdoptManualCarriesHandWrittenLinesAcrossARegenerate(t *testing.T) {
+	// `propose --out internal/market/entities/roster.json` is the command
+	// design 9's monthly runbook names, and it rebuilds the file from the
+	// generator and writes it over the target. Every `entities link` line in
+	// that file is invisible to the generator by construction -- it exists
+	// because no gate admitted it -- so the run deleted it, silently, and the
+	// reviewer's diff showed a removal with no reason attached to it.
+	generated := roster(tataSteel(), plainSplit())
+	before, err := generated.ComputeDigest()
+	require.NoError(t, err)
+
+	kept, err := generated.AdoptManual([]entities.Link{fundUnit()})
+	require.NoError(t, err)
+	require.Len(t, kept, 1)
+	require.Len(t, generated.Links, 3)
+	require.NoError(t, generated.Validate())
+
+	after, err := generated.ComputeDigest()
+	require.NoError(t, err)
+	require.NotEqual(t, before, after,
+		"the digest covers the whole file, so carrying a line across is a change to it and must show as one")
+
+	var found bool
+	for _, l := range generated.Links {
+		if l.Reason == entities.ReasonManual {
+			found = true
+			require.Equal(t, "hardik", l.RatifiedBy, "the ratifier is the whole reason the line is worth keeping")
+			require.NotEmpty(t, l.Note)
+		}
+	}
+	require.True(t, found)
+
+	// Only `manual` lines are carried. The generated half of last month's
+	// roster is NOT: the generator is the source of truth for it, and
+	// carrying it across would let a line the store no longer supports
+	// survive a regenerate that dropped it.
+	fresh := roster(tataSteel())
+	kept, err = fresh.AdoptManual([]entities.Link{plainSplit()})
+	require.NoError(t, err)
+	require.Empty(t, kept)
+	require.Len(t, fresh.Links, 1)
+}
+
+func TestAdoptManualKeepsTheHandWrittenLineWhenTheGeneratorCatchesUp(t *testing.T) {
+	// A pair a human hand-linked can become auto-acceptable later: a backfill
+	// fills in the gap dates, and G4a stops refusing it. Both lines then say
+	// the same thing about the same pair and only one of them names the
+	// person who decided it, so the hand-written one stays and the generated
+	// twin goes.
+	manual := tataSteel()
+	manual.Reason = entities.ReasonManual
+	manual.Note = "NSE circular 2022/07: 1:10 face value split"
+
+	generated := roster(tataSteel(), plainSplit())
+	kept, err := generated.AdoptManual([]entities.Link{manual})
+	require.NoError(t, err)
+	require.Len(t, kept, 1)
+	require.Len(t, generated.Links, 2, "one line for the pair, not two")
+	require.NoError(t, generated.Validate(), "and not a G5 merge point against itself")
+
+	for _, l := range generated.Links {
+		if l.Predecessor == manual.Predecessor {
+			require.Equal(t, entities.ReasonManual, l.Reason)
+			require.Equal(t, "hardik", l.RatifiedBy)
+		}
+	}
+}
+
+func TestAdoptManualRefusesWhenAHandWrittenLineContradictsAGeneratedOne(t *testing.T) {
+	// The case that must not be resolved by machine: two lines claiming one
+	// endpoint, one of them written by a human. Validate would catch it as a
+	// G5 graph error after the fact; refusing here names the two lines
+	// instead, because the operator has to decide which is wrong.
+	rival := fundUnit()
+	rival.Predecessor = "INE090A01013" // plainSplit's predecessor
+	rival.Gates.PredecessorLastBar = "2019-12-19"
+	_, err := roster(tataSteel(), plainSplit()).AdoptManual([]entities.Link{rival})
+	require.ErrorContains(t, err, "both claim INE090A01013 as a predecessor")
+	require.ErrorContains(t, err, "--discard-manual")
+
+	rival = fundUnit()
+	rival.Successor = "INE090A01021" // plainSplit's successor
+	rival.Gates.SuccessorFirstBar = "2019-12-20"
+	_, err = roster(tataSteel(), plainSplit()).AdoptManual([]entities.Link{rival})
+	require.ErrorContains(t, err, "both claim INE090A01021 as a successor")
+}
