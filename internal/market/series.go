@@ -409,3 +409,64 @@ func uniqueSorted(ids []int64) []int64 {
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out
 }
+
+// DatedClose is one session's close for one entity.
+type DatedClose struct {
+	Date  time.Time
+	Close float64
+}
+
+// EntityCloses returns one entity's closes over [from, to], ascending, and
+// REFUSES when a succession boundary's guard band falls inside the range.
+//
+// The refusal is the same rule EntityReturns applies and for the same reason,
+// even though a moving average is not a difference. An average taken across an
+// unadjusted split mixes two price levels an order of magnitude apart, and the
+// result is not a wrong number so much as a meaningless one: a 200-day mean of
+// TATASTEEL spanning July 2022 sits somewhere between 950 and 100, above every
+// post-split price and below every pre-split one, so a trend rule reading it
+// would flip and stay flipped for most of a year.
+func (s *Store) EntityCloses(ctx context.Context, source string, entityID int64, from, to, asOfIngest time.Time) ([]DatedClose, error) {
+	if !from.Before(to) {
+		return nil, fmt.Errorf("entity closes: from %s must be before to %s",
+			from.Format(time.DateOnly), to.Format(time.DateOnly))
+	}
+	boundaries, err := s.EntityBoundaries(ctx, []int64{entityID}, asOfIngest)
+	if err != nil {
+		return nil, err
+	}
+	if bs := boundaries[entityID]; len(bs) > 0 {
+		guards, err := s.guardStarts(ctx, source, boundaries, asOfIngest)
+		if err != nil {
+			return nil, err
+		}
+		if refusal, refused := firstRefusal(entityID, from, to, bs, guards); refused {
+			return nil, fmt.Errorf("entity closes: %w", refusal)
+		}
+	}
+
+	rows, err := s.pool.Query(ctx, `WITH `+entityMapCTE("$5")+`,
+		mem AS (SELECT symbol_id FROM entity_map WHERE entity_id = $2)
+		SELECT DISTINCT ON (b.date) b.date, b.close::float8
+		FROM bars b JOIN mem ON mem.symbol_id = b.symbol_id
+		WHERE b.source = $1 AND b.date >= $3 AND b.date <= $4 AND b.ingested_at <= $5
+		ORDER BY b.date, b.ingested_at DESC`,
+		source, entityID, from, to, asOfIngest)
+	if err != nil {
+		return nil, fmt.Errorf("entity closes: %w", err)
+	}
+	defer rows.Close()
+	var out []DatedClose
+	for rows.Next() {
+		var d time.Time
+		var c float64
+		if err := rows.Scan(&d, &c); err != nil {
+			return nil, err
+		}
+		out = append(out, DatedClose{Date: Day(d.Year(), d.Month(), d.Day()), Close: c})
+	}
+	return out, rows.Err()
+}
+
+// Error makes BoundaryRefusal usable with %w.
+var _ error = BoundaryRefusal{}

@@ -17,6 +17,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -188,16 +189,39 @@ func (e *Engine) Run(ctx context.Context, cash float64) (Result, error) {
 			if err != nil {
 				return Result{}, err
 			}
+			// Sells first. A monthly rebalance sells the names leaving the
+			// book and buys the ones joining it at the SAME open, and applying
+			// a buy before the sale that funds it would fail on cash for a
+			// reason the market never imposed. Zerodha releases delivery sale
+			// proceeds for same-day trading, so this is the real constraint
+			// rather than a convenience -- but it IS an assumption, and a
+			// broker that held proceeds to settlement would make this loop
+			// optimistic by one rebalance's worth of turnover.
+			sort.SliceStable(ex.Fills, func(i, j int) bool {
+				return ex.Fills[i].Side == cost.Sell && ex.Fills[j].Side != cost.Sell
+			})
 			for _, f := range ex.Fills {
 				if err := p.Apply(f); err != nil {
+					// A buy the book cannot fund is a rejection, not a fault.
+					// Sizing happens on a close and filling happens at the
+					// next open, so an adverse gap can make a correctly sized
+					// order unaffordable by morning. A real broker rejects it;
+					// aborting the run instead would make the backtest unable
+					// to model its own most ordinary failure.
+					if errors.Is(err, ErrInsufficientCash) {
+						res.Unfilled = append(res.Unfilled, Unfilled{
+							Order: f.Order, Date: date, Reason: err.Error(),
+						})
+						continue
+					}
 					return Result{}, fmt.Errorf("engine: %s: %w", date.Format(time.DateOnly), err)
 				}
+				res.Fills = append(res.Fills, f)
 				res.TotalCosts += f.Charges.Total()
 				for _, c := range f.Charges.Unverified {
 					res.Unverified[c]++
 				}
 			}
-			res.Fills = append(res.Fills, ex.Fills...)
 			res.Unfilled = append(res.Unfilled, ex.Unfilled...)
 			pending = nil
 		}

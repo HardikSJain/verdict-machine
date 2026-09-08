@@ -140,3 +140,25 @@ func (f *Fixture) closeAtOrBefore(id int64, date time.Time) (float64, bool) {
 	}
 	return 0, false
 }
+
+// Closes reads the fixture's own bars. A fixture has no succession map, so it
+// cannot refuse for a boundary; a test that needs the refusal path uses
+// Refuse, which stands in for one.
+func (f *Fixture) Closes(_ context.Context, entityID int64, from, to time.Time) ([]DatedClose, error) {
+	if !from.Before(to) {
+		return nil, fmt.Errorf("engine: fixture closes need from before to")
+	}
+	if why, ok := f.refuse[entityID]; ok {
+		return nil, fmt.Errorf("engine: fixture refuses closes for entity %d: %s", entityID, why)
+	}
+	var out []DatedClose
+	for _, d := range f.sessions {
+		if d.Before(from) || d.After(to) {
+			continue
+		}
+		if b, ok := f.bars[key(d)][entityID]; ok {
+			out = append(out, DatedClose{Date: d, Close: b.Close})
+		}
+	}
+	return out, nil
+}

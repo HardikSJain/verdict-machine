@@ -57,4 +57,17 @@ type Market interface {
 	// Returns prices a window for a set of entities, refusing any whose window
 	// touches a succession boundary's guard band.
 	Returns(ctx context.Context, entityIDs []int64, from, to time.Time) (ReturnSet, error)
+
+	// Closes is one entity's close series over a range, ascending. It errors
+	// rather than returning a series that spans a succession boundary: a moving
+	// average taken across an unadjusted split is not a wrong number, it is a
+	// meaningless one, sitting above every post-split price and below every
+	// pre-split one.
+	Closes(ctx context.Context, entityID int64, from, to time.Time) ([]DatedClose, error)
+}
+
+// DatedClose is one session's close.
+type DatedClose struct {
+	Date  time.Time
+	Close float64
 }

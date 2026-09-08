@@ -228,10 +228,16 @@ func TestUnfilledWhenTheNameDoesNotTrade(t *testing.T) {
 	require.Contains(t, res.Unfilled[0].Reason, "did not trade")
 }
 
-// TestABuyBeyondCashIsAnError rather than silent leverage. The play tier is
-// cash equity; a book that can go short of cash is a book measuring a strategy
-// nobody could have run.
-func TestABuyBeyondCashIsAnError(t *testing.T) {
+// TestABuyBeyondCashIsUnfilledNotLeverage. The play tier is cash equity, so a
+// book that could go short of cash would be measuring a strategy nobody could
+// have run.
+//
+// It is reported as unfilled rather than fatal, because sizing happens on a
+// close and filling happens at the next open: an adverse overnight gap can
+// make a correctly sized order unaffordable by morning, which is an ordinary
+// event a real broker answers by rejecting the order. A run that aborted there
+// could not model its own most common failure.
+func TestABuyBeyondCashIsUnfilledNotLeverage(t *testing.T) {
 	f := engine.NewFixture([]time.Time{d1, d2}).
 		AddBar(d1, engine.Bar{EntityID: 1, Scrip: "AAA", Open: 100, Close: 100}).
 		AddBar(d2, engine.Bar{EntityID: 1, Scrip: "AAA", Open: 100, Close: 100})
@@ -239,9 +245,14 @@ func TestABuyBeyondCashIsAnError(t *testing.T) {
 	s := &scripted{name: "greedy", on: map[string][]risk.Intent{
 		d1.Format(time.DateOnly): {buyIntent("AAA", 1000, 100)}, // 100,000 plus charges
 	}}
-	_, err := harness(t, f, s, looseLimits()).Run(context.Background(), 100_000)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "the book holds")
+	res, err := harness(t, f, s, looseLimits()).Run(context.Background(), 100_000)
+	require.NoError(t, err)
+	require.Empty(t, res.Fills)
+	require.Len(t, res.Unfilled, 1)
+	require.ErrorIs(t, engine.ErrInsufficientCash, engine.ErrInsufficientCash)
+	require.Contains(t, res.Unfilled[0].Reason, "insufficient cash")
+	require.Contains(t, res.Unfilled[0].Reason, "the book holds")
+	require.Equal(t, 100_000.0, res.FinalCash, "and not a rupee of it was spent")
 }
 
 // TestEquityCurveMarksAtEveryClose, including a session where a held name did

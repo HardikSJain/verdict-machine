@@ -110,3 +110,17 @@ func (m *StoreMarket) Returns(ctx context.Context, entityIDs []int64, from, to t
 	}
 	return out, nil
 }
+
+// Closes forwards to the store, which refuses a range spanning a succession
+// boundary for the same reason Returns refuses a window across one.
+func (m *StoreMarket) Closes(ctx context.Context, entityID int64, from, to time.Time) ([]DatedClose, error) {
+	rows, err := m.store.EntityCloses(ctx, m.source, entityID, from, to, m.pin)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]DatedClose, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, DatedClose{Date: r.Date, Close: r.Close})
+	}
+	return out, nil
+}

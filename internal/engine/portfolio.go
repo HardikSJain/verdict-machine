@@ -1,11 +1,19 @@
 package engine
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 
 	"github.com/HardikSJain/verdict-machine/internal/cost"
 )
+
+// ErrInsufficientCash is what a buy that the book cannot fund returns. It is a
+// sentinel rather than a string because the engine has to tell it apart from a
+// real fault: a broker rejects an underfunded order, it does not halt the
+// account, and a backtest that aborted on one would be unable to model the
+// ordinary case of sizing on a close and filling at a higher open.
+var ErrInsufficientCash = errors.New("insufficient cash")
 
 // Position is one holding. CostBasis is what was paid for the shares still
 // held, charges included, so a realised P&L is a subtraction rather than a
@@ -65,8 +73,8 @@ func (p *Portfolio) Apply(f Fill) error {
 		outflow := value + charges
 		if outflow > p.Cash+1e-9 {
 			return fmt.Errorf(
-				"buy %d %s at %.2f needs %.2f including %.2f of charges, and the book holds %.2f",
-				f.Quantity, f.Scrip, f.Price, outflow, charges, p.Cash)
+				"%w: buy %d %s at %.2f needs %.2f including %.2f of charges, and the book holds %.2f",
+				ErrInsufficientCash, f.Quantity, f.Scrip, f.Price, outflow, charges, p.Cash)
 		}
 		p.Cash -= outflow
 		held.EntityID = f.EntityID
