@@ -151,8 +151,8 @@ func (m *Momentum) Decide(ctx context.Context, s engine.Session) ([]risk.Intent,
 				px = h.LastMark
 			}
 			out = append(out, risk.Intent{
-				Scrip: h.Scrip, Side: cost.Sell, Product: cost.EquityDelivery,
-				Quantity: h.Quantity, Price: px,
+				EntityID: h.EntityID, Scrip: h.Scrip, Side: cost.Sell,
+				Product: cost.EquityDelivery, Quantity: h.Quantity, Price: px,
 			})
 		}
 		_ = why
@@ -277,8 +277,8 @@ func (m *Momentum) rebalanceTo(ctx context.Context, s engine.Session) ([]risk.In
 			continue
 		}
 		sells = append(sells, risk.Intent{
-			Scrip: h.Scrip, Side: cost.Sell, Product: cost.EquityDelivery,
-			Quantity: h.Quantity - want, Price: px,
+			EntityID: h.EntityID, Scrip: h.Scrip, Side: cost.Sell,
+			Product: cost.EquityDelivery, Quantity: h.Quantity - want, Price: px,
 		})
 	}
 	for _, r := range ranked {
@@ -291,8 +291,8 @@ func (m *Momentum) rebalanceTo(ctx context.Context, s engine.Session) ([]risk.In
 			continue
 		}
 		buys = append(buys, risk.Intent{
-			Scrip: scrip[r.id], Side: cost.Buy, Product: cost.EquityDelivery,
-			Quantity: want - have, Price: s.Closes[r.id],
+			EntityID: r.id, Scrip: scrip[r.id], Side: cost.Buy,
+			Product: cost.EquityDelivery, Quantity: want - have, Price: s.Closes[r.id],
 		})
 	}
 	return append(sells, buys...), nil

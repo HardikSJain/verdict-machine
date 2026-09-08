@@ -39,14 +39,18 @@ func (s *scripted) Decide(_ context.Context, sess engine.Session) ([]risk.Intent
 	return s.on[sess.Date.Format(time.DateOnly)], nil
 }
 
+// Fixtures name entities by the same small integers their bars use, because an
+// intent is identified by entity id and only labelled by ticker.
+var entityOf = map[string]int64{"AAA": 1, "BBB": 2, "CCC": 3, "OLDNAME": 1, "NEWNAME": 1}
+
 func buyIntent(scrip string, qty int64, price float64) risk.Intent {
-	return risk.Intent{Scrip: scrip, Side: cost.Buy, Product: cost.EquityDelivery,
-		Quantity: qty, Price: price}
+	return risk.Intent{EntityID: entityOf[scrip], Scrip: scrip, Side: cost.Buy,
+		Product: cost.EquityDelivery, Quantity: qty, Price: price}
 }
 
 func sellIntent(scrip string, qty int64, price float64) risk.Intent {
-	return risk.Intent{Scrip: scrip, Side: cost.Sell, Product: cost.EquityDelivery,
-		Quantity: qty, Price: price}
+	return risk.Intent{EntityID: entityOf[scrip], Scrip: scrip, Side: cost.Sell,
+		Product: cost.EquityDelivery, Quantity: qty, Price: price}
 }
 
 // harness wires a fixture market to a paper broker, a real risk gate and a
@@ -368,4 +372,55 @@ func TestEngineRefusesAnIncompleteWiring(t *testing.T) {
 	_, err = e.Run(context.Background(), 1000)
 	require.Error(t, err, "one session cannot fill anything")
 	require.Contains(t, err.Error(), "at least two sessions")
+}
+
+// TestARenamedHoldingCanStillBeSold is the regression for a bug that made the
+// first backtest meaningless, and it was invisible in every unit test because
+// no fixture had ever renamed anything.
+//
+// The engine used to recover an intent's entity by matching its ticker against
+// the session's bars. Tickers change while a position is held -- RNAM became
+// NAM-INDIA, ADANIGAS became ATGL, IBSEC became IBVENTURES became DHANI, all
+// under one unchanged ISIN -- and after a rename no bar carried the string the
+// holding remembered. The sell never became an order. The position stuck in the
+// book permanently, marked at its last known price, inflating equity, while
+// every later exit attempt failed silently and re-fired the next session.
+//
+// The fix is that an intent carries the entity id and the ticker is only a
+// label. This test renames the instrument between the buy and the sell, which
+// the old code could not survive.
+func TestARenamedHoldingCanStillBeSold(t *testing.T) {
+	f := engine.NewFixture([]time.Time{d1, d2, d3, d4}).
+		AddBar(d1, engine.Bar{EntityID: 1, Scrip: "OLDNAME", Open: 100, Close: 100}).
+		AddBar(d2, engine.Bar{EntityID: 1, Scrip: "OLDNAME", Open: 100, Close: 100}).
+		// The exchange starts printing a different ticker for the same entity.
+		AddBar(d3, engine.Bar{EntityID: 1, Scrip: "NEWNAME", Open: 100, Close: 100}).
+		AddBar(d4, engine.Bar{EntityID: 1, Scrip: "NEWNAME", Open: 100, Close: 100})
+
+	s := &scripted{name: "renamed", on: map[string][]risk.Intent{
+		d1.Format(time.DateOnly): {buyIntent("OLDNAME", 100, 100)},
+		// Sold under the name it was BOUGHT as, which is what a portfolio
+		// remembers and what the strategy therefore emits.
+		d3.Format(time.DateOnly): {{
+			EntityID: 1, Scrip: "OLDNAME", Side: cost.Sell,
+			Product: cost.EquityDelivery, Quantity: 100, Price: 100,
+		}},
+	}}
+	res, err := harness(t, f, s, looseLimits()).Run(context.Background(), 100_000)
+	require.NoError(t, err)
+
+	require.Len(t, res.Fills, 2, "the buy and the sell both filled across the rename")
+	require.Empty(t, res.Unfilled)
+	require.Empty(t, res.Final.Positions,
+		"a renamed holding must not be stuck in the book forever")
+
+	// And the fill carries the CURRENT ticker, so a report names the company as
+	// it trades today rather than as it traded when it was bought.
+	var sellFill engine.Fill
+	for _, fl := range res.Fills {
+		if fl.Side == cost.Sell {
+			sellFill = fl
+		}
+	}
+	require.Equal(t, "NEWNAME", sellFill.Scrip)
 }

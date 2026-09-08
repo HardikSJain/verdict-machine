@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/HardikSJain/verdict-machine/internal/cost"
@@ -232,6 +233,7 @@ func (e *Engine) Run(ctx context.Context, cash float64) (Result, error) {
 			closes[id] = b.Close
 		}
 		p.Mark(closes)
+		p.relabel(bars)
 		equity := p.Equity(closes)
 		res.Equity = append(res.Equity, EquityPoint{
 			Date: date, Equity: equity, Cash: p.Cash, Held: len(p.Positions),
@@ -258,17 +260,16 @@ func (e *Engine) Run(ctx context.Context, cash float64) (Result, error) {
 		res.SlippageModelled = d.SlippageModelled
 
 		for _, in := range d.Accepted {
-			id, ok := e.entityOf(in, bars)
-			if !ok {
-				res.Unfilled = append(res.Unfilled, Unfilled{
-					Order:  Order{Scrip: in.Scrip, Side: in.Side, Product: in.Product, Quantity: in.Quantity, DecidedOn: date},
-					Date:   date,
-					Reason: "accepted intent names a scrip with no bar on the deciding session",
-				})
-				continue
+			// The entity id comes straight from the intent. It used to be
+			// recovered by matching the intent's ticker against the session's
+			// bars, which could not survive a rename and left renamed holdings
+			// permanently unsellable.
+			label := in.Scrip
+			if b, ok := bars[in.EntityID]; ok && b.Scrip != "" {
+				label = b.Scrip
 			}
 			pending = append(pending, Order{
-				EntityID: id, Scrip: in.Scrip, Side: in.Side,
+				EntityID: in.EntityID, Scrip: label, Side: in.Side,
 				Product: in.Product, Quantity: in.Quantity, DecidedOn: date,
 			})
 		}
@@ -289,26 +290,27 @@ func (e *Engine) Run(ctx context.Context, cash float64) (Result, error) {
 // at the close, so a cap is measured against what the position is worth now
 // and not against what it cost.
 func (e *Engine) book(p *Portfolio, closes map[int64]float64, equity float64) risk.Book {
+	// Keyed by entity id rendered as a string, not by ticker: two holdings
+	// whose tickers collided across a rename would otherwise share a cap.
 	pos := make(map[string]float64, len(p.Positions))
 	for id, held := range p.Positions {
 		mark, ok := closes[id]
 		if !ok {
 			mark = held.LastMark
 		}
-		pos[held.Scrip] = float64(held.Quantity) * mark
-		_ = id
+		pos[strconv.FormatInt(id, 10)] = float64(held.Quantity) * mark
 	}
 	return risk.Book{Equity: equity, Positions: pos}
 }
 
-// entityOf resolves an intent's scrip back to the entity holding a bar on the
-// deciding session. The strategy names scrips because that is what a human and
-// a broker both read; the engine needs the id to price a fill.
-func (e *Engine) entityOf(in risk.Intent, bars map[int64]Bar) (int64, bool) {
-	for id, b := range bars {
-		if b.Scrip == in.Scrip {
-			return id, true
+// relabel refreshes held positions with the ticker each entity carries on this
+// session, so a report shows the name a company trades under now rather than
+// the one it had when it was bought.
+func (p *Portfolio) relabel(bars map[int64]Bar) {
+	for id, held := range p.Positions {
+		if b, ok := bars[id]; ok && b.Scrip != "" && b.Scrip != held.Scrip {
+			held.Scrip = b.Scrip
+			p.Positions[id] = held
 		}
 	}
-	return 0, false
 }

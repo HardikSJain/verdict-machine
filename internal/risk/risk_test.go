@@ -1,6 +1,7 @@
 package risk_test
 
 import (
+	"strconv"
 	"testing"
 	"time"
 
@@ -26,14 +27,27 @@ func gate(t *testing.T, l risk.Limits, b cost.Broker) *risk.Gate {
 	return g
 }
 
+// id turns a fixture's scrip label into a stable entity id, because an intent
+// is identified by entity and only labelled by ticker.
+func id(scrip string) int64 {
+	var n int64
+	for _, r := range scrip {
+		n = n*31 + int64(r)
+	}
+	if n < 0 {
+		n = -n
+	}
+	return n + 1
+}
+
 func buy(scrip string, notional float64) risk.Intent {
-	return risk.Intent{Scrip: scrip, Side: cost.Buy, Product: cost.EquityDelivery,
-		Quantity: int64(notional), Price: 1}
+	return risk.Intent{EntityID: id(scrip), Scrip: scrip, Side: cost.Buy,
+		Product: cost.EquityDelivery, Quantity: int64(notional), Price: 1}
 }
 
 func sell(scrip string, notional float64) risk.Intent {
-	return risk.Intent{Scrip: scrip, Side: cost.Sell, Product: cost.EquityDelivery,
-		Quantity: int64(notional), Price: 1}
+	return risk.Intent{EntityID: id(scrip), Scrip: scrip, Side: cost.Sell,
+		Product: cost.EquityDelivery, Quantity: int64(notional), Price: 1}
 }
 
 // TestMinNotionalIsDerivedFromTheCharges is the change this package makes to
@@ -117,7 +131,7 @@ func TestSellsAreNeverBlockedByACap(t *testing.T) {
 
 	book := risk.Book{
 		Equity:    50_000,
-		Positions: map[string]float64{"HELD": 49_000},
+		Positions: map[string]float64{strconv.FormatInt(id("HELD"), 10): 49_000},
 		DayPnL:    -25_000, // far past the cap
 	}
 	d, err := g.Check(testDay, book, []risk.Intent{sell("HELD", 49_000)})
@@ -145,7 +159,7 @@ func TestKillSwitchStopsSellsToo(t *testing.T) {
 	g := gate(t, risk.DefaultLimits(), cost.Zerodha)
 	book := risk.Book{
 		Equity:     100_000,
-		Positions:  map[string]float64{"HELD": 50_000},
+		Positions:  map[string]float64{strconv.FormatInt(id("HELD"), 10): 50_000},
 		KillSwitch: "manual halt while the bhavcopy loader is being fixed",
 	}
 	d, err := g.Check(testDay, book, []risk.Intent{buy("NEW", 20_000), sell("HELD", 50_000)})
@@ -186,8 +200,9 @@ func TestMaxPositionsCountsNewNamesOnly(t *testing.T) {
 	g := gate(t, l, cost.Zerodha)
 
 	book := risk.Book{
-		Equity:    1_000_000,
-		Positions: map[string]float64{"A": 20_000, "B": 20_000},
+		Equity: 1_000_000,
+		Positions: map[string]float64{
+			strconv.FormatInt(id("A"), 10): 20_000, strconv.FormatInt(id("B"), 10): 20_000},
 	}
 	d, err := g.Check(testDay, book, []risk.Intent{buy("C", 20_000), buy("A", 20_000)})
 	require.NoError(t, err)
@@ -207,7 +222,8 @@ func TestSingleStockAndBookCaps(t *testing.T) {
 	l.MaxBookNotional = 90_000
 	g := gate(t, l, cost.Zerodha)
 
-	book := risk.Book{Equity: 100_000, Positions: map[string]float64{"A": 8_000}}
+	book := risk.Book{Equity: 100_000,
+		Positions: map[string]float64{strconv.FormatInt(id("A"), 10): 8_000}}
 
 	// 8,000 held plus 8,000 more is 16% of a 100,000 book, over the 10% cap.
 	d, err := g.Check(testDay, book, []risk.Intent{buy("A", 8_000)})
@@ -216,7 +232,8 @@ func TestSingleStockAndBookCaps(t *testing.T) {
 	require.Equal(t, risk.RuleMaxStock, d.Rejected[0].Rule)
 
 	// The book cap bites even when no single name does.
-	wide := risk.Book{Equity: 10_000_000, Positions: map[string]float64{"A": 85_000}}
+	wide := risk.Book{Equity: 10_000_000,
+		Positions: map[string]float64{strconv.FormatInt(id("A"), 10): 85_000}}
 	d2, err := g.Check(testDay, wide, []risk.Intent{buy("B", 10_000)})
 	require.NoError(t, err)
 	require.Len(t, d2.Rejected, 1)
@@ -230,7 +247,8 @@ func TestDailyLossCapBlocksBuysAndNotSells(t *testing.T) {
 	l.DailyLossCap = 5_000
 	g := gate(t, l, cost.Zerodha)
 
-	book := risk.Book{Equity: 200_000, Positions: map[string]float64{"A": 50_000}, DayPnL: -5_000}
+	book := risk.Book{Equity: 200_000,
+		Positions: map[string]float64{strconv.FormatInt(id("A"), 10): 50_000}, DayPnL: -5_000}
 	d, err := g.Check(testDay, book, []risk.Intent{buy("B", 20_000), sell("A", 50_000)})
 	require.NoError(t, err)
 	require.Len(t, d.Accepted, 1)
@@ -300,8 +318,8 @@ func TestSlippageWidensTheFloor(t *testing.T) {
 func TestMalformedIntentsAreRejectedNotPanicked(t *testing.T) {
 	g := gate(t, risk.DefaultLimits(), cost.Zerodha)
 	d, err := g.Check(testDay, risk.Book{Equity: 100_000}, []risk.Intent{
-		{Scrip: "A", Side: cost.Buy, Product: cost.EquityDelivery, Quantity: 0, Price: 10},
-		{Scrip: "B", Side: "hold", Product: cost.EquityDelivery, Quantity: 10, Price: 10},
+		{EntityID: 1, Scrip: "A", Side: cost.Buy, Product: cost.EquityDelivery, Quantity: 0, Price: 10},
+		{EntityID: 2, Scrip: "B", Side: "hold", Product: cost.EquityDelivery, Quantity: 10, Price: 10},
 	})
 	require.NoError(t, err)
 	require.Empty(t, d.Accepted)

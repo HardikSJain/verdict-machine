@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/HardikSJain/verdict-machine/internal/cost"
@@ -77,7 +78,10 @@ func (p *Paper) Execute(ctx context.Context, date time.Time, orders []Order, ope
 		price := p.fillPrice(open, o.Side)
 		fillable = append(fillable, o)
 		trades = append(trades, cost.Trade{
-			Date: date, Scrip: o.Scrip, Product: o.Product,
+			// The DP charge is per scrip per sell day, and the entity id is
+			// the scrip's identity: a ticker can be reused after a rename and
+			// would then merge two companies' charges into one.
+			Date: date, Scrip: strconv.FormatInt(o.EntityID, 10), Product: o.Product,
 			Side: o.Side, Quantity: o.Quantity, Price: price,
 		})
 	}
@@ -102,12 +106,12 @@ func (p *Paper) Execute(ctx context.Context, date time.Time, orders []Order, ope
 	if n := len(day.DPScrips); n > 0 {
 		dpPerScrip = day.DPCharge / float64(n)
 	}
-	charged := map[string]bool{}
+	charged := map[int64]bool{}
 
 	for i, o := range fillable {
 		c := day.Trades[i]
-		if o.Side == cost.Sell && dpPerScrip > 0 && !charged[o.Scrip] {
-			charged[o.Scrip] = true
+		if o.Side == cost.Sell && dpPerScrip > 0 && !charged[o.EntityID] {
+			charged[o.EntityID] = true
 			c.DPCharge = dpPerScrip
 			c.Unverified = append(c.Unverified, cost.DPCharge)
 		}

@@ -24,6 +24,7 @@ package risk
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/HardikSJain/verdict-machine/internal/cost"
@@ -99,7 +100,16 @@ func (l Limits) validate() error {
 }
 
 // Intent is one proposed order.
+//
+// EntityID is the identity and Scrip is a label. That distinction is not
+// decoration: tickers are renamed while a position is held -- RNAM became
+// NAM-INDIA, ADANIGAS became ATGL, IBSEC became IBVENTURES became DHANI, all
+// under one unchanged ISIN -- and an engine that matched a holding to a bar by
+// its ticker string could not sell a renamed name at all. It stuck in the book
+// permanently, marked at its last known price, while every later attempt to
+// exit failed silently.
 type Intent struct {
+	EntityID int64
 	Scrip    string
 	Side     cost.Side
 	Product  cost.Product
@@ -109,6 +119,10 @@ type Intent struct {
 
 // Notional is what the intent would put to work.
 func (i Intent) Notional() float64 { return float64(i.Quantity) * i.Price }
+
+// key is how the gate identifies a position. It is the entity id, never the
+// ticker, so a rename cannot make one holding look like two.
+func (i Intent) key() string { return strconv.FormatInt(i.EntityID, 10) }
 
 // Book is the state the gate reads before deciding. Positions are current
 // notionals by scrip.
@@ -228,8 +242,9 @@ func (g *Gate) Check(date time.Time, b Book, intents []Intent) (Decision, error)
 	lossBreached := g.limits.DailyLossCap > 0 && b.DayPnL <= -g.limits.DailyLossCap
 
 	for _, in := range intents {
-		if in.Quantity <= 0 || in.Price <= 0 || (in.Side != cost.Buy && in.Side != cost.Sell) {
-			reject(in, RuleMalformed, fmt.Sprintf("quantity %d, price %g, side %q", in.Quantity, in.Price, in.Side))
+		if in.EntityID <= 0 || in.Quantity <= 0 || in.Price <= 0 || (in.Side != cost.Buy && in.Side != cost.Sell) {
+			reject(in, RuleMalformed, fmt.Sprintf("entity %d, quantity %d, price %g, side %q",
+				in.EntityID, in.Quantity, in.Price, in.Side))
 			continue
 		}
 		if killed {
@@ -240,11 +255,12 @@ func (g *Gate) Check(date time.Time, b Book, intents []Intent) (Decision, error)
 		// cap that can trap the book in a position is worse than the position.
 		if in.Side == cost.Sell {
 			d.Accepted = append(d.Accepted, in)
-			held := pos[in.Scrip] - in.Notional()
+			k := in.key()
+			held := pos[k] - in.Notional()
 			if held <= 0 {
-				delete(pos, in.Scrip)
+				delete(pos, k)
 			} else {
-				pos[in.Scrip] = held
+				pos[k] = held
 			}
 			bookNotional -= in.Notional()
 			continue
@@ -262,14 +278,14 @@ func (g *Gate) Check(date time.Time, b Book, intents []Intent) (Decision, error)
 				n, floor, 100*g.limits.MaxRoundTripCost))
 			continue
 		}
-		_, held := pos[in.Scrip]
+		_, held := pos[in.key()]
 		if !held && len(pos) >= g.limits.MaxPositions {
 			reject(in, RuleMaxPositions, fmt.Sprintf(
 				"the book already holds %d names and %s would be new", len(pos), in.Scrip))
 			continue
 		}
 		if b.Equity > 0 {
-			after := pos[in.Scrip] + n
+			after := pos[in.key()] + n
 			if frac := after / b.Equity; frac > g.limits.MaxStockFraction {
 				reject(in, RuleMaxStock, fmt.Sprintf(
 					"%s would reach %.2f%% of book equity, over the %.2f%% cap",
@@ -283,7 +299,7 @@ func (g *Gate) Check(date time.Time, b Book, intents []Intent) (Decision, error)
 			continue
 		}
 
-		pos[in.Scrip] += n
+		pos[in.key()] += n
 		bookNotional += n
 		d.Accepted = append(d.Accepted, in)
 	}

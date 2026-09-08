@@ -12,11 +12,16 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/HardikSJain/verdict-machine/internal/cost"
 	"github.com/HardikSJain/verdict-machine/internal/db"
+	"github.com/HardikSJain/verdict-machine/internal/engine"
 	"github.com/HardikSJain/verdict-machine/internal/market"
 	"github.com/HardikSJain/verdict-machine/internal/market/bhavcopy"
 	"github.com/HardikSJain/verdict-machine/internal/market/eod2"
 	"github.com/HardikSJain/verdict-machine/internal/market/nseindex"
+	"github.com/HardikSJain/verdict-machine/internal/report"
+	"github.com/HardikSJain/verdict-machine/internal/risk"
+	"github.com/HardikSJain/verdict-machine/internal/strategy"
 )
 
 // version is overridden at build time with -ldflags "-X main.version=...".
@@ -36,6 +41,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newUniverseCmd())
 	root.AddCommand(newEntitiesCmd())
 	root.AddCommand(newIndexCmd())
+	root.AddCommand(newBacktestCmd())
 	return root
 }
 
@@ -602,6 +608,163 @@ func newIndexCheckCmd() *cobra.Command {
 	}
 	cmd.Flags().Float64("tolerance", 0.06,
 		"maximum level change across a rename before it is treated as a rebasing")
+	cmd.Flags().String("database-url", "", "Postgres URL (default $VERDICT_DATABASE_URL)")
+	return cmd
+}
+
+func newBacktestCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "backtest",
+		Short: "Run a strategy over history and print the report (see docs/experiments/)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			fromS, _ := cmd.Flags().GetString("from")
+			toS, _ := cmd.Flags().GetString("to")
+			capital, _ := cmd.Flags().GetFloat64("capital")
+			top, _ := cmd.Flags().GetInt("top")
+			formation, _ := cmd.Flags().GetInt("formation")
+			skip, _ := cmd.Flags().GetInt("skip")
+			lookback, _ := cmd.Flags().GetInt("lookback")
+			n, _ := cmd.Flags().GetInt("n")
+			source, _ := cmd.Flags().GetString("source")
+			useFilter, _ := cmd.Flags().GetBool("filter")
+			filterDays, _ := cmd.Flags().GetInt("filter-days")
+			indexCode, _ := cmd.Flags().GetString("index")
+			brokerS, _ := cmd.Flags().GetString("broker")
+			slippage, _ := cmd.Flags().GetFloat64("slippage-bps")
+			holdout, _ := cmd.Flags().GetString("holdout")
+
+			from, err := time.Parse("2006-01-02", fromS)
+			if err != nil {
+				return fmt.Errorf("--from: %w", err)
+			}
+			to, err := time.Parse("2006-01-02", toS)
+			if err != nil {
+				return fmt.Errorf("--to: %w", err)
+			}
+			// The holdout is sealed by refusing to read past it, not by
+			// remembering not to. A flag that has to be disabled deliberately
+			// is harder to cross by accident than a date in a document.
+			if holdout != "" {
+				h, err := time.Parse("2006-01-02", holdout)
+				if err != nil {
+					return fmt.Errorf("--holdout: %w", err)
+				}
+				if !to.Before(h) {
+					return fmt.Errorf(
+						"--to %s reaches into the holdout that begins %s; experiment 001 gives the holdout ONE run after provenance exists. Pass --holdout \"\" only when spending it deliberately",
+						to.Format(time.DateOnly), h.Format(time.DateOnly))
+				}
+			}
+
+			url, err := databaseURL(cmd)
+			if err != nil {
+				return err
+			}
+			pool, err := db.Connect(cmd.Context(), url)
+			if err != nil {
+				return err
+			}
+			defer pool.Close()
+			store := market.NewStore(pool)
+
+			pin := time.Now()
+			mk, err := engine.NewStoreMarket(store, source, market.Day(from.Year(), from.Month(), from.Day()),
+				market.Day(to.Year(), to.Month(), to.Day()), lookback, n, pin)
+			if err != nil {
+				return err
+			}
+			sched, err := cost.NewSchedule(cost.Broker(brokerS))
+			if err != nil {
+				return err
+			}
+			broker, err := engine.NewPaper(sched, slippage)
+			if err != nil {
+				return err
+			}
+			limits := risk.DefaultLimits()
+			limits.SlippageBps = slippage
+			// Overriding the floor is how a slippage sensitivity isolates the
+			// cost of slippage from its effect on what is tradeable at all.
+			// Both are real; conflating them makes neither readable.
+			if mn, _ := cmd.Flags().GetFloat64("min-notional"); mn > 0 {
+				limits.MinNotional = mn
+			}
+			gate, err := risk.NewGate(limits, sched)
+			if err != nil {
+				return err
+			}
+
+			var filter strategy.MarketFilter = strategy.AlwaysOn{}
+			if useFilter {
+				if filter, err = strategy.NewTrendFilter(indexCode, filterDays); err != nil {
+					return err
+				}
+			}
+			strat, err := strategy.NewMomentum(top, formation, skip, filter)
+			if err != nil {
+				return err
+			}
+			e, err := engine.New(mk, broker, gate, strat)
+			if err != nil {
+				return err
+			}
+
+			started := time.Now()
+			res, err := e.Run(cmd.Context(), capital)
+			if err != nil {
+				return err
+			}
+			benchCode, _ := cmd.Flags().GetString("benchmark")
+			if benchCode == "" {
+				benchCode = indexCode
+			}
+			bench, err := mk.IndexCloses(cmd.Context(), benchCode, res.From, res.To)
+			if err != nil {
+				return err
+			}
+
+			out := cmd.OutOrStdout()
+			rep := report.Build(res, benchCode, bench, capital)
+			fmt.Fprintln(out, rep.String())
+
+			j := strat.Journal()
+			fmt.Fprintf(out, "\nstrategy journal:\n")
+			fmt.Fprintf(out, "  rebalances              %14d\n", j.Rebalances)
+			fmt.Fprintf(out, "  risk-off sessions       %14d  (liquidations %d)\n", j.RiskOffSessions, j.Liquidations)
+			fmt.Fprintf(out, "  unreadable sessions     %14d  (held, traded nothing)\n", j.UnknownSessions)
+			fmt.Fprintf(out, "  returns refused (fence) %14d\n", j.ReturnsRefused)
+			fmt.Fprintf(out, "  returns absent          %14d\n", j.ReturnsAbsent)
+			if held := res.Final.Held(); len(held) > 0 {
+				fmt.Fprintf(out, "\nfinal holdings (%d):\n", len(held))
+				for _, h := range held {
+					fmt.Fprintf(out, "  %-14s qty %8d  basis %12.2f  last mark %10.2f\n",
+						h.Scrip, h.Quantity, h.CostBasis, h.LastMark)
+				}
+			}
+			fmt.Fprintf(out, "\nprovenance: source %s, pin %s, ran in %s\n",
+				mk.Source(), pin.Format(time.RFC3339), time.Since(started).Round(time.Second))
+			fmt.Fprintf(out, "NOT YET REPLAYABLE: the runs table and snapshot_id do not exist, so this\n")
+			fmt.Fprintf(out, "result cannot be reproduced byte-for-byte from a recorded row.\n")
+			return nil
+		},
+	}
+	cmd.Flags().String("from", "2013-01-01", "first session")
+	cmd.Flags().String("to", "2021-12-31", "last session")
+	cmd.Flags().String("holdout", "2022-01-01", "refuse to read at or past this date; \"\" to spend the holdout")
+	cmd.Flags().Float64("capital", 500000, "starting capital in rupees")
+	cmd.Flags().Int("top", 20, "positions held")
+	cmd.Flags().Int("formation", 12, "months back for the far end of the ranking window")
+	cmd.Flags().Int("skip", 1, "months skipped at the near end")
+	cmd.Flags().Int("lookback", 125, "universe lookback in sessions")
+	cmd.Flags().Int("n", 500, "universe size")
+	cmd.Flags().String("source", market.SourceBhavcopy, "bar source")
+	cmd.Flags().Bool("filter", true, "apply the 200-day market trend filter")
+	cmd.Flags().Int("filter-days", 200, "trend filter window in sessions")
+	cmd.Flags().String("index", nseindex.Nifty50, "index the trend filter reads")
+	cmd.Flags().String("benchmark", "", "index to compare against (default: the filter index). The universe is the top 500 by turnover, which sits well below the Nifty 50 in market cap, so NIFTY500 is the fairer comparison and NIFTY50 flatters the strategy by the size premium.")
+	cmd.Flags().String("broker", string(cost.Zerodha), "broker charge schedule")
+	cmd.Flags().Float64("slippage-bps", 0, "slippage per leg in basis points")
+	cmd.Flags().Float64("min-notional", 0, "override the derived position floor (0 = derive it)")
 	cmd.Flags().String("database-url", "", "Postgres URL (default $VERDICT_DATABASE_URL)")
 	return cmd
 }
