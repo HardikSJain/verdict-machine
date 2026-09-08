@@ -780,21 +780,49 @@ M1's `runs` table must also record `snapshot_id` computed over the amended row s
 #### Reading the map from a notebook: `entity_map_at(ts)`, never `entity_map_now`
 
 Migration 0004 publishes the resolution rule as a function so a Python notebook gets entities
-without reimplementing the Go CTEs. **The pinned form is the only one valid for replay:**
+without reimplementing the Go CTEs. **The pinned form is the only one valid for replay**, and
+it has a second half that is just as load-bearing and much easier to leave out: `bars` is
+versioned, so any query reading it must also pick the version in force at the pin, exactly as
+both readers do.
 
 ```sql
 -- Every bar of one company, across every ISIN it has ever had, resolved at the SAME
--- ingest pin the run recorded. Both bounds are the same timestamp on purpose.
-WITH pin AS (SELECT TIMESTAMPTZ '2026-09-07 18:30:00+05:30' AS ts)
-SELECT b.date, b.close, b.symbol_id, m.entity_id
-FROM bars b
-JOIN pin ON true
-JOIN entity_map_at(pin.ts) m ON m.symbol_id = b.symbol_id
-WHERE m.entity_id = 326            -- UniverseMember.EntityID from a run pinned at the same ts
-  AND b.source = 'nse-bhavcopy'
-  AND b.ingested_at <= pin.ts
-ORDER BY b.date;
+-- ingest pin the run recorded -- and ONE ROW PER SESSION, not one row per bar VERSION.
+-- Every bound below is the same timestamp on purpose.
+WITH pin AS (SELECT TIMESTAMPTZ '2026-09-08 00:00:00+05:30' AS ts),
+     member AS (            -- the entity's physical symbol_ids, resolved at the pin
+         SELECT m.symbol_id
+         FROM pin JOIN entity_map_at(pin.ts) m ON true
+         WHERE m.entity_id = 326  -- UniverseMember.EntityID from a run pinned at the same ts
+     ),
+     latest AS (            -- the latest-version pick the read path makes; see below
+         SELECT DISTINCT ON (b.symbol_id, b.date) b.symbol_id, b.date, b.close
+         FROM bars b
+         JOIN member ON member.symbol_id = b.symbol_id
+         JOIN pin ON true
+         WHERE b.source = 'nse-bhavcopy' AND b.ingested_at <= pin.ts
+         ORDER BY b.symbol_id, b.date, b.ingested_at DESC
+     )
+SELECT date, close, symbol_id FROM latest ORDER BY date;
 ```
+
+**Why `latest` and not a bare `b.ingested_at <= pin.ts`.** `bars`' version key is
+`(symbol_id, date, source)` with `ingested_at` as the fourth primary-key column, so
+re-ingesting a corrected file leaves both versions in the table permanently. The bound alone
+admits *every* version at or before the pin rather than the one in force at it. `UniverseAsOf`
+guards that with `DISTINCT ON (symbol_id, date)` and `BarsForDate` with
+`DISTINCT ON (b.symbol_id)` on a fixed date; a documented query that skipped it would
+double-count silently rather than error, which is the worse failure. It is not hypothetical on
+this store: at the pin above, RELIANCE's `eod2` series comes back as **7,834 rows over 7,832
+sessions** without the `latest` CTE — 2023-01-02 and 2023-01-03 were each ingested twice — and
+as 7,832 rows with it.
+
+Run read-only against `verdict` on 2026-09-08 the query above returns **2,703 rows from one
+member, 2011-09-02 to 2022-07-28**. That is not a fault in the query: the live map is empty,
+so entity 326 is still only the pre-2022 TATASTEEL symbol and the series stops dead at the
+split. It is the fragmentation this section exists to describe, and it is what the query will
+keep returning until a human applies the roster — after which the same query spans both
+members and runs to the present.
 
 `entity_map_now` is the interactive convenience and is **never valid for replay**. It carries
 no `ingested_at` bound at all, so a caller who pinned `UniverseAsOf` at T and joins its
@@ -803,8 +831,18 @@ no `ingested_at` bound at all, so a caller who pinned `UniverseAsOf` at T and jo
 retraction dissolves one, and then they disagree silently -- and `snapshot_id` cannot catch
 it, because the row set is unchanged and only the view's resolution moved. The name is the
 only warning the join itself gives, which is why the function and not the view is what this
-document names. `market.Store.EntityMapAt` is the Go door onto the same function, so the CLI
-and a notebook resolve identity through one definition.
+document names.
+
+**One rule, two expressions — not one definition, and the difference matters to whoever
+changes it.** `market.Store.EntityMapAt` is the Go door onto `entity_map_at(ts)`, and
+`verdict entities check` is the only command that goes through it. The read path does not:
+`UniverseAsOf` and `BarsForDate` — and therefore `verdict universe`, the only CLI command a
+reader runs that touches bars — build the same `ingested_at <= pin` resolution inline as a CTE
+(`entityMapCTE`, `internal/market/entity.go`), because they need it in one statement beside the
+member and label CTEs. The two are the same rule written twice: the SQL function a notebook
+calls, and the Go-built CTE the readers embed. Nothing makes them agree by construction —
+tests and review do — so a change to the resolution rule is a change that has to be made in
+both places.
 
 #### What this does not fix, permanently
 

@@ -876,9 +876,14 @@ func TestEntityInvariantsCatchABogusLink_Disjoint(t *testing.T) {
 // as of a moment, and a check that resolved through entity_map_now would
 // report a pair as unlinked (or as linked) on the strength of a row the
 // pinned read cannot see. Routing it through the published entity_map_at
-// rather than a fourth hand-rolled DISTINCT ON also means the CLI and a
-// notebook resolve identity through one definition, which is the claim the
-// notebook documentation makes.
+// rather than a fourth hand-rolled DISTINCT ON means `entities check` and a
+// notebook resolve identity through the same definition. It does NOT mean
+// the whole CLI does: the read path (UniverseAsOf, BarsForDate, and so
+// `verdict universe`) builds the same rule inline as entityMapCTE, because it
+// needs it in one statement beside the member and label CTEs. Two expressions
+// of one rule, agreeing by review rather than by construction -- which is
+// what docs/DESIGN.md says, and it is worth keeping the two statements the
+// same.
 func TestEntityMapAt_ResolvesEverySymbolAtThePin(t *testing.T) {
 	ctx := context.Background()
 	store := market.NewStore(testutil.Pool(t))
