@@ -531,29 +531,47 @@ func (r *Roster) ManualLinks() []Link {
 // says nothing about it.
 //
 // A manual line whose exact pair the generator now proposes keeps the
-// HAND-WRITTEN line and drops the generated twin: the two say the same thing
-// about the same pair, and only one of them names the person who decided it.
+// HAND-WRITTEN line and drops the generated twin ONLY when the two agree
+// about where the boundary is. They say the same thing about the same pair
+// and only one of them names the person who decided it, so the ratifier wins
+// the tie -- but the tie has to be real. `effective_from` is what `apply`
+// writes into `symbol_links.boundary`, and design 4.3 makes that column the
+// one deciding which member of an entity labels a session, so keeping a stale
+// hand-written boundary over a freshly measured one mislabels every session
+// between the true first bar and the stale date. `Apply`'s differsFrom
+// refusal cannot catch it either: by then the planned row already carries the
+// stale value. The mechanism is the one apply.go names -- `bars` is
+// insert-only but a backfill can add EARLIER sessions, which moves a
+// successor's first bar -- and it is also the usual reason a hand-written
+// pair becomes generator-acceptable at all, so the two travel together.
+// Where they disagree this refuses and names both boundaries, because which
+// one is right is not a machine's call.
+//
 // A manual line that shares one endpoint with a DIFFERENT generated line is a
 // G5 branch and is refused here rather than left for Validate, so the
 // operator is told which two lines disagree instead of reading a graph error.
-func (r *Roster) AdoptManual(existing []Link) ([]Link, error) {
-	generated := map[[2]string]bool{}
+func (r *Roster) AdoptManual(existing []Link) ([]Adopted, error) {
+	generated := map[[2]string]Link{}
 	bySuccessor := map[string]Link{}
 	byPredecessor := map[string]Link{}
 	for _, l := range r.Links {
-		generated[[2]string{l.Predecessor, l.Successor}] = true
+		generated[[2]string{l.Predecessor, l.Successor}] = l
 		bySuccessor[l.Successor] = l
 		byPredecessor[l.Predecessor] = l
 	}
-	var kept []Link
+	var kept []Adopted
 	superseded := map[[2]string]bool{}
 	for _, m := range existing {
 		if reasonOf(m) != ReasonManual {
 			continue
 		}
 		pair := [2]string{m.Predecessor, m.Successor}
+		twin, hasTwin := generated[pair]
 		switch {
-		case generated[pair]:
+		case hasTwin:
+			if err := sameBoundary(m, twin); err != nil {
+				return nil, err
+			}
 			superseded[pair] = true
 		default:
 			if g, ok := bySuccessor[m.Successor]; ok {
@@ -571,7 +589,7 @@ func (r *Roster) AdoptManual(existing []Link) ([]Link, error) {
 					m.Predecessor, m.Successor, g.Predecessor, g.Successor, m.Predecessor)
 			}
 		}
-		kept = append(kept, m)
+		kept = append(kept, Adopted{Link: m, SupersededGenerated: hasTwin})
 	}
 	if len(kept) == 0 {
 		return nil, nil
@@ -583,7 +601,54 @@ func (r *Roster) AdoptManual(existing []Link) ([]Link, error) {
 		}
 		links = append(links, l)
 	}
-	r.Links = append(links, kept...)
+	for _, a := range kept {
+		links = append(links, a.Link)
+	}
+	r.Links = links
 	r.Sort()
 	return kept, r.Validate()
+}
+
+// Adopted is one hand-written line carried across a regenerate, and whether
+// carrying it dropped a generated line for the same pair.
+//
+// The two cases are different facts about the store and are reported
+// separately. SupersededGenerated false means the generator cannot reproduce
+// the pair at all and this run would have deleted the only record of it.
+// SupersededGenerated true means the generator DID reproduce it, agreed about
+// the boundary, and its line was dropped in favour of the one naming a
+// ratifier -- saying "the generator cannot reproduce it" there would be
+// false.
+type Adopted struct {
+	Link                Link
+	SupersededGenerated bool
+}
+
+// sameBoundary refuses a supersede where the hand-written line and its
+// generated twin disagree about where the boundary is.
+//
+// The three fields compared are the ones that decide what the store gets:
+// EffectiveFrom becomes symbol_links.boundary, and the two gate dates are the
+// measurement it is supposed to be. Everything else in Gates -- the session
+// counts, the bar counts, the close ratio -- moves every month as the archive
+// grows and comparing it would refuse on noise.
+func sameBoundary(manual, generated Link) error {
+	type field struct{ name, manual, generated string }
+	for _, f := range []field{
+		{"effective_from", manual.EffectiveFrom, generated.EffectiveFrom},
+		{"gates.successor_first_bar", manual.Gates.SuccessorFirstBar, generated.Gates.SuccessorFirstBar},
+		{"gates.predecessor_last_bar", manual.Gates.PredecessorLastBar, generated.Gates.PredecessorLastBar},
+	} {
+		if f.manual == f.generated {
+			continue
+		}
+		return fmt.Errorf(
+			"roster: the hand-written line %s -> %s and the generated line for the same pair disagree about the boundary: "+
+				"%s is %q by hand and %q as measured off bars just now. Keeping the hand-written line would write the hand-written "+
+				"date into symbol_links.boundary, which is the column deciding which member labels a session, and `apply` would not "+
+				"flag it -- so this run will not choose between them. Correct the hand-written line to the measured boundary if the "+
+				"measurement is right, delete it if the generated line should stand, or re-run with --discard-manual once you have kept a copy",
+			manual.Predecessor, manual.Successor, f.name, f.manual, f.generated)
+	}
+	return nil
 }

@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/HardikSJain/verdict-machine/internal/market"
+	"github.com/HardikSJain/verdict-machine/internal/market/entities"
 	"github.com/HardikSJain/verdict-machine/internal/testutil"
 )
 
@@ -171,4 +172,71 @@ func TestEntitiesCheckCommand_SkipCandidatesRunsCleanAndSaysWhatItDidNotCheck(t 
 	require.Contains(t, out, "# 0 violations")
 	require.Contains(t, out, "this run says nothing about successions the map is missing")
 	require.NotContains(t, out, "UNLINKED")
+}
+
+// TestEntitiesProposeCommand_KeepsTheHandWrittenLineInTheFileItOverwrites is
+// the wire between the two halves of the manual-line rescue, and it is the
+// only test that can fail on the defect the rescue was written for.
+//
+// The halves are each covered on their own -- existingManualLines is called
+// directly in entities_test.go, AdoptManual is called on a hand-built roster
+// in the entities package -- and neither of them sees `propose` join them.
+// Passing `nil` where cmd/verdict/entities.go passes `existing` restores the
+// pre-fix behaviour exactly (the monthly run silently truncating a human's
+// ratified decision out of the file it regenerates) with the whole suite
+// green. This drives the real command over a real file and reads the file
+// back afterwards.
+func TestEntitiesProposeCommand_KeepsTheHandWrittenLineInTheFileItOverwrites(t *testing.T) {
+	url := seedCheckStore(t)
+	dir := t.TempDir()
+	rosterPath := filepath.Join(dir, "roster.json")
+
+	// An AMC transfer: the whole ISIN changes, so no prefix rule can ever see
+	// it and the generator cannot reproduce it this month or any month. It is
+	// in the file because a human put it there, with a circular named.
+	handWritten := entities.Link{
+		Reason:           entities.ReasonManual,
+		Predecessor:      "INF732E01011",
+		Successor:        "INF204KB14I2",
+		TickerAtBoundary: "NIFTYBEES",
+		EffectiveFrom:    "2019-12-20",
+		Gates: entities.Gates{
+			CheckDigit:         true,
+			PredecessorLastBar: "2019-12-19",
+			SuccessorFirstBar:  "2019-12-20",
+		},
+		RatifiedBy: "hardik", RatifiedAt: "2026-09-08",
+		Note: "NSE circular: AMC transfer, Goldman Sachs MF to Nippon India MF",
+	}
+	b, err := (&entities.Roster{Version: entities.RosterVersion, Links: []entities.Link{handWritten}}).Marshal()
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(rosterPath, b, 0o644))
+
+	out, err := runCmd(t, "entities", "propose", "--database-url", url,
+		"--out", rosterPath, "--review-out", filepath.Join(dir, "review.jsonl"))
+	require.NoError(t, err)
+	require.Contains(t, out, "# kept hand-written line INF732E01011 -> INF204KB14I2 (ratified by hardik)",
+		"a run that carries a human's line across has to say so: the reviewer is reading a diff, and a silent carry looks the same as a silent drop")
+
+	after, _, err := entities.Load(rosterPath)
+	require.NoError(t, err, "the file this run overwrote must still load")
+	require.Len(t, after.Links, 2, "the generated succession AND the hand-written line, not one of them")
+
+	manual := after.ManualLinks()
+	require.Len(t, manual, 1, "symbol_links has no DELETE, so what a truncating run destroys is the FILE -- the artefact design 5.1 says identity is decided in")
+	require.Equal(t, handWritten.Predecessor, manual[0].Predecessor)
+	require.Equal(t, handWritten.Successor, manual[0].Successor)
+	require.Equal(t, "hardik", manual[0].RatifiedBy, "the ratifier is the whole reason the line is worth keeping")
+	require.Equal(t, handWritten.Note, manual[0].Note, "and the note is the NSE circular design 5.6 requires before a quarantined pair may be promoted")
+	require.Equal(t, handWritten.EffectiveFrom, manual[0].EffectiveFrom)
+
+	// --discard-manual is the only way to lose one, and it says so out loud.
+	out, err = runCmd(t, "entities", "propose", "--database-url", url, "--discard-manual",
+		"--out", rosterPath, "--review-out", filepath.Join(dir, "review.jsonl"))
+	require.NoError(t, err)
+	require.Contains(t, out, "1 hand-written line(s) in "+rosterPath+" are NOT carried into this roster")
+
+	after, _, err = entities.Load(rosterPath)
+	require.NoError(t, err)
+	require.Empty(t, after.ManualLinks())
 }

@@ -111,9 +111,19 @@ func newEntitiesProposeCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			for _, l := range kept {
+			// Two different facts, printed as two different lines. Saying
+			// "the generator cannot reproduce it" about a pair the generator
+			// just reproduced would be an untrue confirmation in the report
+			// the operator reads before deciding to apply.
+			for _, a := range kept {
+				if a.SupersededGenerated {
+					fmt.Fprintf(w, "# kept hand-written line %s -> %s (ratified by %s): the generator now proposes this pair too, at the same"+
+						" boundary %s, and its line was DROPPED in favour of the one naming a ratifier\n",
+						a.Link.Predecessor, a.Link.Successor, a.Link.RatifiedBy, a.Link.EffectiveFrom)
+					continue
+				}
 				fmt.Fprintf(w, "# kept hand-written line %s -> %s (ratified by %s): the generator cannot reproduce it and this run would otherwise have deleted it\n",
-					l.Predecessor, l.Successor, l.RatifiedBy)
+					a.Link.Predecessor, a.Link.Successor, a.Link.RatifiedBy)
 			}
 
 			if err := writeFile(out, func(path string) error {

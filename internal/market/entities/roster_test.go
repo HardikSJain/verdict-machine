@@ -502,6 +502,8 @@ func TestAdoptManualCarriesHandWrittenLinesAcrossARegenerate(t *testing.T) {
 	kept, err := generated.AdoptManual([]entities.Link{fundUnit()})
 	require.NoError(t, err)
 	require.Len(t, kept, 1)
+	require.False(t, kept[0].SupersededGenerated,
+		"the generator has never proposed this pair, so nothing of its was dropped for it")
 	require.Len(t, generated.Links, 3)
 	require.NoError(t, generated.Validate())
 
@@ -545,6 +547,9 @@ func TestAdoptManualKeepsTheHandWrittenLineWhenTheGeneratorCatchesUp(t *testing.
 	kept, err := generated.AdoptManual([]entities.Link{manual})
 	require.NoError(t, err)
 	require.Len(t, kept, 1)
+	require.True(t, kept[0].SupersededGenerated,
+		"the generator DID reproduce this pair, and the caller has to be able to say so: printing "+
+			"\"the generator cannot reproduce it\" here would be a false line in the report the operator applies on")
 	require.Len(t, generated.Links, 2, "one line for the pair, not two")
 	require.NoError(t, generated.Validate(), "and not a G5 merge point against itself")
 
@@ -554,6 +559,59 @@ func TestAdoptManualKeepsTheHandWrittenLineWhenTheGeneratorCatchesUp(t *testing.
 			require.Equal(t, "hardik", l.RatifiedBy)
 		}
 	}
+}
+
+// TestAdoptManualRefusesWhenTheHandWrittenBoundaryDisagreesWithTheGenerator is
+// the case the supersede branch used to resolve silently and wrongly.
+//
+// The pair matches, so the branch above fires -- but the hand-written line
+// carries a DIFFERENT effective_from from the one the generator just measured
+// off bars, and the hand-written one is the line that survives. effective_from
+// is what `apply` writes into symbol_links.boundary, and design 4.3 makes that
+// column the one deciding which member of an entity labels a session, so every
+// session between the true first bar and the stale date gets labelled as the
+// predecessor. Nothing downstream catches it: `Apply`'s differsFrom refusal
+// compares the PLANNED row against the stored one, and by then the plan
+// already carries the stale date; for a pair not yet applied there is no
+// stored row to compare against at all. The monthly roster diff shows nothing
+// either, because the surviving line is byte-identical to last month's.
+//
+// The mechanism is the one apply.go names: bars is insert-only, but a backfill
+// can add EARLIER sessions, which moves a successor's first bar. That is also
+// the usual reason a hand-written pair becomes generator-acceptable in the
+// first place, so the two arrive together.
+func TestAdoptManualRefusesWhenTheHandWrittenBoundaryDisagreesWithTheGenerator(t *testing.T) {
+	manual := tataSteel()
+	manual.Reason = entities.ReasonManual
+	manual.Note = "NSE circular 2022/07: 1:10 face value split"
+	manual.EffectiveFrom = "2022-08-12" // the generator now measures 2022-07-29
+	manual.Gates.SuccessorFirstBar = "2022-08-12"
+
+	_, err := roster(tataSteel(), plainSplit()).AdoptManual([]entities.Link{manual})
+	require.ErrorContains(t, err, "disagree about the boundary")
+	require.ErrorContains(t, err, "effective_from")
+	require.ErrorContains(t, err, "2022-08-12", "the hand-written date has to be named")
+	require.ErrorContains(t, err, "2022-07-29", "and so does the measured one, because the operator chooses between them")
+	require.ErrorContains(t, err, "--discard-manual")
+
+	// A predecessor_last_bar that moved is the same defect arriving from the
+	// other side of the gap, and it is refused for the same reason.
+	moved := tataSteel()
+	moved.Reason = entities.ReasonManual
+	moved.Note = "NSE circular 2022/07"
+	moved.Gates.PredecessorLastBar = "2022-06-30"
+	_, err = roster(tataSteel(), plainSplit()).AdoptManual([]entities.Link{moved})
+	require.ErrorContains(t, err, "gates.predecessor_last_bar")
+
+	// And the agreeing case still supersedes: the refusal is about the
+	// boundary, not about the pair matching.
+	agrees := tataSteel()
+	agrees.Reason = entities.ReasonManual
+	agrees.Note = "NSE circular 2022/07"
+	kept, err := roster(tataSteel(), plainSplit()).AdoptManual([]entities.Link{agrees})
+	require.NoError(t, err)
+	require.Len(t, kept, 1)
+	require.True(t, kept[0].SupersededGenerated)
 }
 
 func TestAdoptManualRefusesWhenAHandWrittenLineContradictsAGeneratedOne(t *testing.T) {
