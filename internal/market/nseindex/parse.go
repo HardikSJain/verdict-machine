@@ -13,6 +13,7 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -33,6 +34,26 @@ var wantHeader = []string{
 	"Volume", "Turnover (Rs. Cr.)", "P/E", "P/B", "Div Yield",
 }
 
+// dateFmts are the layouts the archive's Index Date column has actually used.
+//
+// It is hyphenated in every file sampled by hand, and then a backfill over
+// 3,600 sessions found "09/06/2014" -- NSE switched to slashes for stretches of
+// 2014 and 2015 and switched back. This is the same class of defect as the
+// two-digit year in the 2020-07-13 equity bhavcopy that cost M0 1,392 bars: the
+// archive is mostly consistent, and the exceptions are invisible until
+// something reads every file.
+var dateFmts = []string{"02-01-2006", "02/01/2006"}
+
+func parseDate(s string) (time.Time, error) {
+	s = strings.TrimSpace(s)
+	for _, f := range dateFmts {
+		if d, err := time.Parse(f, s); err == nil {
+			return time.Date(d.Year(), d.Month(), d.Day(), 0, 0, 0, 0, time.UTC), nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("date %q matches none of %v", s, dateFmts)
+}
+
 // Parse reads one session's index CSV.
 //
 // wantDate is checked against every row's own Index Date column. The archive
@@ -40,65 +61,81 @@ var wantHeader = []string{
 // keeps that a fact rather than an assumption: NSE serving yesterday's file
 // under today's URL would otherwise write yesterday's levels under today's date
 // and be invisible until a trend rule acted on it.
-func Parse(r io.Reader, wantDate time.Time) ([]market.IndexLevel, error) {
+func Parse(r io.Reader, wantDate time.Time) ([]market.IndexLevel, []string, error) {
 	cr := csv.NewReader(r)
 	cr.FieldsPerRecord = len(wantHeader)
 	cr.TrimLeadingSpace = true
 
 	header, err := cr.Read()
 	if err != nil {
-		return nil, fmt.Errorf("index csv: reading header: %w", err)
+		return nil, nil, fmt.Errorf("index csv: reading header: %w", err)
 	}
 	if len(header) != len(wantHeader) {
-		return nil, fmt.Errorf("index csv: header has %d columns, want %d: %v",
+		return nil, nil, fmt.Errorf("index csv: header has %d columns, want %d: %v",
 			len(header), len(wantHeader), header)
 	}
 	for i, want := range wantHeader {
 		if strings.TrimSpace(header[i]) != want {
-			return nil, fmt.Errorf("index csv: column %d is %q, want %q; the archive's layout changed and a silent reorder would misfile every value",
+			return nil, nil, fmt.Errorf("index csv: column %d is %q, want %q; the archive's layout changed and a silent reorder would misfile every value",
 				i, strings.TrimSpace(header[i]), want)
 		}
 	}
 
+	records, err := cr.ReadAll()
+	if err != nil {
+		return nil, nil, fmt.Errorf("index csv: %w", err)
+	}
+
+	// Count names before building anything. NSE publishes a genuine duplicate
+	// on at least one session: on 2013-02-08 two DIFFERENT indices are both
+	// labelled "CNX Alpha Index", closing at 4713.18 and 1572.90. One of them
+	// is mislabelled at source and there is no way to tell which from inside
+	// the file, so both are excluded and the collision is reported. Taking the
+	// first would pick between them by row order, which is a coin flip written
+	// as a fact; failing the whole session would throw away the other
+	// ninety-odd indices over one bad row.
+	count := map[string]int{}
+	for _, rec := range records {
+		if n := strings.TrimSpace(rec[0]); n != "" {
+			count[n]++
+		}
+	}
+	var anomalies []string
+	for name, n := range count {
+		if n > 1 {
+			anomalies = append(anomalies, fmt.Sprintf(
+				"%q appears %d times on %s; all copies excluded because the archive gives no way to choose between them",
+				name, n, wantDate.Format(time.DateOnly)))
+		}
+	}
+	sort.Strings(anomalies)
+
 	var out []market.IndexLevel
-	seen := map[string]bool{}
-	for {
-		rec, err := cr.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("index csv: %w", err)
-		}
+	for _, rec := range records {
 		name := strings.TrimSpace(rec[0])
-		if name == "" {
+		if name == "" || count[name] > 1 {
 			continue
 		}
-		d, err := time.Parse("02-01-2006", strings.TrimSpace(rec[1]))
+		d, err := parseDate(rec[1])
 		if err != nil {
-			return nil, fmt.Errorf("index csv: %s: bad date %q: %w", name, rec[1], err)
+			return nil, nil, fmt.Errorf("index csv: %s: %w", name, err)
 		}
-		d = time.Date(d.Year(), d.Month(), d.Day(), 0, 0, 0, 0, time.UTC)
 		if !d.Equal(wantDate) {
-			return nil, fmt.Errorf(
+			return nil, nil, fmt.Errorf(
 				"index csv: %s carries date %s in a file requested for %s; the archive served the wrong session",
 				name, d.Format(time.DateOnly), wantDate.Format(time.DateOnly))
 		}
 		close, err := num(rec[5])
 		if err != nil {
-			return nil, fmt.Errorf("index csv: %s on %s: closing value %q: %w",
+			return nil, nil, fmt.Errorf("index csv: %s on %s: closing value %q: %w",
 				name, d.Format(time.DateOnly), rec[5], err)
 		}
 		if close == nil {
 			// Never observed in any sampled file; an index with no close is
 			// not a level and silently dropping it would understate coverage.
-			return nil, fmt.Errorf("index csv: %s on %s has no closing value",
+			return nil, nil, fmt.Errorf("index csv: %s on %s has no closing value",
 				name, d.Format(time.DateOnly))
 		}
-		if seen[name] {
-			return nil, fmt.Errorf("index csv: %s appears twice on %s", name, d.Format(time.DateOnly))
-		}
-		seen[name] = true
 
 		l := market.IndexLevel{IndexCode: CodeFor(name, d), IndexName: name, Date: d, Close: *close}
 		for _, f := range []struct {
@@ -111,12 +148,12 @@ func Parse(r io.Reader, wantDate time.Time) ([]market.IndexLevel, error) {
 		} {
 			v, err := num(f.raw)
 			if err != nil {
-				return nil, fmt.Errorf("index csv: %s on %s: %q: %w", name, d.Format(time.DateOnly), f.raw, err)
+				return nil, nil, fmt.Errorf("index csv: %s on %s: %q: %w", name, d.Format(time.DateOnly), f.raw, err)
 			}
 			*f.dst = v
 		}
 		if v, err := num(rec[8]); err != nil {
-			return nil, fmt.Errorf("index csv: %s on %s: volume %q: %w", name, d.Format(time.DateOnly), rec[8], err)
+			return nil, nil, fmt.Errorf("index csv: %s on %s: volume %q: %w", name, d.Format(time.DateOnly), rec[8], err)
 		} else if v != nil {
 			n := int64(*v)
 			l.Volume = &n
@@ -124,9 +161,9 @@ func Parse(r io.Reader, wantDate time.Time) ([]market.IndexLevel, error) {
 		out = append(out, l)
 	}
 	if len(out) == 0 {
-		return nil, fmt.Errorf("index csv: no rows for %s", wantDate.Format(time.DateOnly))
+		return nil, anomalies, fmt.Errorf("index csv: no usable rows for %s", wantDate.Format(time.DateOnly))
 	}
-	return out, nil
+	return out, anomalies, nil
 }
 
 // num parses one numeric cell.

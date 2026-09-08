@@ -59,27 +59,27 @@ func NewFetcher() *Fetcher {
 // hard failure for what is really an absent file, and a backfill would stop
 // dead on the first one. So the body is sniffed, and anything that is not the
 // archive's header is treated as absent rather than as a fault.
-func (f *Fetcher) Fetch(ctx context.Context, d time.Time) (levels []market.IndexLevel, found bool, err error) {
+func (f *Fetcher) Fetch(ctx context.Context, d time.Time) (levels []market.IndexLevel, anomalies []string, found bool, err error) {
 	body, found, err := f.get(ctx, f.URLFor(d))
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	}
 	if !found && f.MirrorFor != nil {
 		// One retry against the mirror. NSE's archive occasionally serves the
 		// soft-404 page for a session it does have.
 		body, found, err = f.get(ctx, f.MirrorFor(d))
 		if err != nil {
-			return nil, false, err
+			return nil, nil, false, err
 		}
 	}
 	if !found {
-		return nil, false, nil
+		return nil, nil, false, nil
 	}
-	levels, err = Parse(bytes.NewReader(body), d)
+	levels, anomalies, err = Parse(bytes.NewReader(body), d)
 	if err != nil {
-		return nil, true, err
+		return nil, anomalies, true, err
 	}
-	return levels, true, nil
+	return levels, anomalies, true, nil
 }
 
 // get returns the body when the response is a real CSV. It reports found=false

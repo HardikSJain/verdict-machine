@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/HardikSJain/verdict-machine/internal/market"
@@ -12,6 +13,10 @@ import (
 // Summary counts what one Backfill run did.
 type Summary struct {
 	Fetched, NoFile, Errors, Skipped, Inserted int
+	// Anomalies counts rows the archive published that could not be trusted --
+	// today only duplicate index names -- excluded from the store and recorded
+	// in ingest_log's note so the exclusion stays answerable later.
+	Anomalies int
 }
 
 // ist is India Standard Time; NSE publishes each session's index file that
@@ -75,7 +80,7 @@ func Backfill(ctx context.Context, store *market.Store, f *Fetcher, from, to tim
 		if err := ctx.Err(); err != nil {
 			return sum, err
 		}
-		levels, found, err := f.Fetch(ctx, d)
+		levels, anomalies, found, err := f.Fetch(ctx, d)
 		switch {
 		case err != nil:
 			sum.Errors++
@@ -105,8 +110,17 @@ func Backfill(ctx context.Context, store *market.Store, f *Fetcher, from, to tim
 			}
 			sum.Fetched++
 			sum.Inserted += n
+			sum.Anomalies += len(anomalies)
+			note := ""
+			if len(anomalies) > 0 {
+				// Anomalies go into the log rather than a stderr line, because
+				// a stderr line is gone by the next run and this one has to
+				// still be answerable months later.
+				note = strings.Join(anomalies, "; ")
+				fmt.Fprintf(log, "%s anomaly: %s\n", d.Format(time.DateOnly), note)
+			}
 			fmt.Fprintf(log, "%s ok: %d indices, %d new\n", d.Format(time.DateOnly), len(levels), n)
-			if err := store.LogIngest(ctx, Source, d, "ok", len(levels), ""); err != nil {
+			if err := store.LogIngest(ctx, Source, d, "ok", len(levels), note); err != nil {
 				return sum, err
 			}
 		}

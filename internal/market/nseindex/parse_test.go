@@ -46,7 +46,7 @@ func TestParseRealRowsAcrossEveryEra(t *testing.T) {
 		{"2026 Nifty 50", rowNifty50, day(2026, 9, 4), "NIFTY50", "Nifty 50", 23897.7},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := nseindex.Parse(strings.NewReader(header+tc.row), tc.date)
+			got, _, err := nseindex.Parse(strings.NewReader(header+tc.row), tc.date)
 			require.NoError(t, err)
 			require.Len(t, got, 1)
 			require.Equal(t, tc.wantCode, got[0].IndexCode,
@@ -64,7 +64,7 @@ func TestParseRealRowsAcrossEveryEra(t *testing.T) {
 // close. A zero open would give them a daily range equal to their entire level
 // and put them bottom of any ranking that touched it.
 func TestDashIsNullNotZero(t *testing.T) {
-	got, err := nseindex.Parse(strings.NewReader(header+rowDashes), day(2026, 9, 4))
+	got, _, err := nseindex.Parse(strings.NewReader(header+rowDashes), day(2026, 9, 4))
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	l := got[0]
@@ -82,7 +82,7 @@ func TestDashIsNullNotZero(t *testing.T) {
 // TestLeadingDotFloats: the archive writes small percentages as ".1" and
 // "-.23".
 func TestLeadingDotFloats(t *testing.T) {
-	got, err := nseindex.Parse(strings.NewReader(header+rowNifty50), day(2026, 9, 4))
+	got, _, err := nseindex.Parse(strings.NewReader(header+rowNifty50), day(2026, 9, 4))
 	require.NoError(t, err)
 	require.NotNil(t, got[0].PctChange)
 	require.InDelta(t, 0.1, *got[0].PctChange, 1e-9)
@@ -93,7 +93,7 @@ func TestLeadingDotFloats(t *testing.T) {
 // NSE serving yesterday's file under today's URL would otherwise write stale
 // levels under today's date and stay invisible until a trend rule acted on it.
 func TestParseRefusesAFileForTheWrongSession(t *testing.T) {
-	_, err := nseindex.Parse(strings.NewReader(header+rowNifty50), day(2026, 9, 5))
+	_, _, err := nseindex.Parse(strings.NewReader(header+rowNifty50), day(2026, 9, 5))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "served the wrong session")
 }
@@ -103,25 +103,53 @@ func TestParseRefusesAFileForTheWrongSession(t *testing.T) {
 func TestParseRefusesAChangedHeader(t *testing.T) {
 	swapped := strings.Replace(header,
 		"Volume,Turnover (Rs. Cr.)", "Turnover (Rs. Cr.),Volume", 1)
-	_, err := nseindex.Parse(strings.NewReader(swapped+rowNifty50), day(2026, 9, 4))
+	_, _, err := nseindex.Parse(strings.NewReader(swapped+rowNifty50), day(2026, 9, 4))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "the archive's layout changed")
 }
 
-// TestParseRefusesADuplicateIndex: two rows for one index on one session would
-// silently overwrite each other under a (code, date) key.
-func TestParseRefusesADuplicateIndex(t *testing.T) {
-	_, err := nseindex.Parse(strings.NewReader(header+rowNifty50+rowNifty50), day(2026, 9, 4))
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "appears twice")
+// TestDuplicateIndexIsExcludedAndReported, not guessed at and not fatal.
+//
+// NSE really does this: on 2013-02-08 two DIFFERENT indices are both labelled
+// "CNX Alpha Index", closing at 4713.18 and 1572.90. One is mislabelled at
+// source and the file gives no way to tell which. Taking the first would pick
+// between them by row order -- a coin flip written as a fact -- and failing the
+// session would discard the other ninety-odd indices over one bad row. So both
+// copies are dropped and the collision is recorded where it stays answerable.
+func TestDuplicateIndexIsExcludedAndReported(t *testing.T) {
+	other := strings.Replace(rowNifty50, "23897.7", "1572.9", 1)
+	got, anomalies, err := nseindex.Parse(
+		strings.NewReader(header+rowNifty50+other+rowDashes), day(2026, 9, 4))
+	require.NoError(t, err, "one bad row must not cost the whole session")
+	require.Len(t, anomalies, 1)
+	require.Contains(t, anomalies[0], "appears 2 times")
+
+	require.Len(t, got, 1, "the unambiguous index survives")
+	require.Equal(t, "Nifty 50 Futures Index", got[0].IndexName)
+	for _, l := range got {
+		require.NotEqual(t, "NIFTY50", l.IndexCode, "neither copy of the ambiguous index is kept")
+	}
+}
+
+// TestSlashDatesParse. The archive is hyphenated in every hand-sampled file and
+// then switches to slashes for stretches of 2014 and 2015 -- found only by a
+// backfill that read all 3,600 sessions, the same way M0 found a two-digit year
+// in one equity bhavcopy.
+func TestSlashDatesParse(t *testing.T) {
+	slashed := "CNX Nifty,09/06/2014,7621.65,7673.7,7580.25,7654.6,71.2,0.94,231879926,10866.56,20.85,3.62,1.26\n"
+	got, _, err := nseindex.Parse(strings.NewReader(header+slashed), day(2014, 6, 9))
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, nseindex.Nifty50, got[0].IndexCode)
+	require.Equal(t, 7654.6, got[0].Close)
 }
 
 // TestParseRefusesAnEmptyFile rather than reporting a session with no indices,
 // which would settle in ingest_log as a successful ingest of nothing.
 func TestParseRefusesAnEmptyFile(t *testing.T) {
-	_, err := nseindex.Parse(strings.NewReader(header), day(2026, 9, 4))
+	_, _, err := nseindex.Parse(strings.NewReader(header), day(2026, 9, 4))
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "no rows")
+	require.Contains(t, err.Error(), "no usable rows")
 }
 
 // TestUncuratedNamesStayApart is the safe direction of the identity rule.
@@ -155,14 +183,14 @@ func TestCuratedAliasesCollapseToOneCode(t *testing.T) {
 // TestContentHashChangesWithAnyPublishedValue, so a re-ingest that changes
 // nothing is a no-op and a correction is a new version.
 func TestContentHashChangesWithAnyPublishedValue(t *testing.T) {
-	base, err := nseindex.Parse(strings.NewReader(header+rowNifty50), day(2026, 9, 4))
+	base, _, err := nseindex.Parse(strings.NewReader(header+rowNifty50), day(2026, 9, 4))
 	require.NoError(t, err)
-	same, err := nseindex.Parse(strings.NewReader(header+rowNifty50), day(2026, 9, 4))
+	same, _, err := nseindex.Parse(strings.NewReader(header+rowNifty50), day(2026, 9, 4))
 	require.NoError(t, err)
 	require.Equal(t, base[0].ContentHash(), same[0].ContentHash())
 
 	corrected := strings.Replace(rowNifty50, "23897.7", "23897.8", 1)
-	other, err := nseindex.Parse(strings.NewReader(header+corrected), day(2026, 9, 4))
+	other, _, err := nseindex.Parse(strings.NewReader(header+corrected), day(2026, 9, 4))
 	require.NoError(t, err)
 	require.NotEqual(t, base[0].ContentHash(), other[0].ContentHash())
 
