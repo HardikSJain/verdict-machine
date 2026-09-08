@@ -931,8 +931,8 @@ with the per-symbol label for 4,100 of 4,100 symbols on each of six sampled date
 0004 has since been applied to `verdict` (2026-09-08, `goose_db_version` = 4, `symbol_links`
 present and holding 0 rows), so the shadow is no longer needed: the binary at this HEAD reads
 the store directly and `verdict universe --as-of 2026-09-04 --lookback 125` returns the same
-2,127 entities against the real empty table. **That equivalence is weak evidence and must not be cited as
-though it were strong**: with no link rows every entity is a singleton and the two queries
+2,127 entities against the real empty table. **That equivalence is weak evidence and must not
+be cited as though it were strong**: with no link rows every entity is a singleton and the two queries
 are identical by construction, so it can only rule out a regression for unlinked symbols. It
 says nothing about the multi-member path. The full design, its staging and its test plan are
 in `.superpowers/sdd/2026-09-07-m0-scaffold/isin-design.md`.
@@ -1291,13 +1291,18 @@ same spirit as the two stages before it.
    holes from the pending tail because `backfill` leaves a recent 404 unlogged on purpose,
    and treating that tail as a hole would make the roster ungeneratable for a reason that
    is a clock rather than a gap. A candidate whose own gap dates are unsettled is
-   quarantined either way, so the narrower refusal does not admit anything. The invariant report is printed *before* the scan runs, so a
-   mid-backfill refusal does not withhold an answer that was already computed.
+   quarantined either way, so the narrower refusal does not admit anything. The invariant
+   report is printed *before* the scan runs, so a mid-backfill refusal does not withhold an
+   answer that was already computed -- pinned by
+   `TestEntitiesCheckCommand_ExitsNonZeroOnAnUnlinkedAcceptedCandidate`.
 4. **`Store.EntityMapAt` is new and is not in the design's method list.** It reads the
    published `entity_map_at(ts)` function rather than a fourth hand-rolled `DISTINCT ON`, so
-   the CLI, the tests and the notebook documentation resolve identity through one definition
-   -- which is the claim the notebook section above makes, and it would be an empty claim if
-   nothing in the repository went through that door. A pair counts as already linked only
+   `entities check`, its tests and the notebook documentation resolve identity through one
+   definition -- which would be an empty claim if nothing in the repository went through that
+   door. It does **not** put the read path through it: `UniverseAsOf` and `BarsForDate` build
+   the same rule inline as `entityMapCTE`, because they need it in one statement beside the
+   member and label CTEs, so the rule has two expressions kept in step by review rather than
+   by construction. The notebook section above says so. A pair counts as already linked only
    when *both* symbols are present in the map and resolve to the same entity: a bare map
    lookup would give two unknown symbols entity 0, compare 0 == 0, and report the pair as
    safely linked.
