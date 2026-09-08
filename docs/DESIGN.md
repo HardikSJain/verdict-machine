@@ -514,6 +514,11 @@ only while `verify` stays green. A one-page runbook.
   Before the change the two halves were disjoint and could not be differenced by accident;
   now they can. `UniverseMember.LastBreak` carries the most recent boundary at or before
   `asOf` and `verdict universe` prints it as `last_break`.
+  **The fence is INERT while the live map is empty**, which it is: `EntityBoundaries` returns
+  an empty map and `LastBreak` is nil for every member, so the guard you write today never
+  fires and cannot be seen to work. `verdict entities apply` over the reviewed roster -- a
+  human's decision, not yet taken -- is what makes it live. Test the guard against a seeded
+  map (`verdict_test`, as `internal/market/entities`' fixtures do), never against `verdict`.
   **(b) `runs` must record `snapshot_id` computed over the amended row set including
   `symbol_links`, and `config_hash` including the roster digest.** See the data model and
   the succession section for both.
@@ -774,6 +779,19 @@ the caller's pin, and `UniverseMember.LastBreak` carries the most recent one at 
 `asOf`; `verdict universe` prints it as `last_break` with a header line counting the members
 that have one. Until `adjustments` exists the only safe use of them is to **refuse**.
 
+**Both are INERT today, and the guard you write against them will not fire.** `symbol_links`
+is empty on the live store, so `EntityBoundaries` returns an empty map for every entity id it
+is handed and `LastBreak` is nil for every member: `verdict universe --as-of 2026-09-04
+--lookback 125` prints `0 of 2127 members carry a succession boundary at or before as-of` (run
+2026-09-08). One thing changes that, and it is not a code change: a human running
+`verdict entities apply` over the reviewed roster. Write the guard anyway — the alternative is
+finding it missing on the day the map is seeded, which is the day the danger starts — but do
+not read a green run against the live store as evidence that it works, because a guard that
+never fires and a guard that is not there produce identical output today. Exercise it against
+a seeded map instead: `internal/market/entities`' fixtures apply a real roster to
+`verdict_test`, and `TestEntityMapAt_ResolvesEverySymbolAtThePin` and
+`TestUnlinkedCandidates_GoesQuietOnceTheRosterIsApplied` show the shape.
+
 M1's `runs` table must also record `snapshot_id` computed over the amended row set including
 `symbol_links`, and `config_hash` including the roster digest -- see the data model above.
 
@@ -872,9 +890,28 @@ both places.
   moment M1 puts an ETF in the universe. G1 is meaningless for `INF` -- one issuer code
   covers dozens of unrelated schemes -- so the only route is a hand-written `manual` roster
   line, which is exactly where a false positive would originate.
-- **Every read pays 15-30% forever** for a correction that matters to about 12% of symbols.
-  The ~3,600 symbols that never changed ISIN fund the fix for the 491 that did, on every
-  query.
+- **Every read pays for the overlay, forever, and the bill is now measured rather than
+  guessed.** Medians of six warm runs each against the live store, `nse-bhavcopy`,
+  `--as-of 2026-09-04 --lookback 125 --n 500`, running the exact SQL the Go builders emit with
+  `symbol_links` shadowed as an empty CTE because the table did not exist there yet (Stage 1's
+  report, `.superpowers/sdd/2026-09-07-m0-scaffold/stage1-report.md`):
+  **`UniverseAsOf` 578 ms → 625 ms, +47 ms, about +8%**; **`BarsForDate` 12.4 ms → 27.3 ms,
+  about 2.2x, +15 ms** — the ~4,100 `symbolLabelLateral` evaluations `entity_label` now makes
+  per call against the ~2,600 the old query made for the symbols that actually held a bar.
+  The "15–30%" this bullet used to state as a fact was never a measurement: it is
+  isin-design.md §4.7's *expectation*, written against revision 1's `entity_label` and marked
+  stale in the same paragraph by the design itself. It was too pessimistic for `UniverseAsOf`
+  and far too optimistic for `BarsForDate`, which it had never timed at all.
+- **The many fund the fix for the few, and the two counts are in different units.** In
+  **symbols**: the store registers 4,100, the committed roster's 444 links would pull **859**
+  of them (21%) into 415 multi-member entities, and the remaining **3,241** (79%) would stay
+  their own entity and pay the overlay on every query for a correction that never touches
+  them. The **491** quoted earlier in this section is a count of *tickers* holding more than
+  one `symbol_id`, not of symbols; the same fragmentation in symbol units is **1,017**.
+  isin-design.md §4.7 states this as "the ~3,600 symbols that never changed ISIN fund the fix
+  for the 491 that did" — which is 4,100 symbols minus 491 tickers, the very subtraction the
+  paragraphs above spend a page disproving. The numbers here are the ones this document
+  stands behind (re-measured read-only on 2026-09-08).
 
 #### Stage 1 of the repair has landed (migration 0004, `symbol_links`)
 
