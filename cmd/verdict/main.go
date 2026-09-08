@@ -3,10 +3,12 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 	"github.com/HardikSJain/verdict-machine/internal/engine"
 	"github.com/HardikSJain/verdict-machine/internal/market"
 	"github.com/HardikSJain/verdict-machine/internal/market/bhavcopy"
+	"github.com/HardikSJain/verdict-machine/internal/market/entities"
 	"github.com/HardikSJain/verdict-machine/internal/market/eod2"
 	"github.com/HardikSJain/verdict-machine/internal/market/nseindex"
 	"github.com/HardikSJain/verdict-machine/internal/report"
@@ -612,6 +615,36 @@ func newIndexCheckCmd() *cobra.Command {
 	return cmd
 }
 
+// gitSHA is the commit the binary was built from. Go stamps it into build info
+// for a `go build` from a repository; VERDICT_GIT_SHA overrides it for a `go
+// run`, where the stamp is absent. A run recorded without it is still a run, but
+// its code cannot be recovered, so the value says so rather than being blank.
+func gitSHA() string {
+	if v := os.Getenv("VERDICT_GIT_SHA"); v != "" {
+		return v
+	}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range info.Settings {
+			if s.Key == "vcs.revision" {
+				if dirty := vcsModified(info); dirty {
+					return s.Value + "-dirty"
+				}
+				return s.Value
+			}
+		}
+	}
+	return "unknown"
+}
+
+func vcsModified(info *debug.BuildInfo) bool {
+	for _, s := range info.Settings {
+		if s.Key == "vcs.modified" {
+			return s.Value == "true"
+		}
+	}
+	return false
+}
+
 func newBacktestCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "backtest",
@@ -709,6 +742,31 @@ func newBacktestCmd() *cobra.Command {
 				return err
 			}
 
+			// Provenance, computed BEFORE the run so the pin it records is the
+			// pin the run actually read at.
+			snapshotID, tables, err := store.SnapshotID(cmd.Context(), pin)
+			if err != nil {
+				return err
+			}
+			rosters, err := store.RosterDigests(cmd.Context(), pin)
+			if err != nil {
+				return err
+			}
+			cfg := map[string]any{
+				"strategy": strat.Name(), "source": source, "capital": capital,
+				"top": top, "formation": formation, "skip": skip,
+				"lookback": lookback, "universe_n": n,
+				"filter": useFilter, "filter_days": filterDays, "index": indexCode,
+				"broker": brokerS, "slippage_bps": slippage,
+				"limits": limits, "roster_digests": rosters,
+				"from": from.Format(time.DateOnly), "to": to.Format(time.DateOnly),
+			}
+			cfgDigest, err := entities.DigestOf(cfg)
+			if err != nil {
+				return err
+			}
+			configHash := hex.EncodeToString(cfgDigest)
+
 			started := time.Now()
 			res, err := e.Run(cmd.Context(), capital)
 			if err != nil {
@@ -741,10 +799,55 @@ func newBacktestCmd() *cobra.Command {
 						h.Scrip, h.Quantity, h.CostBasis, h.LastMark)
 				}
 			}
-			fmt.Fprintf(out, "\nprovenance: source %s, pin %s, ran in %s\n",
-				mk.Source(), pin.Format(time.RFC3339), time.Since(started).Round(time.Second))
-			fmt.Fprintf(out, "NOT YET REPLAYABLE: the runs table and snapshot_id do not exist, so this\n")
-			fmt.Fprintf(out, "result cannot be reproduced byte-for-byte from a recorded row.\n")
+			runID, err := market.NewRunID()
+			if err != nil {
+				return err
+			}
+			finished := time.Now()
+			record, _ := cmd.Flags().GetBool("record")
+			fmt.Fprintf(out, "\nprovenance\n")
+			fmt.Fprintf(out, "  run_id       %s\n", runID)
+			fmt.Fprintf(out, "  git_sha      %s\n", gitSHA())
+			fmt.Fprintf(out, "  config_hash  %s\n", configHash)
+			fmt.Fprintf(out, "  snapshot_id  %s\n", snapshotID)
+			for _, t := range tables {
+				fmt.Fprintf(out, "    %-14s %10d rows  %s\n", t.Table, t.Rows, t.Digest[:16])
+			}
+			fmt.Fprintf(out, "  ingest pin   %s\n", pin.Format(time.RFC3339))
+			fmt.Fprintf(out, "  ran in       %s\n", finished.Sub(started).Round(time.Second))
+
+			// A repeat of an identical run is not new evidence, and the only
+			// way to know is to have recorded the first one.
+			if prior, err := store.PriorRuns(cmd.Context(), configHash, snapshotID); err == nil && len(prior) > 0 {
+				fmt.Fprintf(out, "\n  NOTE: %d earlier run(s) share this exact config and snapshot:\n", len(prior))
+				for _, r := range prior {
+					fmt.Fprintf(out, "    %s  %s  %s..%s\n", r.StartedAt.Format(time.RFC3339),
+						r.RunID, r.PeriodFrom.Format(time.DateOnly), r.PeriodTo.Format(time.DateOnly))
+				}
+				fmt.Fprintf(out, "  This run is a repetition, not independent evidence.\n")
+			}
+
+			if !record {
+				fmt.Fprintf(out, "\n  not recorded (--record=false); this run leaves no audit trail\n")
+				return nil
+			}
+			if err := store.RecordRun(cmd.Context(), market.Run{
+				RunID: runID, Mode: "backtest", Strategy: strat.Name(),
+				GitSHA: gitSHA(), ConfigHash: configHash, SnapshotID: snapshotID,
+				IngestPin: pin, PeriodFrom: res.From, PeriodTo: res.To,
+				Result: map[string]any{
+					"net_cagr": rep.NetCAGR, "benchmark": benchCode,
+					"benchmark_cagr": rep.BenchmarkCAGR, "excess_cagr": rep.ExcessCAGR,
+					"max_drawdown": rep.MaxDrawdown, "final_equity": rep.FinalNet,
+					"total_costs": rep.TotalCosts, "trades": len(rep.Trades),
+					"trade_mean": rep.TradeMean, "trade_stddev": rep.TradeStdDev,
+					"turnover": rep.Turnover, "slippage_bps": slippage,
+				},
+				StartedAt: started, FinishedAt: finished,
+			}); err != nil {
+				return err
+			}
+			fmt.Fprintf(out, "  recorded as run %s\n", runID)
 			return nil
 		},
 	}
@@ -765,6 +868,7 @@ func newBacktestCmd() *cobra.Command {
 	cmd.Flags().String("broker", string(cost.Zerodha), "broker charge schedule")
 	cmd.Flags().Float64("slippage-bps", 0, "slippage per leg in basis points")
 	cmd.Flags().Float64("min-notional", 0, "override the derived position floor (0 = derive it)")
+	cmd.Flags().Bool("record", true, "write a runs row so the result can be replayed and repeats detected")
 	cmd.Flags().String("database-url", "", "Postgres URL (default $VERDICT_DATABASE_URL)")
 	return cmd
 }
