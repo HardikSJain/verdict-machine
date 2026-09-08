@@ -705,6 +705,52 @@ rather than decorative.
 The kill switch is read from `Book.KillSwitch` supplied by the caller rather than from the
 `kill_switch` table, which does not exist until M2.
 
+## `internal/engine` has landed (M1 PR 4)
+
+The loop is 289 lines, inside the design's ~500 cap; the package is 870 with both Market
+implementations and the paper broker. Seams shipped: **Market** (`StoreMarket` over Postgres and
+`Fixture` over a frozen table, which is what the CI golden backtest will run on), **Broker**
+(`Paper`, with Publisher and Kite arriving in M3 and phase 2 behind the same interface), and
+**Strategy**.
+
+**The one rule the package exists to enforce: signals are read at a CLOSE and orders fill at the
+NEXT OPEN.** The session order is fixed and not interchangeable -- yesterday's orders meet today's
+open, fills move cash, the book marks at today's close, the strategy sees that close, the gate
+accepts or refuses, survivors wait for tomorrow. So a strategy cannot act on a price in the same
+session it observed, and orders decided on the final session never fill because they were never
+given an open. The test fixture closes at 100 and opens at 150 the next morning so that getting it
+wrong is impossible to miss; mutating the fill to use the close fails it.
+
+Three things are deliberate and worth not undoing:
+
+- **Charges leave cash on both sides.** A buy costs turnover plus charges, a sell returns turnover
+  minus charges. Netting them into the fill price would make every cost basis a fiction and
+  understate exactly the drag this project exists to measure. `TestChargesLeaveCashOnBothSides`
+  runs a flat round trip and asserts the entire loss equals the charges.
+- **The paper broker prices a whole session through `cost.Day`, not order by order**, because the
+  DP charge is per scrip per sell day. A position exited in three clips pays the depository once;
+  pricing each clip alone would treble the one fee that decides whether a small trade was worth
+  doing.
+- **Nothing is dropped.** Risk rejections, unfilled orders and the cost model's unverified-rate
+  list all reach `Result`. A backtest that silently discards refused intents is quietly running a
+  different strategy from the one that was written.
+
+**A real bug the tests caught before any strategy existed:** `LastMark` was written only by `Apply`,
+so it held the FILL price forever. A name bought at 100, trading at 120 for six months, then halted
+for one session would have valued at 100 again for that session -- a 17% drawdown and a 17% recovery
+around a day on which nothing happened. `Portfolio.Mark` now runs at every close.
+
+**Smoke run against the live store**, 2026-06-01 to 2026-09-04: 69 sessions in 8.6 s, a real 500-name
+universe, and `Returns` over the top 50 came back 44 priced / 4 refused / 2 absent -- the fence firing
+inside the engine's own read path. The test buy was refused by `max_stock_fraction` (24.88% of book
+equity against a 10% cap), which is the whole chain working: store, universe, fence, strategy, gate,
+recorded rejection.
+
+**Still open and it must land before the first backtest is believable:** prerequisite (b), the `runs`
+table recording `snapshot_id` over the amended row set and `config_hash` including the roster digest.
+`StoreMarket` already carries the pin and exposes it (`Pin()`, `Source()`) precisely so that row can
+be written without threading a new parameter through the loop.
+
 ## Reviewer Concerns
 
 Three rounds of adversarial review (scores 7, 7, 8 of 10). The four issues from the final

@@ -447,3 +447,31 @@ func (s *Store) BarsForDate(ctx context.Context, source string, date, asOfIngest
 	}
 	return out, rows.Err()
 }
+
+// Sessions returns the distinct trading dates one source holds in [from, to],
+// ascending, as the store knew them at asOfIngest.
+//
+// It is the exchange calendar as the archive records it rather than as a
+// holiday table asserts it, which is the same choice backfill makes: NSE
+// trades some Saturdays (budget days, Muhurat) and a calendar built from
+// weekday arithmetic misses them. M0 lost 19 real sessions to exactly that
+// bug before the archive was made the authority.
+func (s *Store) Sessions(ctx context.Context, source string, from, to, asOfIngest time.Time) ([]time.Time, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT date FROM bars
+		WHERE source = $1 AND date >= $2 AND date <= $3 AND ingested_at <= $4
+		ORDER BY date`, source, from, to, asOfIngest)
+	if err != nil {
+		return nil, fmt.Errorf("sessions: %w", err)
+	}
+	defer rows.Close()
+	var out []time.Time
+	for rows.Next() {
+		var d time.Time
+		if err := rows.Scan(&d); err != nil {
+			return nil, err
+		}
+		out = append(out, Day(d.Year(), d.Month(), d.Day()))
+	}
+	return out, rows.Err()
+}
