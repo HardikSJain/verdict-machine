@@ -581,9 +581,14 @@ only while `verify` stays green. A one-page runbook.
   `verdict universe` prints the warning above every such run. A guard written today can be
   seen to fire. It was inert before that apply, which is why this paragraph used to say so. Test the guard against a seeded
   map (`verdict_test`, as `internal/market/entities`' fixtures do), never against `verdict`.
+  **(a) HAS LANDED** as `Store.EntityReturns` in `internal/market/series.go` -- and building it
+  found that the design's own wording was too narrow: the ISIN boundary and the ex-date are not
+  the same session, and refusing only windows that SPAN the boundary would have let the split
+  through for 59% of links. See "The fence has landed" in the succession section for the
+  measurement, the guard band and what it costs (12 of 500 names at as-of 2026-09-04).
   **(b) `runs` must record `snapshot_id` computed over the amended row set including
-  `symbol_links`, and `config_hash` including the roster digest.** See the data model and
-  the succession section for both.
+  `symbol_links`, and `config_hash` including the roster digest.** Still open; it lands with the
+  `runs` table itself. See the data model and the succession section for both.
   Then the milestone itself: `internal/cost` with the golden contract-note test;
   `internal/risk` (max_positions, min notional, stock and book caps) wired into backtest
   sizing; engine + SimClock + Paper broker; both strategies registered, the 200-DMA ETF
@@ -855,6 +860,75 @@ to `verdict_test`, and `TestEntityMapAt_ResolvesEverySymbolAtThePin` and
 
 M1's `runs` table must also record `snapshot_id` computed over the amended row set including
 `symbol_links`, and `config_hash` including the roster digest -- see the data model above.
+
+#### The fence has landed (M1 PR 1, `internal/market/series.go`)
+
+`Store.EntityReturns` is the shipping path for every return the engine computes. It prices a
+window for a set of entities and returns three maps -- `Priced`, `Refused`, `Absent` -- with
+`Accounted` asserting that every requested entity appears in exactly one of them. Refusals are
+data the caller must walk past, not a warning it can ignore, and returning them as an error was
+rejected: some name is always near a split, so an all-or-nothing fence would make momentum
+unrunnable and would be deleted within a week.
+
+**Building it turned up a defect in the design's own framing of the rule.** The design said to
+refuse a return computed *across a boundary*. A boundary is the ISIN change; the price break is
+the ex-date of the corporate action behind it; **they are not the same day.** Measured over all
+444 links in the live roster on 2026-09-08, taking a >25% single-session move as the break:
+
+| where the break sits | boundaries |
+|---|---|
+| at the boundary itself | 167 |
+| 1 session before it | **262** |
+| 2 sessions before it | 14 |
+| 3 sessions before it | 0 |
+| 4 sessions before it | 1 |
+| 5+ sessions before it | 0 |
+
+Those sum to 444: every link accounted for exactly once, which is also the strongest evidence
+yet that the reviewed roster contains no lines without a real corporate action behind them.
+
+The majority case is the dangerous one. At TATASTEEL the ex-split session is 2022-07-28, closing
+100.35 against the previous session's 959.40, while the ISIN only changes on 07-29. A window
+ending on the 28th never touches the boundary, both its endpoints are the *same* `symbol_id`,
+every entity invariant in this repository is satisfied -- and it prices at **-89.4%**. A fence
+written to the design's literal wording would have let that through for **59% of all boundaries**.
+So `BoundaryGuardSessions = 5` extends the refusal back five sessions before each boundary,
+covering the measured maximum of four with one session of margin, and
+`TestEntityReturns_RefusesTheWindowThatEndsOnTheExDate` pins both halves: that the fence refuses,
+and that the two closes it declined to difference really do produce -89.4%. Mutating the constant
+to 0 fails it with exactly that number in the failure message.
+
+**What it costs, measured, and re-runnable with `go run ./scripts/fence-cost`.** Against the live
+store at as-of 2026-09-04, top 500 by 125-session turnover, 12-1 momentum window
+2025-09-04..2026-08-04: **456 priced (91.2%), 12 refused (2.4%), 32 absent (6.4%)**, in 301 ms.
+The 12 are all real face-value splits inside the window -- KOTAKBANK, MCX, ANGELONE, CAMS,
+NUVAMA, ADANIPOWER, BEML, NAZARA and four smaller names -- and the 32 absent are names listed too
+recently to have a 12-month formation period at all (515 entities in the store first traded after
+2025-09-04). The fence is neither vacuous nor ruinous.
+
+Note which way the harm ran. A split always *lowers* the quoted price, so the fake return is
+always negative: in a long-only top-20 momentum book the unfenced failure is **wrongful
+exclusion** of a name that actually did well, the same outcome as the pre-roster universe hole
+that hid TATASTEEL, arriving by a different mechanism. Any long-short or bottom-ranked use would
+turn the same fake number into an active wrong position.
+
+**The limit, and it is not fixable here.** The ex-date step lives inside one `symbol_id`, so the
+fence sees it only because a boundary sits nearby *in the map at the caller's pin*. A run pinned
+before the roster was applied prices that same window at -89.4% and nothing objects --
+`TestEntityReturns_ProtectionIsContingentOnThePinnedRoster` asserts exactly that, because it is
+"replay reproduces the answer, not the judgement" made executable. The fence protects runs pinned
+at or after 2026-09-08, which is every run M1 will make. It is not retroactive, and a green run
+against an old pin is not evidence of anything.
+
+Two pins in the new query are mutation-verified rather than asserted: the entity map's
+`ingested_at` bound (drop it and the successor's bars answer for an entity that had no members at
+the pin) and the guard band constant. `EndpointStaleDays = 30` puts a floor under "the last
+session at or before X", so a name that stopped trading in July answers a December window with an
+explicit `Absent` and a reason rather than a July close and a plausible number.
+
+Still open from this section: **prerequisite (b)**, `runs` recording `snapshot_id` over the
+amended row set and `config_hash` including the roster digest. It lands with the `runs` table
+itself, which does not exist yet.
 
 #### Reading the map from a notebook: `entity_map_at(ts)`, never `entity_map_now`
 
