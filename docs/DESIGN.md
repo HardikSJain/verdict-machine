@@ -387,10 +387,14 @@ Monthly, on a settled archive:
    read `data/succession-review.jsonl` for the new pair, and open a PR. **The reviewer is
    checking the generator, not 444 independent facts** (design §5.5), so a regression in
    `propose` would be ratified wholesale over irreversible rows; review the diff in that
-   light. Two things to know before reading that diff. Hand-written `manual` lines already
-   in the roster are **carried across** by this run and appear in its output as
-   `# kept hand-written line …`; `--discard-manual` is the only way to lose one, and it says
-   so. And `boundary_ratio_matches` — G6, the one non-gating-on-structure gate — admits an
+   light. Two things to know before reading that diff. That command **overwrites** the file
+   it is pointed at, and every generated line in it is regenerated from `bars` — but the
+   hand-written `manual` lines are read out of the old file first (before a connection is
+   even opened) and **carried across**, printed as `# kept hand-written line …`.
+   `--discard-manual` is the only way to lose one; it names each line it drops, with the one
+   exception that a roster which no longer parses has no readable lines to name — and without
+   the flag, a roster that will not parse stops the run rather than being overwritten. And
+   `boundary_ratio_matches` — G6, the one non-gating-on-structure gate — admits an
    arbitrary cross-company price splice **41.5% of the time** on this archive (judgement
    call 5 below, with the SQL). It is weak evidence, not near-certain rejection, and it is
    the only thing between a wrong-but-disjoint merge and 444 irreversible rows.
@@ -918,11 +922,16 @@ both places.
 The canonical-entity layer described above now exists as a read-time overlay: migration
 0004 adds `symbol_links`, and `UniverseAsOf` and `BarsForDate` resolve identity through it.
 **It ships with the table empty**, so every symbol is still its own entity and both reads
-answer exactly what they answered before — verified read-only against the live 13,792,595-bar
-store: the whole ranked universe at `--asof 2026-09-04 --lookback 125` (2,127 entities) and
-`BarsForDate` for that session (2,633 rows) are row-for-row identical to the pre-change
-queries, and the entity label agrees with the per-symbol label for 4,100 of 4,100 symbols on
-each of six sampled dates. **That equivalence is weak evidence and must not be cited as
+answer exactly what they answered before. Stage 1 verified that read-only against the live
+13,792,595-bar store, running the exact SQL the Go builders emit with `symbol_links` shadowed
+as an empty CTE — the table did not exist on `verdict` at the time: the whole ranked universe
+at `--as-of 2026-09-04 --lookback 125` (2,127 entities) and `BarsForDate` for that session
+(2,633 rows) were row-for-row identical to the pre-change queries, and the entity label agreed
+with the per-symbol label for 4,100 of 4,100 symbols on each of six sampled dates. Migration
+0004 has since been applied to `verdict` (2026-09-08, `goose_db_version` = 4, `symbol_links`
+present and holding 0 rows), so the shadow is no longer needed: the binary at this HEAD reads
+the store directly and `verdict universe --as-of 2026-09-04 --lookback 125` returns the same
+2,127 entities against the real empty table. **That equivalence is weak evidence and must not be cited as
 though it were strong**: with no link rows every entity is a singleton and the two queries
 are identical by construction, so it can only rule out a regression for unlinked symbols. It
 says nothing about the multi-member path. The full design, its staging and its test plan are
@@ -1306,10 +1315,18 @@ same spirit as the two stages before it.
    is the worked example. The old "534 of 4,092" is not reproducible at any pin in this
    store and was measured against a database that no longer exists.
 
-**The state of the live store after this branch, stated plainly because it is the thing most
-likely to be assumed rather than checked:** the `verdict` database is on migration **0003**.
-`symbol_links` does not exist there, the roster has not been applied, and a binary built from
-this branch cannot read that store at all until `verdict migrate` is run against it (both
-readers join `entity_map`, which needs the table). Applying 0004 is safe during a run -- a
-binary built before it simply never reads the table -- and it is a human's call, as is the
-`apply` that follows it.
+**The state of the live store, stated plainly because it is the thing most likely to be
+assumed rather than checked** (re-verified read-only 2026-09-08): the `verdict` database is at
+`goose_db_version` **4**. `symbol_links` exists there and holds **0 rows**, and
+`entity_map_at` / `entity_map_now` are published. A binary built from this branch therefore
+reads the store: `verdict universe --as-of 2026-09-04 --lookback 125` returns 2,127 entities
+and the header line `0 of 2127 members carry a succession boundary at or before as-of`. What
+has **not** happened is the `apply`, and the monthly item says so out loud --
+`verdict entities check` against that store today prints 444 `UNLINKED candidate` lines and
+exits non-zero with "444 accepted candidate(s) the map does not carry" (181 quarantined, 625
+generated, about five seconds). That is the control working, not a fault: the roster is
+committed and unapplied, and writing 444 irreversible merge rows into a store that cannot
+delete is a human's call. *(An earlier revision of this paragraph said the store was on
+migration 0003 and that a binary from this branch could not read it at all. That was true when
+it was written and stopped being true when 0004 was applied. Applying 0004 is safe during a
+run -- a binary built before it simply never reads the table.)*
