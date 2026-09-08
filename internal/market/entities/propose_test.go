@@ -472,3 +472,105 @@ func TestTheCommittedRosterLoadsAndValidates(t *testing.T) {
 		require.Equal(t, entities.ReasonSuccession, l.Reason, "%s -> %s", l.Predecessor, l.Successor)
 	}
 }
+
+// renamed writes one symbol's bars under two tickers, with the rename
+// registered at the first session that carried the new one.
+//
+// EnsureSymbols records a rename at the LATEST date in the batch that first
+// shows the new ticker, so the new name's own first session is inserted alone
+// and the rest follows. That is the shape of the real thing: `symbols` is
+// insert-only and CADILAHC -> ZYDUSLIFE is the worked example in
+// docs/DESIGN.md.
+func renamed(t *testing.T, store *market.Store, isin, before, after string, oldDays, newDays []time.Time, firstClose, close float64) {
+	t.Helper()
+	series(t, store, isin, before, oldDays, firstClose, close)
+	series(t, store, isin, after, newDays[:1], close, close)
+	if len(newDays) > 1 {
+		series(t, store, isin, after, newDays[1:], close, close)
+	}
+}
+
+// TestProposeLabelsEachSideOfTheBoundaryAtItsOwnDate pins the two ticker
+// laterals in loadSymbolFacts, which nothing else in the package exercises:
+// every other fixture gives a symbol ONE ticker for its whole span, so the
+// rule that picks a label AT a date is never asked a question it can answer
+// wrongly. Swapping the two arguments -- labelling the predecessor at its
+// first date and the successor at its last -- left the whole suite green.
+//
+// Three things ride on those laterals. `boundary_ticker_unchanged` is one of
+// design 5.5's four spot-check selectors, the one telling the reviewer which
+// lines to look at hardest. `ticker_at_boundary` is written into every roster
+// line and into symbol_links.evidence, i.e. into rows that cannot be deleted.
+// And the second generator groups by the predecessor's LAST ticker, which is
+// what surfaces the 52 INF/IN9 fund-unit pairs for quarantine.
+func TestProposeLabelsEachSideOfTheBoundaryAtItsOwnDate(t *testing.T) {
+	ctx := context.Background()
+	store, pool := proposeStore(t)
+	predLast, succFirst := market.Day(2017, 7, 28), market.Day(2017, 7, 31)
+	predRename, succRename := market.Day(2017, 4, 3), market.Day(2017, 10, 2)
+	series(t, store, calCtrl, "CONTROL", weekdaysIn(archiveFrom, archiveTo), 100, 100)
+
+	// Both sides are renamed mid-span, and both renames are far away from the
+	// boundary: what the boundary label must report is the name each side
+	// carried on ITS OWN boundary session, which is the middle value on each
+	// side rather than the first or the last.
+	renamed(t, store, calPred, "CADILAHC", "ZYDUSLIFE",
+		weekdaysIn(archiveFrom, predRename.AddDate(0, 0, -1)), weekdaysIn(predRename, predLast), 959.4, 100.35)
+	renamed(t, store, calSucc, "ZYDUSLIFE", "ZYDUSWELL",
+		weekdaysIn(succFirst, succRename.AddDate(0, 0, -1)), weekdaysIn(succRename, archiveTo), 107.6, 110)
+	settle(t, pool, lateFetch)
+
+	r, cands, _ := propose(t, pool)
+	c := candidateFor(t, cands, calPred, calSucc)
+	require.Equal(t, "ZYDUSLIFE", c.TickerBefore,
+		"the predecessor is labelled at its LAST session, not at its first: CADILAHC is what it was called in January and it died as ZYDUSLIFE")
+	require.Equal(t, "ZYDUSLIFE", c.TickerAfter,
+		"and the successor at its FIRST session, not at its last: ZYDUSWELL is a later rename and says nothing about the boundary")
+	require.True(t, c.EvidenceNotGating.BoundaryTickerUnchanged,
+		"the name did not change at the boundary here; a reviewer sorting on this field is deciding which lines to look at hardest")
+	require.Len(t, r.Links, 1)
+	require.Equal(t, "ZYDUSLIFE", r.Links[0].TickerAtBoundary,
+		"and this value goes into symbol_links.evidence, in a table with no DELETE")
+
+	// The same rule, read through market's own labelling of those two
+	// sessions. The laterals in propose claim to mirror symbolLabelLateral,
+	// and this is that claim executed rather than asserted in a comment.
+	require.Equal(t, c.TickerBefore, tickerOnDate(ctx, t, store, predLast, calPred))
+	require.Equal(t, c.TickerAfter, tickerOnDate(ctx, t, store, succFirst, calSucc))
+	require.Equal(t, "CADILAHC", tickerOnDate(ctx, t, store, archiveFrom, calPred),
+		"and the reader disagrees with the boundary label at a different date, so the two are not trivially equal")
+}
+
+// TestProposeReportsATickerThatChangesAtTheBoundary is the other half of the
+// same rule: the 121 same-session ticker+ISIN changes design 5.5 sends the
+// reviewer to. It is evidence and gates nothing, so it has to be reported
+// truthfully rather than defaulted true.
+func TestProposeReportsATickerThatChangesAtTheBoundary(t *testing.T) {
+	store, pool := proposeStore(t)
+	series(t, store, calCtrl, "CONTROL", weekdaysIn(archiveFrom, archiveTo), 100, 100)
+	series(t, store, calPred, "OLDCO", weekdaysIn(archiveFrom, market.Day(2017, 7, 28)), 100, 100)
+	series(t, store, calSucc, "NEWCO", weekdaysIn(market.Day(2017, 7, 31), archiveTo), 100, 100)
+	settle(t, pool, lateFetch)
+
+	_, cands, _ := propose(t, pool)
+	c := candidateFor(t, cands, calPred, calSucc)
+	require.Equal(t, "OLDCO", c.TickerBefore)
+	require.Equal(t, "NEWCO", c.TickerAfter)
+	require.False(t, c.EvidenceNotGating.BoundaryTickerUnchanged,
+		"the ISIN and the ticker changed on the same session, which is the case a reviewer has to look at rather than the case they can skip")
+}
+
+// tickerOnDate reads one symbol's label for one session through the STORE's
+// own reader, which resolves it with market.symbolLabelLateral.
+func tickerOnDate(ctx context.Context, t *testing.T, store *market.Store, date time.Time, isin string) string {
+	t.Helper()
+	bars, err := store.BarsForDate(ctx, market.SourceBhavcopy, date, time.Now())
+	require.NoError(t, err)
+	for _, b := range bars {
+		if b.ISIN == isin {
+			return b.Ticker
+		}
+	}
+	t.Fatalf("no %s bar on %s", isin, date.Format("2006-01-02"))
+	return ""
+}
