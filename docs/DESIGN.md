@@ -665,6 +665,46 @@ broker decision recorded above is what makes ₹10,000 the right number. Note al
 delivery strategy pays at least ~0.2% per round trip, forever**, and that is the hurdle the first
 backtest has to clear before anything else about it is interesting.
 
+## `internal/risk` has landed (M1 PR 3), and the floor is now derived
+
+Two things here depart from the design's RiskGate v1 paragraph and both are deliberate.
+
+**The minimum position size is solved for, not configured.** The design fixed it at "roughly
+Rs10k at current charges"; `risk.MinNotional` now solves for the smallest notional whose modelled
+round trip stays under `MaxRoundTripCost`, using the shipping cost schedule. At the design's own
+0.5% rule the answer is **Rs5,600 at Zerodha and Rs25,600 at Angel One**. So the estimate was
+conservative by about 80% at the broker we actually use -- with 20 positions that is the difference
+between needing Rs2,00,000 of algo capital and needing Rs1,12,000 -- and a single hardcoded 10,000
+would have been wrong in both directions depending on the venue. The test asserts the numbers *and*
+the property that produced them (the floor clears the cap, one step below it does not), so a charge
+change fails loudly instead of leaving a stale constant that still looks deliberate.
+
+That derivation also bounds what any risk rule can achieve. STT is 0.1% a side and scales perfectly
+with size, so round-trip cost asymptotes near 0.2% however large the position: a 0.5% budget is
+comfortable, 0.25% costs ten times the position size, and **0.2% is unreachable at any size**.
+`MinNotional` errors rather than returning an absurd floor when the cap is under the asymptote.
+
+**A limit may block an increase in exposure and never a reduction.** Every cap applies to buys
+only. A gate that can refuse a sell can trap the book in a position it has decided it wants out of,
+and that failure is unbounded where an oversized position is not. `TestSellsAreNeverBlockedByACap`
+engages every cap at once and asserts the sell still passes; mutating the exemption away fails it.
+
+**One decision here is open and the design does not settle it: the kill switch stops sells too.**
+The reasoning is that a kill switch means the machine is not to be trusted, and an untrusted
+machine should not be choosing when to liquidate either -- the human keeps a Kite login, so the
+exit is never unavailable, only its automation is. `TestKillSwitchStopsSellsToo` pins the current
+behaviour and names it as a choice rather than a derivation. Overruling it is a one-line change.
+
+`SlippageBps` is **zero by default and that is not an oversight**: no slippage has been measured,
+and inventing a number would put a fabricated constant inside the floor the whole book is sized
+against. Until the alert phase measures real fills -- the promotion gate wants slippage within band
+on at least 40 -- the derived floor is a LOWER bound, and `Decision.SlippageModelled` says so on
+every run. Feeding 10 bps a leg in raises the floor, which is what keeps the parameter honest
+rather than decorative.
+
+The kill switch is read from `Book.KillSwitch` supplied by the caller rather than from the
+`kill_switch` table, which does not exist until M2.
+
 ## Reviewer Concerns
 
 Three rounds of adversarial review (scores 7, 7, 8 of 10). The four issues from the final
