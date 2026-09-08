@@ -211,7 +211,8 @@ func (s *switchAt) RiskOn(_ context.Context, sess engine.Session) (bool, string,
 func TestTrendFilterIsRiskOffWhileWarmingUp(t *testing.T) {
 	sessions := weekdays(day(2025, 1, 1), day(2025, 6, 30))
 	f := trending(sessions, 3)
-	tf, err := strategy.NewTrendFilter(1, "PROXY", 200)
+	f.SetIndex("NIFTY50", indexSeries(sessions, func(i int) float64 { return 100 + float64(i) }))
+	tf, err := strategy.NewTrendFilter("NIFTY50", 200)
 	require.NoError(t, err)
 
 	on, why, err := tf.RiskOn(context.Background(), engine.Session{
@@ -228,14 +229,13 @@ func TestTrendFilterFollowsTheMean(t *testing.T) {
 	f := engine.NewFixture(sessions)
 	// Rise for the first two thirds, then fall hard.
 	turn := len(sessions) * 2 / 3
-	for i, d := range sessions {
-		px := 100 + float64(i)
+	f.SetIndex("NIFTY50", indexSeries(sessions, func(i int) float64 {
 		if i > turn {
-			px = 100 + float64(turn) - float64(i-turn)*3
+			return 100 + float64(turn) - float64(i-turn)*3
 		}
-		f.AddBar(d, engine.Bar{EntityID: 1, Scrip: "PROXY", Open: px, Close: px})
-	}
-	tf, err := strategy.NewTrendFilter(1, "PROXY", 50)
+		return 100 + float64(i)
+	}))
+	tf, err := strategy.NewTrendFilter("NIFTY50", 50)
 	require.NoError(t, err)
 
 	on, why, err := tf.RiskOn(context.Background(), engine.Session{Date: sessions[turn], Market: f})
@@ -254,11 +254,8 @@ func TestTrendFilterFollowsTheMean(t *testing.T) {
 func TestTrendFilterRefusesAStaleProxy(t *testing.T) {
 	sessions := weekdays(day(2024, 1, 1), day(2025, 6, 30))
 	f := engine.NewFixture(sessions)
-	for i, d := range sessions[:len(sessions)-5] {
-		px := 100 + float64(i)
-		f.AddBar(d, engine.Bar{EntityID: 1, Scrip: "PROXY", Open: px, Close: px})
-	}
-	tf, err := strategy.NewTrendFilter(1, "PROXY", 50)
+	f.SetIndex("NIFTY50", indexSeries(sessions[:len(sessions)-5], func(i int) float64 { return 100 + float64(i) }))
+	tf, err := strategy.NewTrendFilter("NIFTY50", 50)
 	require.NoError(t, err)
 
 	on, why, err := tf.RiskOn(context.Background(), engine.Session{
@@ -266,7 +263,7 @@ func TestTrendFilterRefusesAStaleProxy(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.False(t, on)
-	require.Contains(t, why, "did not trade")
+	require.Contains(t, why, "has no close for")
 }
 
 // TestMomentumRefusesNonsenseParameters, in particular a formation window that
@@ -283,8 +280,17 @@ func TestMomentumRefusesNonsenseParameters(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "AlwaysOn")
 
-	_, err = strategy.NewTrendFilter(0, "X", 200)
+	_, err = strategy.NewTrendFilter("", 200)
 	require.Error(t, err)
-	_, err = strategy.NewTrendFilter(1, "X", 1)
+	_, err = strategy.NewTrendFilter("NIFTY50", 1)
 	require.Error(t, err)
+}
+
+// indexSeries builds a synthetic index close series over a calendar.
+func indexSeries(sessions []time.Time, at func(i int) float64) []engine.DatedClose {
+	out := make([]engine.DatedClose, 0, len(sessions))
+	for i, d := range sessions {
+		out = append(out, engine.DatedClose{Date: d, Close: at(i)})
+	}
+	return out
 }

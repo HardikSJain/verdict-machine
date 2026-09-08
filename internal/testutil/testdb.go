@@ -4,6 +4,7 @@ package testutil
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -71,10 +72,50 @@ func Pool(t *testing.T) *pgxpool.Pool {
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
 
-	// TRUNCATE does not fire row-level triggers, so the insert-only guard does not block it.
-	_, err = pool.Exec(ctx, "TRUNCATE bars, symbols, symbol_links, ingest_log RESTART IDENTITY")
-	require.NoError(t, err)
+	// TRUNCATE does not fire row-level triggers, so the insert-only guard does
+	// not block it.
+	//
+	// The table list is read from the catalogue rather than written here, and
+	// that is a fix rather than a flourish: it used to be the literal
+	// "bars, symbols, symbol_links, ingest_log", and when migration 0005 added
+	// index_levels the list silently stopped covering the database. Tests in one
+	// package then leaked rows into each other -- a re-ingest that should have
+	// been a no-op saw a hash another test had written and skipped, and the
+	// failure surfaced three tests away from its cause. Every future table gets
+	// covered by construction.
+	require.NoError(t, truncateAll(ctx, pool))
 	return pool
+}
+
+// truncateAll empties every table in the public schema except goose's own
+// version table, which must survive or the next Pool would re-run every
+// migration.
+func truncateAll(ctx context.Context, pool *pgxpool.Pool) error {
+	rows, err := pool.Query(ctx, `
+		SELECT tablename FROM pg_tables
+		WHERE schemaname = 'public' AND tablename <> 'goose_db_version'
+		ORDER BY tablename`)
+	if err != nil {
+		return err
+	}
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			rows.Close()
+			return err
+		}
+		names = append(names, pgx.Identifier{n}.Sanitize())
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	_, err = pool.Exec(ctx, "TRUNCATE "+strings.Join(names, ", ")+" RESTART IDENTITY CASCADE")
+	return err
 }
 
 // acquireDBLock opens a standalone connection and takes dbTestLockKey on it.

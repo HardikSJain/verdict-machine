@@ -23,6 +23,9 @@ type Fixture struct {
 	// refuse marks entities whose returns are refused, so a test can exercise
 	// the path a real succession boundary takes without seeding one.
 	refuse map[int64]string
+
+	// indices holds synthetic index series by code.
+	indices map[string][]DatedClose
 }
 
 // NewFixture builds an empty fixture over a session calendar.
@@ -34,6 +37,7 @@ func NewFixture(sessions []time.Time) *Fixture {
 		bars:     map[string]map[int64]Bar{},
 		universe: map[string][]Member{},
 		refuse:   map[int64]string{},
+		indices:  map[string][]DatedClose{},
 	}
 }
 
@@ -159,6 +163,32 @@ func (f *Fixture) Closes(_ context.Context, entityID int64, from, to time.Time) 
 		if b, ok := f.bars[key(d)][entityID]; ok {
 			out = append(out, DatedClose{Date: d, Close: b.Close})
 		}
+	}
+	return out, nil
+}
+
+// SetIndex records a synthetic index series.
+func (f *Fixture) SetIndex(code string, series []DatedClose) *Fixture {
+	f.indices[code] = append([]DatedClose(nil), series...)
+	sort.Slice(f.indices[code], func(i, j int) bool { return f.indices[code][i].Date.Before(f.indices[code][j].Date) })
+	return f
+}
+
+// IndexCloses returns the synthetic series clipped to the range.
+func (f *Fixture) IndexCloses(_ context.Context, code string, from, to time.Time) ([]DatedClose, error) {
+	if !from.Before(to) {
+		return nil, fmt.Errorf("engine: fixture index closes need from before to")
+	}
+	series, ok := f.indices[code]
+	if !ok {
+		return nil, fmt.Errorf("engine: fixture holds no index %q", code)
+	}
+	var out []DatedClose
+	for _, c := range series {
+		if c.Date.Before(from) || c.Date.After(to) {
+			continue
+		}
+		out = append(out, c)
 	}
 	return out, nil
 }

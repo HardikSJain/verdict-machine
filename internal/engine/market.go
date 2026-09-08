@@ -64,6 +64,13 @@ type Market interface {
 	// meaningless one, sitting above every post-split price and below every
 	// pre-split one.
 	Closes(ctx context.Context, entityID int64, from, to time.Time) ([]DatedClose, error)
+
+	// IndexCloses is an index's close series over a range, ascending, by
+	// canonical code. Indices need no succession fence -- an index is not
+	// reissued on a corporate action -- but they do have a rebranding problem
+	// of their own, handled in internal/market/nseindex before a name is ever
+	// mapped to a code.
+	IndexCloses(ctx context.Context, code string, from, to time.Time) ([]DatedClose, error)
 }
 
 // DatedClose is one session's close.

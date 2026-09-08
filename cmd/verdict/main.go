@@ -16,6 +16,7 @@ import (
 	"github.com/HardikSJain/verdict-machine/internal/market"
 	"github.com/HardikSJain/verdict-machine/internal/market/bhavcopy"
 	"github.com/HardikSJain/verdict-machine/internal/market/eod2"
+	"github.com/HardikSJain/verdict-machine/internal/market/nseindex"
 )
 
 // version is overridden at build time with -ldflags "-X main.version=...".
@@ -34,6 +35,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newBackfillCmd())
 	root.AddCommand(newUniverseCmd())
 	root.AddCommand(newEntitiesCmd())
+	root.AddCommand(newIndexCmd())
 	return root
 }
 
@@ -467,4 +469,120 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
+
+func newIndexCmd() *cobra.Command {
+	index := &cobra.Command{
+		Use:   "index",
+		Short: "NSE daily index archive: backfill and identity checks",
+	}
+	index.AddCommand(newIndexBackfillCmd())
+	index.AddCommand(newIndexCheckCmd())
+	return index
+}
+
+func newIndexBackfillCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "backfill",
+		Short: "Download NSE index archives into index_levels (source=nse-index); resumable",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			fromS, _ := cmd.Flags().GetString("from")
+			toS, _ := cmd.Flags().GetString("to")
+			delay, _ := cmd.Flags().GetDuration("delay")
+			from, err := time.Parse("2006-01-02", fromS)
+			if err != nil {
+				return fmt.Errorf("--from: %w", err)
+			}
+			to := time.Now().UTC()
+			if toS != "" {
+				if to, err = time.Parse("2006-01-02", toS); err != nil {
+					return fmt.Errorf("--to: %w", err)
+				}
+			}
+			url, err := databaseURL(cmd)
+			if err != nil {
+				return err
+			}
+			pool, err := db.Connect(cmd.Context(), url)
+			if err != nil {
+				return err
+			}
+			defer pool.Close()
+			sum, err := nseindex.Backfill(cmd.Context(), market.NewStore(pool), nseindex.NewFetcher(),
+				from, to, delay, cmd.ErrOrStderr())
+			fmt.Fprintf(cmd.OutOrStdout(),
+				"index backfill: fetched %d, no-file %d, errors %d, skipped %d, inserted %d levels\n",
+				sum.Fetched, sum.NoFile, sum.Errors, sum.Skipped, sum.Inserted)
+			return err
+		},
+	}
+	cmd.Flags().String("from", "2012-02-01", "first session date (YYYY-MM-DD)")
+	cmd.Flags().String("to", "", "last session date (default today)")
+	cmd.Flags().Duration("delay", 750*time.Millisecond, "pause between requests")
+	cmd.Flags().String("database-url", "", "Postgres URL (default $VERDICT_DATABASE_URL)")
+	return cmd
+}
+
+// newIndexCheckCmd verifies the alias table against the data it claims to
+// describe. A rebrand must leave the level alone; a name change that comes with
+// a rebasing is a different index wearing an old name and must not be merged.
+func newIndexCheckCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "check",
+		Short: "Verify every curated index alias: continuity across each rename, and gaps",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			tol, _ := cmd.Flags().GetFloat64("tolerance")
+			url, err := databaseURL(cmd)
+			if err != nil {
+				return err
+			}
+			pool, err := db.Connect(cmd.Context(), url)
+			if err != nil {
+				return err
+			}
+			defer pool.Close()
+			store := market.NewStore(pool)
+			pin := time.Now()
+			out := cmd.OutOrStdout()
+			var failures int
+
+			for _, code := range nseindex.CuratedCodes() {
+				names, err := nseindex.NamesFor(code)
+				if err != nil {
+					return err
+				}
+				changes, err := store.NameChanges(cmd.Context(), code, pin)
+				if err != nil {
+					return err
+				}
+				fmt.Fprintf(out, "%s  (%s)\n", code, strings.Join(names, " -> "))
+				if len(changes) == 0 {
+					fmt.Fprintf(out, "  no rename observed in the store\n")
+					continue
+				}
+				for _, c := range changes {
+					jump := c.Close/c.PrevClose - 1
+					status := "ok"
+					if jump > tol || jump < -tol {
+						status = "REBASED?"
+						failures++
+					}
+					fmt.Fprintf(out, "  %s %-16s %10.2f  ->  %s %-16s %10.2f   %+.2f%%  %s\n",
+						c.PrevDate.Format(time.DateOnly), c.FromName, c.PrevClose,
+						c.Date.Format(time.DateOnly), c.ToName, c.Close, 100*jump, status)
+				}
+			}
+			if failures > 0 {
+				fmt.Fprintf(out, "\n%d rename(s) moved the level by more than %.1f%%: that is a rebasing, not a rebrand, and those names must not share a code\n",
+					failures, 100*tol)
+				return fmt.Errorf("index check: %d suspect alias(es)", failures)
+			}
+			fmt.Fprintf(out, "\nall curated aliases continuous within %.1f%%\n", 100*tol)
+			return nil
+		},
+	}
+	cmd.Flags().Float64("tolerance", 0.06,
+		"maximum level change across a rename before it is treated as a rebasing")
+	cmd.Flags().String("database-url", "", "Postgres URL (default $VERDICT_DATABASE_URL)")
+	return cmd
 }

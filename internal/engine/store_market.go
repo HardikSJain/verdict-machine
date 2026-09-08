@@ -124,3 +124,16 @@ func (m *StoreMarket) Closes(ctx context.Context, entityID int64, from, to time.
 	}
 	return out, nil
 }
+
+// IndexCloses reads the NSE index archive.
+func (m *StoreMarket) IndexCloses(ctx context.Context, code string, from, to time.Time) ([]DatedClose, error) {
+	rows, err := m.store.IndexCloses(ctx, code, from, to, m.pin)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]DatedClose, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, DatedClose{Date: r.Date, Close: r.Close})
+	}
+	return out, nil
+}
