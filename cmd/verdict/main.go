@@ -367,6 +367,13 @@ func newEntitiesCmd() *cobra.Command {
 			"the run; a candidate whose own gap dates are unsettled is quarantined anyway.\n" +
 			"--skip-candidates runs the invariants alone, which is the right thing mid-backfill\n" +
 			"and on a store with no bars.\n\n" +
+			"The same scan re-runs the gates against the links the map ALREADY holds and\n" +
+			"prints a STALE line for every merged pair the gates no longer accept. Design 5.5's\n" +
+			"\"every gate is independently re-checkable\" is this leg, and nothing else in the\n" +
+			"system can say that a standing merge stopped passing its own gates. It is\n" +
+			"reported and does not fail the command: an applied hand-written line fails a gate\n" +
+			"by construction -- an INF fund-unit transfer fails G0 and G1 -- so failing on one\n" +
+			"would make the monthly item permanently red.\n\n" +
 			"What this cannot do: a wrong-but-DISJOINT merge -- a reverse-merger shell, a\n" +
 			"freed ticker reused by a different company -- is undetectable from inside the\n" +
 			"store, and no exit code here should be read as saying otherwise.\n\n" +
@@ -428,7 +435,8 @@ func newEntitiesCmd() *cobra.Command {
 					return fmt.Errorf("entities check: %w", err)
 				}
 			} else {
-				fmt.Fprintln(w, "# candidate scan skipped (--skip-candidates): this run says nothing about successions the map is missing")
+				fmt.Fprintln(w, "# candidate scan skipped (--skip-candidates): this run says nothing about successions the map is missing,"+
+					" and nothing about whether the links it already holds still pass their gates")
 			}
 
 			switch {

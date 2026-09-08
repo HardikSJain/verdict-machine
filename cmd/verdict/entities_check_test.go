@@ -240,3 +240,60 @@ func TestEntitiesProposeCommand_KeepsTheHandWrittenLineInTheFileItOverwrites(t *
 	require.NoError(t, err)
 	require.Empty(t, after.ManualLinks())
 }
+
+// TestEntitiesCheckCommand_ReportsAStandingLinkThatStoppedPassingItsGates is
+// the re-check leg through the CLI, including the decision not to fail on it.
+//
+// Design 5.5 rests on `verdict entities check` re-evaluating the gates against
+// the store, and until Stage 3 it did the opposite of that for links the map
+// already held: the pair was skipped before its gates were ever consulted, so
+// a merge that stopped passing was reported by nothing at all (design 5.6:
+// there is no other detector). The exit code deliberately does NOT change --
+// an applied hand-written line fails a gate by construction -- so both halves
+// are asserted here, because a report nobody prints and a check that goes
+// permanently red are the same failure from opposite ends.
+func TestEntitiesCheckCommand_ReportsAStandingLinkThatStoppedPassingItsGates(t *testing.T) {
+	pool := testutil.Pool(t)
+	store := market.NewStore(pool)
+	url := os.Getenv("VERDICT_TEST_DATABASE_URL")
+	dir := t.TempDir()
+	rosterPath := filepath.Join(dir, "roster.json")
+
+	// A three-calendar-day gap, inside G4b's cap, holding two weekdays the
+	// archive has not fetched from any symbol. G4 counts sessions out of
+	// bars, so it reads zero sessions between and accepts the pair.
+	predLast, boundary := market.Day(2017, 7, 31), market.Day(2017, 8, 3)
+	unfetched := [2]time.Time{market.Day(2017, 8, 1), market.Day(2017, 8, 2)}
+	checkSeries(t, store, checkCtrl, "CONTROL", checkFrom, predLast, 100, 100)
+	checkSeries(t, store, checkCtrl, "CONTROL", boundary, checkTo, 100, 100)
+	checkSeries(t, store, checkPred, "TATASTEEL", checkFrom, predLast, 959.4, 100.35)
+	checkSeries(t, store, checkSucc, "TATASTEEL", boundary, checkTo, 107.6, 110)
+	settleCheckArchive(t, pool)
+
+	_, err := runCmd(t, "entities", "propose", "--database-url", url,
+		"--out", rosterPath, "--review-out", filepath.Join(dir, "review.jsonl"))
+	require.NoError(t, err)
+	out, err := runCmd(t, "entities", "apply", "--database-url", url, "--roster", rosterPath)
+	require.NoError(t, err)
+	require.Contains(t, out, "# inserted 1 rows")
+
+	out, err = runCmd(t, "entities", "check", "--database-url", url)
+	require.NoError(t, err)
+	require.NotContains(t, out, "STALE", "the link is in the map and still passes every gate")
+	require.Contains(t, out, "# 0 linked pair(s) the gates no longer accept")
+
+	// A backfill now supplies the two sessions that were missing from the
+	// gap. Nothing about symbol_links changed; what changed is what G4 can
+	// see, and G4 is the gate that kills demergers.
+	checkSeries(t, store, checkCtrl, "CONTROL", unfetched[0], unfetched[1], 100, 100)
+
+	out, err = runCmd(t, "entities", "check", "--database-url", url)
+	require.NoError(t, err,
+		"an applied hand-written line fails a gate by construction, so this category may not fail the run -- a permanently red monthly item is one nobody reads")
+	require.Contains(t, out, "STALE\tlinked pair\t"+checkPred+" -> "+checkSucc)
+	require.Contains(t, out, "gates now failing: [G4 adjacent]",
+		"which gate stopped passing is the whole finding: the operator decides on it, and nothing else in the system can tell them")
+	require.Contains(t, out, "# 1 linked pair(s) the gates no longer accept")
+	require.Contains(t, out, "# 0 accepted candidate(s) the map does not carry",
+		"and it is not double-counted as a seed gap: the map carries this pair")
+}

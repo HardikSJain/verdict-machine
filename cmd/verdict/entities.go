@@ -441,6 +441,12 @@ func newEntitiesRetractCmd() *cobra.Command {
 // than a hole and does not stop the run; a candidate whose own gap dates are
 // unsettled fails its own G4a and is quarantined, so nothing is admitted by
 // the narrower refusal.
+//
+// STALE lines are the other direction, and they are the re-check design §5.5
+// promises: a pair the map ALREADY carries whose gates the archive no longer
+// accepts. They print with the gates that now fail and do not change the exit
+// code -- an applied `manual` line fails a gate by construction and would
+// otherwise turn the monthly item permanently red.
 func scanCandidates(ctx context.Context, pool *pgxpool.Pool, store *market.Store, asOfIngest time.Time, w io.Writer) (int, error) {
 	_, cands, _, err := entities.Propose(ctx, pool, entities.ProposeOptions{AsOfIngest: asOfIngest})
 	if err != nil {
@@ -450,12 +456,18 @@ func scanCandidates(ctx context.Context, pool *pgxpool.Pool, store *market.Store
 	if err != nil {
 		return 0, err
 	}
-	gaps, queue := entities.UnlinkedCandidates(cands, entityOf)
+	gaps, queue, stale := entities.UnlinkedCandidates(cands, entityOf)
 	for _, c := range gaps {
 		fmt.Fprintf(w, "UNLINKED\tcandidate\t%s -> %s\t%s\tboundary %s\n",
 			c.Predecessor, c.Successor, c.TickerAfter, c.SuccessorSpn[0])
 	}
+	for _, c := range stale {
+		fmt.Fprintf(w, "STALE\tlinked pair\t%s -> %s\t%s\tboundary %s\tgates now failing: %v\n",
+			c.Predecessor, c.Successor, c.TickerAfter, c.SuccessorSpn[0], c.FailedGates)
+	}
 	fmt.Fprintf(w, "# %d accepted candidate(s) the map does not carry, %d quarantined candidate(s) it does not carry either"+
 		" (the queue: reported, not a defect), %d candidate(s) generated\n", len(gaps), len(queue), len(cands))
+	fmt.Fprintf(w, "# %d linked pair(s) the gates no longer accept (re-checked against the store, reported and not fatal:"+
+		" an applied hand-written line fails a gate by construction)\n", len(stale))
 	return len(gaps), nil
 }
