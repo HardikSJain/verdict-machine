@@ -391,9 +391,10 @@ Monthly, on a settled archive:
    it is pointed at, and every generated line in it is regenerated from `bars` — but the
    hand-written `manual` lines are read out of the old file first (before a connection is
    even opened) and **carried across**, printed as `# kept hand-written line …`.
-   `--discard-manual` is the only way to lose one; it names each line it drops, with the one
-   exception that a roster which no longer parses has no readable lines to name — and without
-   the flag, a roster that will not parse stops the run rather than being overwritten. And
+   `--discard-manual` is the only way to lose one, and it prints how many lines it dropped
+   and which file they were in (not which lines: keep a copy first). The one silent case is a
+   roster that no longer parses — under the flag there is nothing readable left to count, and
+   without it an unparseable roster stops the run rather than being overwritten. And
    `boundary_ratio_matches` — G6, the one non-gating-on-structure gate — admits an
    arbitrary cross-company price splice **41.5% of the time** on this archive (judgement
    call 5 below, with the SQL). It is weak evidence, not near-certain rejection, and it is
@@ -786,8 +787,9 @@ that have one. Until `adjustments` exists the only safe use of them is to **refu
 **Both are INERT today, and the guard you write against them will not fire.** `symbol_links`
 is empty on the live store, so `EntityBoundaries` returns an empty map for every entity id it
 is handed and `LastBreak` is nil for every member: `verdict universe --as-of 2026-09-04
---lookback 125` prints `0 of 2127 members carry a succession boundary at or before as-of` (run
-2026-09-08). One thing changes that, and it is not a code change: a human running
+--lookback 125 --n 100000` prints `0 of 2127 members carry a succession boundary at or before
+as-of` (run 2026-09-08; the `--n` lifts the default top-500 limit so the count covers the whole
+ranking). One thing changes that, and it is not a code change: a human running
 `verdict entities apply` over the reviewed roster. Write the guard anyway — the alternative is
 finding it missing on the day the map is seeded, which is the day the danger starts — but do
 not read a green run against the live store as evidence that it works, because a guard that
@@ -844,7 +846,7 @@ member, 2011-09-02 to 2022-07-28**. That is not a fault in the query: the live m
 so entity 326 is still only the pre-2022 TATASTEEL symbol and the series stops dead at the
 split. It is the fragmentation this section exists to describe, and it is what the query will
 keep returning until a human applies the roster — after which the same query spans both
-members and runs to the present.
+members (symbol 3 carries 1,018 more sessions, 2022-07-29 to 2026-09-07).
 
 `entity_map_now` is the interactive convenience and is **never valid for replay**. It carries
 no `ingested_at` bound at all, so a caller who pinned `UniverseAsOf` at T and joins its
@@ -858,8 +860,8 @@ document names.
 **One rule, two expressions — not one definition, and the difference matters to whoever
 changes it.** `market.Store.EntityMapAt` is the Go door onto `entity_map_at(ts)`, and
 `verdict entities check` is the only command that goes through it. The read path does not:
-`UniverseAsOf` and `BarsForDate` — and therefore `verdict universe`, the only CLI command a
-reader runs that touches bars — build the same `ingested_at <= pin` resolution inline as a CTE
+`UniverseAsOf` and `BarsForDate` — and therefore `verdict universe`, the command a reader of
+this section will actually run — build the same `ingested_at <= pin` resolution inline as a CTE
 (`entityMapCTE`, `internal/market/entity.go`), because they need it in one statement beside the
 member and label CTEs. The two are the same rule written twice: the SQL function a notebook
 calls, and the Go-built CTE the readers embed. Nothing makes them agree by construction —
@@ -929,13 +931,14 @@ at `--as-of 2026-09-04 --lookback 125` (2,127 entities) and `BarsForDate` for th
 (2,633 rows) were row-for-row identical to the pre-change queries, and the entity label agreed
 with the per-symbol label for 4,100 of 4,100 symbols on each of six sampled dates. Migration
 0004 has since been applied to `verdict` (2026-09-08, `goose_db_version` = 4, `symbol_links`
-present and holding 0 rows), so the shadow is no longer needed: the binary at this HEAD reads
-the store directly and `verdict universe --as-of 2026-09-04 --lookback 125` returns the same
-2,127 entities against the real empty table. **That equivalence is weak evidence and must not
-be cited as though it were strong**: with no link rows every entity is a singleton and the
-two queries are identical by construction, so it can only rule out a regression for unlinked
-symbols. It says nothing about the multi-member path. The full design, its staging and its
-test plan are in `.superpowers/sdd/2026-09-07-m0-scaffold/isin-design.md`.
+present and holding 0 rows), so the shadow is no longer needed. The binary at this HEAD reads
+the store directly, and `verdict universe --as-of 2026-09-04 --lookback 125 --n 100000`
+returns the same 2,127 entities against the real empty table. **That equivalence is weak
+evidence and must not be cited as though it were strong**: with no link rows every entity is a
+singleton and the two queries are identical by construction, so it can only rule out a
+regression for unlinked symbols. It says nothing about the multi-member path. The full design,
+its staging and its test plan are in
+`.superpowers/sdd/2026-09-07-m0-scaffold/isin-design.md`.
 
 Two judgement calls made while implementing Stage 1, recorded here because they resolve
 places where that document says two things:
@@ -1324,9 +1327,9 @@ same spirit as the two stages before it.
 assumed rather than checked** (re-verified read-only 2026-09-08): the `verdict` database is at
 `goose_db_version` **4**. `symbol_links` exists there and holds **0 rows**, and
 `entity_map_at` / `entity_map_now` are published. A binary built from this branch therefore
-reads the store: `verdict universe --as-of 2026-09-04 --lookback 125` returns 2,127 entities
-and the header line `0 of 2127 members carry a succession boundary at or before as-of`. What
-has **not** happened is the `apply`, and the monthly item says so out loud --
+reads the store: `verdict universe --as-of 2026-09-04 --lookback 125 --n 100000` returns
+2,127 entities and the header line `0 of 2127 members carry a succession boundary at or before
+as-of`. What has **not** happened is the `apply`, and the monthly item says so out loud --
 `verdict entities check` against that store today prints 444 `UNLINKED candidate` lines and
 exits non-zero with "444 accepted candidate(s) the map does not carry" (181 quarantined, 625
 generated, about five seconds). That is the control working, not a fault: the roster is
