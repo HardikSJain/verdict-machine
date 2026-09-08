@@ -489,9 +489,43 @@ only while `verify` stays green. A one-page runbook.
   backtest reports per-trade mean and standard deviation.
 - Forward-test repo: separate public repo (recommended) or a folder in the code repo.
 - Exact DP charge per sell per scrip and any charge-schedule changes since the last
-  TradeLabs snapshot: verified by the contract-note reconciliation in Next Steps.
+  TradeLabs snapshot: verified by the contract-note reconciliation in Next Steps. Zerodha's
+  rate card reads ₹13 + 18% GST = ₹15.34 (₹12.75 + GST = ₹15.05 where the primary holder is
+  a woman), charged once per scrip per day however many times that scrip is sold. That is
+  the figure the reconciliation has to land on, not a substitute for landing on it, since a
+  rate card is not evidence of what was actually debited.
 
 ### Resolved
+
+- **Which broker executes (2026-09-08).** Zerodha, and this was an unexamined assumption
+  until now: the builder's actual portfolio sits at Angel One and the Kite account holds a
+  single stock. The decision is to fund Kite with the algo's play-tier capital and leave the
+  Angel One holdings untouched. Reasons, in order of weight. **Cost**: equity delivery
+  brokerage is ₹0 at Zerodha against ₹20-or-0.1%-min-₹5 per order at Angel One, and the DP
+  charge is ₹13+GST = ₹15.34 per scrip per sell against ₹20+GST = ₹23.60. A 20-name monthly
+  rebalance at five swaps a month is 120 orders and 60 sells a year, so roughly ₹920/yr at
+  Zerodha against ₹2,600-3,800 at Angel One. That gap is fixed in rupees, so on a small book
+  it is 1 to 1.5% a year, a large fraction of whatever edge a momentum rule has.
+  **Separation**: the algo's P&L stays uncontaminated by discretionary trades, which is what
+  makes the M4 gate readable at all. **No rework**: Publisher baskets, Kite Connect and the
+  daily-login constraint above all stand as designed. API cost is *not* a reason either way,
+  and should not be quoted as one: Kite Connect order placement is free and Angel One's
+  SmartAPI is free including data, while this project needs neither broker's historical data
+  because it has its own. The one thing not checked, and the only thing that would reopen
+  this: whether Angel One has a Publisher-basket equivalent, i.e. a free phase-1 path with
+  manual confirm and no static IP. It was not researched because the cost argument settles it
+  regardless.
+- **Which contract note the golden test is built from (2026-09-08).** Both, for different
+  lines. Every charge except brokerage and DP is statutory -- STT, exchange transaction
+  charges, SEBI turnover fee, stamp duty, and the GST on them -- and identical at every
+  Indian broker, so any real note validates them. The Kite account's single holding supplies
+  a Zerodha delivery *buy* against the executing broker itself. An Angel One note with a
+  delivery sell supplies the sell-side lines the Kite account cannot: sell-side STT, and a DP
+  charge whose *structure* (flat, per scrip, per sell day, quantity-independent) is what the
+  test pins, with Zerodha's ₹15.34 substituted for Angel One's ₹23.60 as a constant. Note
+  that DP charges appear on neither broker's contract note -- they are on the funds
+  statement/ledger -- which is the trap this decision exists to avoid, since the ~₹10k
+  minimum-notional rule in RiskGate v1 is derived from that charge alone.
 
 - **Whether eod2 retains delisted symbols' history (M0).** It does not: eod2 is
   survivor-only -- DHFL and JETAIRWAYS 404 in its `daily/` directory, while NSE's own
