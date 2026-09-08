@@ -932,10 +932,10 @@ with the per-symbol label for 4,100 of 4,100 symbols on each of six sampled date
 present and holding 0 rows), so the shadow is no longer needed: the binary at this HEAD reads
 the store directly and `verdict universe --as-of 2026-09-04 --lookback 125` returns the same
 2,127 entities against the real empty table. **That equivalence is weak evidence and must not
-be cited as though it were strong**: with no link rows every entity is a singleton and the two queries
-are identical by construction, so it can only rule out a regression for unlinked symbols. It
-says nothing about the multi-member path. The full design, its staging and its test plan are
-in `.superpowers/sdd/2026-09-07-m0-scaffold/isin-design.md`.
+be cited as though it were strong**: with no link rows every entity is a singleton and the
+two queries are identical by construction, so it can only rule out a regression for unlinked
+symbols. It says nothing about the multi-member path. The full design, its staging and its
+test plan are in `.superpowers/sdd/2026-09-07-m0-scaffold/isin-design.md`.
 
 Two judgement calls made while implementing Stage 1, recorded here because they resolve
 places where that document says two things:
