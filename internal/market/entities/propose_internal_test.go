@@ -282,3 +282,151 @@ func TestApplyPathGateQuarantinesBothSidesOfAConflict(t *testing.T) {
 	require.Equal(t, []string{G4}, dead.FailedGates)
 	require.Empty(t, live.FailedGates)
 }
+
+// pairsOf flattens a generated candidate list into (predecessor, successor)
+// pairs in the order the generator emitted them.
+func pairsOf(cands []*Candidate) [][2]string {
+	out := make([][2]string, 0, len(cands))
+	for _, c := range cands {
+		out = append(out, [2]string{c.Predecessor, c.Successor})
+	}
+	return out
+}
+
+func TestGenerateChainsConsecutiveMembersOnly(t *testing.T) {
+	// The single most consequential property of the generator, and the one
+	// `Roster.Validate` is least able to see: a company with three ISINs must
+	// produce TWO links, first->second and second->third, and never
+	// first->third.
+	//
+	// A first->third link passes every gate it is asked. G1 holds (same
+	// issuer), G2 holds (01 -> 03 increases), G3 holds (the spans are
+	// disjoint), G6 holds if the two closes happen to land in a band -- and
+	// G4 is the only thing standing between it and acceptance, on the
+	// accident that the SECOND ISIN traded in the gap. It would then reach
+	// `applyPathGate` as a second claim on the third ISIN, quarantining the
+	// GENUINE second->third link along with it: one bad pair silently
+	// removing a real company from the map. The whole shape argument -- "the
+	// generated graph is a set of paths rather than a mesh" -- rests on this
+	// loop pairing g[i] with g[i+1] only.
+	facts := map[int64]*symbolFacts{
+		1: factsFor(1, "INE777C01011", "POCL", dt(2015, 3, 2), dt(2019, 5, 24), 100, 100),
+		2: factsFor(2, "INE777C01029", "POCL", dt(2019, 5, 27), dt(2022, 1, 2), 100, 100),
+		3: factsFor(3, "INE777C01037", "POCL", dt(2022, 1, 3), dt(2026, 9, 4), 100, 100),
+	}
+	got := pairsOf(generate(facts))
+	require.Equal(t, [][2]string{
+		{"INE777C01011", "INE777C01029"},
+		{"INE777C01029", "INE777C01037"},
+	}, got, "two consecutive links, and no first-to-third")
+
+	// A four-ISIN chain is three pairs, not six: the live archive holds one
+	// such company and 29 chains of three.
+	facts[4] = factsFor(4, "INE777C01045", "POCL", dt(2026, 9, 5), dt(2026, 9, 7), 100, 100)
+	require.Len(t, generate(facts), 3)
+
+	// Members are ordered by their SPANS, not by the serial and not by the
+	// symbol_id: the registry assigns ids in discovery order, and 8.14's
+	// fixture registers every successor before its predecessor precisely
+	// because that is the live store's shape.
+	scrambled := map[int64]*symbolFacts{
+		9: factsFor(9, "INE777C01011", "POCL", dt(2015, 3, 2), dt(2019, 5, 24), 100, 100),
+		7: factsFor(7, "INE777C01029", "POCL", dt(2019, 5, 27), dt(2022, 1, 2), 100, 100),
+		8: factsFor(8, "INE777C01037", "POCL", dt(2022, 1, 3), dt(2026, 9, 4), 100, 100),
+	}
+	require.Equal(t, got, pairsOf(generate(scrambled)))
+
+	// And a symbol that is alone in its issuer group produces nothing at all,
+	// which is the ~3,600 names that never changed ISIN.
+	require.Empty(t, generate(map[int64]*symbolFacts{
+		1: factsFor(1, "INE666D01014", "CONTROL", dt(2015, 3, 2), dt(2026, 9, 4), 100, 100),
+	}))
+}
+
+func TestGenerateEmitsEachPairOnceAcrossBothGenerators(t *testing.T) {
+	// Both generators run over the same symbols. The ticker pass exists to
+	// SURFACE the fund-unit cases, and on an equity chain whose ticker never
+	// changed it re-finds the identical pair. Emitting it twice would give
+	// the successor two identical claims, and `applyPathGate` -- which counts
+	// claims and does not compare them -- would quarantine the pair as a
+	// merge point with itself.
+	facts := map[int64]*symbolFacts{
+		1: factsFor(1, "INE081A01012", "TATASTEEL", dt(2015, 3, 2), dt(2022, 7, 28), 100, 100),
+		2: factsFor(2, "INE081A01020", "TATASTEEL", dt(2022, 7, 29), dt(2026, 9, 4), 100, 100),
+	}
+	cands := generate(facts)
+	require.Len(t, cands, 1)
+	require.Equal(t, "issuer-prefix", cands[0].Generator,
+		"the ISIN-keyed pass runs first, so it is the one recorded")
+	applyPathGate(cands)
+	require.Empty(t, cands[0].FailedGates, "a pair found twice is one candidate, not a merge point")
+
+	// The ticker pass on its own is what the fund units need: no INE prefix
+	// exists to group INF732E01011 with INF204KB14I2, so only the shared
+	// ticker pairs them, and they land in the review file as design 5.4 asks.
+	units := map[int64]*symbolFacts{
+		1: factsFor(1, "INF732E01011", "NIFTYBEES", dt(2015, 3, 2), dt(2019, 12, 19), 100, 100),
+		2: factsFor(2, "INF204KB14I2", "NIFTYBEES", dt(2019, 12, 20), dt(2026, 9, 4), 100, 100),
+	}
+	cands = generate(units)
+	require.Len(t, cands, 1)
+	require.Equal(t, "ticker", cands[0].Generator)
+}
+
+func TestGenerateIsDeterministicAndSoIsTheRosterDigest(t *testing.T) {
+	// The roster's sha256 is stamped into every row `apply` writes and is the
+	// only thing pointing an irreversible merge back at a reviewed diff. It
+	// is taken over the roster's canonical form, so it is stable under
+	// re-ordering -- but only if the generator's OUTPUT is stable, and
+	// `generate` starts from a map. Go randomises map iteration on every
+	// range, so an unsorted group key or an unsorted group would give the
+	// same store a different roster, a different digest, and a monthly ops
+	// diff that churns for no reason. Once, by luck, is not evidence: this
+	// runs the whole thing repeatedly.
+	facts := func() map[int64]*symbolFacts {
+		return map[int64]*symbolFacts{
+			1:  factsFor(1, "INE777C01011", "POCL", dt(2015, 3, 2), dt(2019, 5, 24), 100, 100),
+			2:  factsFor(2, "INE777C01029", "POCL", dt(2019, 5, 27), dt(2022, 1, 2), 100, 100),
+			3:  factsFor(3, "INE777C01037", "POCL", dt(2022, 1, 3), dt(2026, 9, 4), 100, 100),
+			4:  factsFor(4, "INE081A01012", "TATASTEEL", dt(2015, 3, 2), dt(2022, 7, 28), 100, 100),
+			5:  factsFor(5, "INE081A01020", "TATASTEEL", dt(2022, 7, 29), dt(2026, 9, 4), 100, 100),
+			6:  factsFor(6, "INE090A01013", "ICICIBANK", dt(2015, 3, 2), dt(2019, 5, 24), 100, 100),
+			7:  factsFor(7, "INE090A01021", "ICICIBANK", dt(2019, 5, 27), dt(2026, 9, 4), 100, 100),
+			8:  factsFor(8, "INF732E01011", "NIFTYBEES", dt(2015, 3, 2), dt(2019, 12, 19), 100, 100),
+			9:  factsFor(9, "INF204KB14I2", "NIFTYBEES", dt(2019, 12, 20), dt(2026, 9, 4), 100, 100),
+			10: factsFor(10, "INE666D01014", "CONTROL", dt(2015, 3, 2), dt(2026, 9, 4), 100, 100),
+		}
+	}
+	sessions := []time.Time{}
+	settled := map[time.Time]bool{}
+	for d := dt(2015, 3, 2); !d.After(dt(2026, 9, 7)); d = d.AddDate(0, 0, 1) {
+		settled[d] = true
+	}
+
+	run := func() ([][2]string, string) {
+		cands := generate(facts())
+		for _, c := range cands {
+			gate(c, sessions, settled, 0)
+		}
+		applyPathGate(cands)
+		r := &Roster{Version: RosterVersion}
+		for _, c := range cands {
+			if c.Accepted() {
+				r.Links = append(r.Links, c.link(ProposeOptions{}))
+			}
+		}
+		b, err := r.Marshal()
+		require.NoError(t, err)
+		require.NotEmpty(t, r.Digest)
+		require.NoError(t, r.Validate())
+		return pairsOf(cands), string(b)
+	}
+
+	wantPairs, wantFile := run()
+	require.NotEmpty(t, wantPairs)
+	for i := 0; i < 32; i++ {
+		pairs, file := run()
+		require.Equal(t, wantPairs, pairs, "the candidate order is a function of the facts, not of map iteration")
+		require.Equal(t, wantFile, file, "and so are the roster's bytes, including its stated sha256")
+	}
+}
