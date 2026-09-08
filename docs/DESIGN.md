@@ -612,6 +612,59 @@ only while `verify` stays green. A one-page runbook.
   test for `internal/cost`; charges are the number that decided the sign in 38 of
   TradeLabs' experiments.
 
+## `internal/cost` has landed (M1 PR 2), and the note changed the model
+
+Built against a real Angel One contract note (2026-09-07, NSE cash, BUY 98 NIFTYBEES at 272.29,
+turnover 26,684.42) rather than a rate card. `TestGoldenContractNote` reproduces all eleven lines
+to the paisa from the rates, and the model would have been wrong without the document.
+
+**The finding that justified the whole exercise.** The note PRINTS CGST 1.88 and SGST 1.88. They
+sum to 3.76. The obligation total, 26,713.02, only reconciles at **3.75**. So **GST is computed
+once at 18% of the taxable value and rounded once**; the halves are a display split, each rounded
+independently. No rate card says this. A model built from published rates computes 9% twice, runs
+a paisa heavy on roughly half of all trades forever, and passes every test that has no real
+document behind it. Mutating the implementation to the two-halves form fails the golden test by
+exactly 0.01, which is the whole point.
+
+Three more things the note settled that memory or a search would have got wrong: the NSE cash
+transaction charge is **0.0030699%**, not the widely quoted 0.00297% (which reconciles to 0.79
+against the note's 0.82); stamp duty on delivery is **0.015%** and the 0.002% several sources
+quote is the non-delivery rate; and **buying units of an equity-oriented fund carries no STT at
+all** where a share carries 0.1%, so the ETF control strategy and the equity strategy do not share
+a tax rule.
+
+**Every rate carries provenance, and `Verified` means one thing: a document held in this
+repository reconciles it to the paisa.** A rate card is not verification. `Charges.Unverified`
+names every component that leaned on an unreconciled rate, and the backtest report is required to
+print that list beside its result. A backtest on unverified rates is *not* refused -- that would
+leave the project unable to test anything -- but it cannot come back looking like one that did not.
+Two entries are marked WRONG BY CONSTRUCTION rather than merely unverified: GST before 2017-07-01
+(service tax applied, at 15% and lower earlier) and stamp duty before 2020-07-01 (levied state by
+state, with no single national rate to apply at all). Every backtest session before those dates
+carries the flag. Stock STT and both DP charges are unverified pending a Kite contract note and
+ledger; the ETF buy path is fully verified.
+
+**The DP charge is unreachable from `Trade()` by construction.** It is on no contract note -- it
+is on the funds statement -- and it is levied per scrip per SELL DAY regardless of how many clips
+the position was sold in. `Schedule.Day` is the only path to it, and it refuses trades from another
+session rather than levying one charge where two were due. Pricing it per trade would double-count
+a clipped exit; forgetting it under-reports on exactly the small orders where it dominates.
+
+**Which is where RiskGate v1's minimum notional actually comes from.** Round-trip cost, computed:
+
+| notional | Zerodha | Angel One |
+|---|---|---|
+| ₹10,000 | **0.376%** | 0.695% |
+| ₹50,000 | 0.253% | 0.364% |
+| ₹1,00,000 | 0.238% | 0.293% |
+
+So the design's ~₹10,000 floor clears its own 0.5% round-trip rule at Zerodha and does **not** at
+Angel One, where the floor would have to be nearer ₹30,000. The floor is broker-dependent and the
+broker decision recorded above is what makes ₹10,000 the right number. Note also the asymptote:
+0.238% at a lakh is almost entirely STT at 0.1% a side, which no size and no broker removes. **A
+delivery strategy pays at least ~0.2% per round trip, forever**, and that is the hurdle the first
+backtest has to clear before anything else about it is interesting.
+
 ## Reviewer Concerns
 
 Three rounds of adversarial review (scores 7, 7, 8 of 10). The four issues from the final
