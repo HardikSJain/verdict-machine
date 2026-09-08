@@ -541,10 +541,11 @@ only while `verify` stays green. A one-page runbook.
   Before the change the two halves were disjoint and could not be differenced by accident;
   now they can. `UniverseMember.LastBreak` carries the most recent boundary at or before
   `asOf` and `verdict universe` prints it as `last_break`.
-  **The fence is INERT while the live map is empty**, which it is: `EntityBoundaries` returns
-  an empty map and `LastBreak` is nil for every member, so the guard you write today never
-  fires and cannot be seen to work. `verdict entities apply` over the reviewed roster -- a
-  human's decision, not yet taken -- is what makes it live. Test the guard against a seeded
+  **The fence is LIVE.** The reviewed roster was ratified and applied on 2026-09-08
+  (444 links across 415 entities), so `EntityBoundaries` returns real boundaries and
+  `LastBreak` is populated: at as-of 2026-09-04, 113 of the top 500 members carry one, and
+  `verdict universe` prints the warning above every such run. A guard written today can be
+  seen to fire. It was inert before that apply, which is why this paragraph used to say so. Test the guard against a seeded
   map (`verdict_test`, as `internal/market/entities`' fixtures do), never against `verdict`.
   **(b) `runs` must record `snapshot_id` computed over the amended row set including
   `symbol_links`, and `config_hash` including the roster digest.** See the data model and
