@@ -34,24 +34,56 @@ var wantHeader = []string{
 	"Volume", "Turnover (Rs. Cr.)", "P/E", "P/B", "Div Yield",
 }
 
-// dateFmts are the layouts the archive's Index Date column has actually used.
+// dateFmts are the layouts the archive's Index Date column has actually used,
+// and the last of them is why this is a list rather than a constant.
 //
-// It is hyphenated in every file sampled by hand, and then a backfill over
-// 3,600 sessions found "09/06/2014" -- NSE switched to slashes for stretches of
-// 2014 and 2015 and switched back. This is the same class of defect as the
-// two-digit year in the 2020-07-13 equity bhavcopy that cost M0 1,392 bars: the
-// archive is mostly consistent, and the exceptions are invisible until
-// something reads every file.
-var dateFmts = []string{"02-01-2006", "02/01/2006"}
+// Hyphenated day-first is the norm. A backfill over 3,600 sessions found two
+// departures, neither visible to hand-sampling:
+//
+//   - Slashes for stretches of 2014 and 2015 ("09/06/2014"), then back.
+//   - **Month-first for a handful of April 2023 sessions**, inconsistently
+//     inside the same week: the file at .../ind_close_all_06042023.csv carries
+//     "04-06-2023" and the one at .../ind_close_all_12042023.csv carries
+//     "12-04-2023". Month-first and day-first are indistinguishable whenever
+//     both numbers are 12 or less, so this cannot be resolved by reading the
+//     string.
+//
+// The filename is therefore the authority, and parseDate is handed the session
+// it is supposed to be: a layout is accepted only if it reproduces that date.
+// Without it, 2023-04-10's levels would have been filed under 2023-10-04, which
+// is a real Wednesday session -- silent corruption rather than a loud failure.
+// This is the same shape as M0's two-digit year in the 2020-07-13 bhavcopy: the
+// archive is mostly consistent, and its exceptions surface only when something
+// reads every file.
+var dateFmts = []string{"02-01-2006", "02/01/2006", "01-02-2006", "01/02/2006"}
 
-func parseDate(s string) (time.Time, error) {
-	s = strings.TrimSpace(s)
+// parseDate decodes the Index Date column against the session the file was
+// requested for.
+//
+// Trying layouts until one MATCHES rather than until one parses is the whole
+// point. It cannot mask a genuinely wrong file: if the archive served another
+// session entirely, no layout reproduces the requested date and the caller
+// still errors.
+func parseDate(raw string, want time.Time) (time.Time, error) {
+	raw = strings.TrimSpace(raw)
+	var parsed []string
 	for _, f := range dateFmts {
-		if d, err := time.Parse(f, s); err == nil {
-			return time.Date(d.Year(), d.Month(), d.Day(), 0, 0, 0, 0, time.UTC), nil
+		d, err := time.Parse(f, raw)
+		if err != nil {
+			continue
 		}
+		got := time.Date(d.Year(), d.Month(), d.Day(), 0, 0, 0, 0, time.UTC)
+		if got.Equal(want) {
+			return got, nil
+		}
+		parsed = append(parsed, got.Format(time.DateOnly))
 	}
-	return time.Time{}, fmt.Errorf("date %q matches none of %v", s, dateFmts)
+	if len(parsed) == 0 {
+		return time.Time{}, fmt.Errorf("date %q matches none of %v", raw, dateFmts)
+	}
+	return time.Time{}, fmt.Errorf(
+		"date %q reads as %s under every layout tried, none of them the requested %s; the archive served the wrong session",
+		raw, strings.Join(parsed, " or "), want.Format(time.DateOnly))
 }
 
 // Parse reads one session's index CSV.
@@ -116,14 +148,9 @@ func Parse(r io.Reader, wantDate time.Time) ([]market.IndexLevel, []string, erro
 		if name == "" || count[name] > 1 {
 			continue
 		}
-		d, err := parseDate(rec[1])
+		d, err := parseDate(rec[1], wantDate)
 		if err != nil {
 			return nil, nil, fmt.Errorf("index csv: %s: %w", name, err)
-		}
-		if !d.Equal(wantDate) {
-			return nil, nil, fmt.Errorf(
-				"index csv: %s carries date %s in a file requested for %s; the archive served the wrong session",
-				name, d.Format(time.DateOnly), wantDate.Format(time.DateOnly))
 		}
 		close, err := num(rec[5])
 		if err != nil {

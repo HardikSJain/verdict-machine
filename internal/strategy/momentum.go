@@ -92,11 +92,17 @@ func (m *Momentum) Journal() Journal { return m.journal }
 type Journal struct {
 	Rebalances      int
 	RiskOffSessions int
-	Liquidations    int
-	ReturnsRefused  int
-	ReturnsAbsent   int
-	RefusedByScrip  map[string]int
-	Rankings        []Ranking
+	// UnknownSessions counts sessions the filter could not read at all --
+	// warm-up, or a session missing from the index archive. They are counted
+	// apart from RiskOffSessions because sitting out on a signal and sitting
+	// out on a gap are different facts about a backtest.
+	UnknownSessions   int
+	LastUnknownReason string
+	Liquidations      int
+	ReturnsRefused    int
+	ReturnsAbsent     int
+	RefusedByScrip    map[string]int
+	Rankings          []Ranking
 }
 
 // Ranking is one rebalance's view, kept so a report can show what was ranked
@@ -115,11 +121,19 @@ func (m *Momentum) Decide(ctx context.Context, s engine.Session) ([]risk.Intent,
 		return nil, err
 	}
 
-	on, why, err := m.Filter.RiskOn(ctx, s)
+	stance, why, err := m.Filter.Stance(ctx, s)
 	if err != nil {
 		return nil, err
 	}
-	if !on {
+	if stance == Unknown {
+		// The filter cannot see. Hold what is held, open nothing, and record
+		// it: a session sat out for want of data must not look like a session
+		// sat out on a signal.
+		m.journal.UnknownSessions++
+		m.journal.LastUnknownReason = why
+		return nil, nil
+	}
+	if stance == RiskOff {
 		m.journal.RiskOffSessions++
 		// Liquidate whatever is held, on any session, not only a rebalance
 		// one. The design says the book goes to cash when the trend breaks and

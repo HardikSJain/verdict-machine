@@ -110,7 +110,9 @@ func run(url, code, etf string, tol float64) error {
 	fmt.Printf("  index only      %5d\n", indexOnly)
 	fmt.Printf("  equity only     %5d\n", equityOnly)
 	if indexOnly > 0 || equityOnly > 0 {
-		fmt.Printf("  -> two independently loaded files disagree about which days NSE traded\n")
+		fmt.Printf("  -> the two files disagree about which days NSE traded; each one is a session\n")
+		fmt.Printf("     one archive has and the other does not, and the filter must not read a\n")
+		fmt.Printf("     missing index close as a signal\n")
 		if err := printCalendarGaps(ctx, pool, first); err != nil {
 			return err
 		}
@@ -135,6 +137,13 @@ func run(url, code, etf string, tol float64) error {
 		fmt.Printf("  correlation                 %.4f\n", stat.corr)
 		fmt.Printf("  mean absolute difference    %.4f%%\n", 100*stat.mad)
 		fmt.Printf("  worst single session        %.4f%% on %s\n", 100*stat.worst, stat.worstDate.Format(time.DateOnly))
+		if len(stat.Excluded) > 0 {
+			fmt.Printf("  excluded as corporate actions in %s (>%.0f%% in a day, which is not tracking error):\n",
+				etf, 100*corporateActionThreshold)
+			for _, d := range stat.Excluded {
+				fmt.Printf("     %s\n", d.Format(time.DateOnly))
+			}
+		}
 		if stat.corr < 0.95 || stat.mad > tol {
 			fmt.Printf("  -> the index and the ETF that tracks it disagree; one of the two loaders is wrong\n")
 			failures++
@@ -242,7 +251,17 @@ type tracking struct {
 	mad       float64
 	worst     float64
 	worstDate time.Time
+	// Excluded are sessions where the two series disagree by more than a
+	// quarter. An ETF tracking an index cannot miss by 25% in a day through
+	// tracking error; that is a corporate action in the ETF, and leaving one in
+	// destroys the statistic it is supposed to inform. NIFTYBEES did a 1:10
+	// unit split on 2019-12-19 -- 1292.54 to 130.20 -- and that single session
+	// dragged the correlation from 0.99 to 0.50.
+	Excluded []time.Time
 }
+
+// corporateActionThreshold is what counts as "not tracking error".
+const corporateActionThreshold = 0.25
 
 // trackingStats compares two series' DAILY RETURNS rather than their levels.
 // Levels cannot be compared: the ETF is roughly a hundredth of the index and
@@ -284,21 +303,44 @@ func trackingStats(a, b []market.DatedClose) (tracking, error) {
 	}
 	mx /= float64(len(xs))
 	my /= float64(len(ys))
+	// Drop corporate actions before computing anything, including the means.
+	var fx, fy []float64
+	var fd, excluded []time.Time
+	for i := range xs {
+		if math.Abs(xs[i]-ys[i]) > corporateActionThreshold {
+			excluded = append(excluded, dates[i])
+			continue
+		}
+		fx = append(fx, xs[i])
+		fy = append(fy, ys[i])
+		fd = append(fd, dates[i])
+	}
+	if len(fx) < 30 {
+		return tracking{}, fmt.Errorf("only %d comparable sessions after excluding corporate actions", len(fx))
+	}
+	mx, my = 0, 0
+	for i := range fx {
+		mx += fx[i]
+		my += fy[i]
+	}
+	mx /= float64(len(fx))
+	my /= float64(len(fy))
+
 	var cov, vx, vy, sad, worst float64
 	var worstDate time.Time
-	for i := range xs {
-		dx, dy := xs[i]-mx, ys[i]-my
+	for i := range fx {
+		dx, dy := fx[i]-mx, fy[i]-my
 		cov += dx * dy
 		vx += dx * dx
 		vy += dy * dy
-		d := math.Abs(xs[i] - ys[i])
+		d := math.Abs(fx[i] - fy[i])
 		sad += d
 		if d > worst {
-			worst, worstDate = d, dates[i]
+			worst, worstDate = d, fd[i]
 		}
 	}
 	return tracking{
-		n: len(xs), corr: cov / math.Sqrt(vx*vy), mad: sad / float64(len(xs)),
-		worst: worst, worstDate: worstDate,
+		n: len(fx), corr: cov / math.Sqrt(vx*vy), mad: sad / float64(len(fx)),
+		worst: worst, worstDate: worstDate, Excluded: excluded,
 	}, nil
 }

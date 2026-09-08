@@ -98,6 +98,35 @@ func TestParseRefusesAFileForTheWrongSession(t *testing.T) {
 	require.Contains(t, err.Error(), "served the wrong session")
 }
 
+// TestMonthFirstDatesResolveAgainstTheFilename is the defect that would have
+// corrupted rather than failed.
+//
+// NSE wrote month-first for a few April 2023 sessions and day-first for the
+// rest of the same week. "04-10-2023" is 10 April under one reading and 4
+// October under the other, and 4 October 2023 is a real Wednesday session, so a
+// parser that simply picked a layout would have filed April's levels onto
+// October's date and nothing downstream would ever have noticed.
+func TestMonthFirstDatesResolveAgainstTheFilename(t *testing.T) {
+	row := func(d string) string {
+		return "Nifty 50," + d + ",17600,17700,17550,17624.05,50,.28,100,200,20,3,1.2\n"
+	}
+	// Month-first, as the archive really wrote it for 2023-04-10.
+	got, _, err := nseindex.Parse(strings.NewReader(header+row("04-10-2023")), day(2023, 4, 10))
+	require.NoError(t, err)
+	require.Equal(t, day(2023, 4, 10), got[0].Date)
+
+	// Day-first, as it wrote the very next sessions.
+	got, _, err = nseindex.Parse(strings.NewReader(header+row("12-04-2023")), day(2023, 4, 12))
+	require.NoError(t, err)
+	require.Equal(t, day(2023, 4, 12), got[0].Date)
+
+	// And the ambiguity is still not a licence to accept anything: a file for a
+	// genuinely different session matches under no layout.
+	_, _, err = nseindex.Parse(strings.NewReader(header+row("04-10-2023")), day(2023, 4, 11))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "served the wrong session")
+}
+
 // TestParseRefusesAChangedHeader. A silent column reorder would file turnover
 // where volume belongs and nothing downstream would ever notice.
 func TestParseRefusesAChangedHeader(t *testing.T) {

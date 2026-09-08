@@ -198,11 +198,11 @@ type switchAt struct {
 
 func (s *switchAt) Name() string { return "switch-at" }
 
-func (s *switchAt) RiskOn(_ context.Context, sess engine.Session) (bool, string, error) {
+func (s *switchAt) Stance(_ context.Context, sess engine.Session) (strategy.Stance, string, error) {
 	if !sess.Date.Before(s.off) {
-		return false, "test flip", nil
+		return strategy.RiskOff, "test flip", nil
 	}
-	return true, "test", nil
+	return strategy.RiskOn, "test", nil
 }
 
 // TestTrendFilterIsRiskOffWhileWarmingUp. Not enough history is not evidence
@@ -215,11 +215,12 @@ func TestTrendFilterIsRiskOffWhileWarmingUp(t *testing.T) {
 	tf, err := strategy.NewTrendFilter("NIFTY50", 200)
 	require.NoError(t, err)
 
-	on, why, err := tf.RiskOn(context.Background(), engine.Session{
+	st, why, err := tf.Stance(context.Background(), engine.Session{
 		Date: sessions[20], Market: f,
 	})
 	require.NoError(t, err)
-	require.False(t, on)
+	require.Equal(t, strategy.Unknown, st,
+		"warming up is not evidence the trend is down")
 	require.Contains(t, why, "warming up")
 }
 
@@ -238,19 +239,24 @@ func TestTrendFilterFollowsTheMean(t *testing.T) {
 	tf, err := strategy.NewTrendFilter("NIFTY50", 50)
 	require.NoError(t, err)
 
-	on, why, err := tf.RiskOn(context.Background(), engine.Session{Date: sessions[turn], Market: f})
+	st, why, err := tf.Stance(context.Background(), engine.Session{Date: sessions[turn], Market: f})
 	require.NoError(t, err)
-	require.True(t, on, "at the peak the close is above its own mean: %s", why)
+	require.Equal(t, strategy.RiskOn, st, "at the peak the close is above its own mean: %s", why)
 
-	on, why, err = tf.RiskOn(context.Background(), engine.Session{Date: sessions[len(sessions)-1], Market: f})
+	st, why, err = tf.Stance(context.Background(), engine.Session{Date: sessions[len(sessions)-1], Market: f})
 	require.NoError(t, err)
-	require.False(t, on, "after the fall it is below: %s", why)
+	require.Equal(t, strategy.RiskOff, st, "after the fall it is below: %s", why)
 	require.Contains(t, why, "below its 50-day mean")
 }
 
-// TestTrendFilterRefusesAStaleProxy: a proxy that did not trade today cannot
-// drive today's rule, because a stale close is exactly what a halted or
-// delisted proxy produces and it would freeze the filter in its last state.
+// TestTrendFilterRefusesAStaleProxy: a session the index archive is missing
+// cannot drive today's rule.
+//
+// It answers Unknown, not RiskOff, and the difference is money. NSE's index
+// archive really is missing three sessions the equity archive has --
+// 2014-12-15, 2015-03-12, 2015-07-08 -- and a two-state filter would have
+// liquidated the whole book and rebought it on each, paying about 0.4% round
+// trip for a file that did not exist.
 func TestTrendFilterRefusesAStaleProxy(t *testing.T) {
 	sessions := weekdays(day(2024, 1, 1), day(2025, 6, 30))
 	f := engine.NewFixture(sessions)
@@ -258,11 +264,12 @@ func TestTrendFilterRefusesAStaleProxy(t *testing.T) {
 	tf, err := strategy.NewTrendFilter("NIFTY50", 50)
 	require.NoError(t, err)
 
-	on, why, err := tf.RiskOn(context.Background(), engine.Session{
+	st, why, err := tf.Stance(context.Background(), engine.Session{
 		Date: sessions[len(sessions)-1], Market: f,
 	})
 	require.NoError(t, err)
-	require.False(t, on)
+	require.Equal(t, strategy.Unknown, st,
+		"a session the archive is missing is not a sell signal")
 	require.Contains(t, why, "has no close for")
 }
 
@@ -293,4 +300,48 @@ func indexSeries(sessions []time.Time, at func(i int) float64) []engine.DatedClo
 		out = append(out, engine.DatedClose{Date: d, Close: at(i)})
 	}
 	return out
+}
+
+// TestUnknownHoldsTheBookInsteadOfLiquidatingIt is the behaviour the tri-state
+// exists for, asserted end to end rather than at the filter alone.
+func TestUnknownHoldsTheBookInsteadOfLiquidatingIt(t *testing.T) {
+	sessions := weekdays(day(2024, 1, 1), day(2025, 6, 30))
+	f := trending(sessions, 5)
+
+	blind := day(2025, 5, 14)
+	m, err := strategy.NewMomentum(2, 12, 1, &blindAt{at: blind})
+	require.NoError(t, err)
+	sched, _ := cost.NewSchedule(cost.Zerodha)
+	broker, _ := engine.NewPaper(sched, 0)
+	l := risk.DefaultLimits()
+	l.MinNotional = 1000
+	l.MaxStockFraction = 1
+	g, _ := risk.NewGate(l, sched)
+	e, _ := engine.New(f, broker, g, m)
+	res, err := e.Run(context.Background(), 1_000_000)
+	require.NoError(t, err)
+
+	require.NotEmpty(t, res.Final.Positions,
+		"a session the filter could not read must not empty the book")
+	require.Zero(t, m.Journal().Liquidations,
+		"and must not count as a risk-off liquidation")
+	require.Greater(t, m.Journal().UnknownSessions, 0,
+		"but it is counted, because sitting out on a gap is a different fact from sitting out on a signal")
+
+	for _, fl := range res.Fills {
+		require.NotEqual(t, blind.AddDate(0, 0, 1), fl.Date,
+			"nothing traded on the session after the blind one")
+	}
+}
+
+// blindAt is risk-on except for one session it cannot see.
+type blindAt struct{ at time.Time }
+
+func (b *blindAt) Name() string { return "blind-at" }
+
+func (b *blindAt) Stance(_ context.Context, s engine.Session) (strategy.Stance, string, error) {
+	if s.Date.Equal(b.at) {
+		return strategy.Unknown, "no index close for this session", nil
+	}
+	return strategy.RiskOn, "test", nil
 }

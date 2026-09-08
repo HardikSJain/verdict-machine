@@ -8,14 +8,47 @@ import (
 	"github.com/HardikSJain/verdict-machine/internal/engine"
 )
 
+// Stance is what the filter says about a session, and it has three values
+// rather than two for a reason that cost real money before it was noticed.
+//
+// "The index closed below its mean" and "I could not read the index" are not
+// the same statement, and collapsing them into one boolean makes a missing data
+// file liquidate the entire book. NSE's index archive is missing three full
+// sessions that the equity archive has -- 2014-12-15, 2015-03-12, 2015-07-08 --
+// and on each of those a two-state filter would have sold everything and bought
+// it back, paying roughly 0.4% round trip for a file that did not exist.
+type Stance int
+
+const (
+	// RiskOn: be invested.
+	RiskOn Stance = iota
+	// RiskOff: the trend has broken. Liquidate and wait.
+	RiskOff
+	// Unknown: the filter cannot see. Hold whatever is held and open nothing
+	// new. This is the only honest answer to missing data, and it is
+	// deliberately NOT the same as RiskOff.
+	Unknown
+)
+
+func (s Stance) String() string {
+	switch s {
+	case RiskOn:
+		return "risk-on"
+	case RiskOff:
+		return "risk-off"
+	default:
+		return "unknown"
+	}
+}
+
 // MarketFilter decides whether the book should be invested at all, read at
 // every session's close.
 type MarketFilter interface {
 	Name() string
-	// RiskOn reports whether to be invested, and why. The reason is carried so
-	// a report can say which sessions the strategy sat out and on what basis
-	// rather than showing an unexplained flat stretch in the equity curve.
-	RiskOn(ctx context.Context, s engine.Session) (bool, string, error)
+	// Stance reports what to do, and why. The reason is carried so a report can
+	// say which sessions the strategy sat out and on what basis rather than
+	// showing an unexplained flat stretch in the equity curve.
+	Stance(ctx context.Context, s engine.Session) (Stance, string, error)
 }
 
 // AlwaysOn never sits out. It is the control: the design's risk-off rule is a
@@ -25,8 +58,8 @@ type AlwaysOn struct{}
 
 func (AlwaysOn) Name() string { return "always-on" }
 
-func (AlwaysOn) RiskOn(context.Context, engine.Session) (bool, string, error) {
-	return true, "no filter", nil
+func (AlwaysOn) Stance(context.Context, engine.Session) (Stance, string, error) {
+	return RiskOn, "no filter", nil
 }
 
 // TrendFilter is the design's 200-day rule: invested while the market index
@@ -74,23 +107,23 @@ func (f *TrendFilter) Name() string {
 	return fmt.Sprintf("trend-%dd-%s", f.Days, f.IndexCode)
 }
 
-// RiskOn reads the index's closes and compares the latest to its own mean.
+// Stance reads the index's closes and compares the latest to its own mean.
 //
-// **A short history means risk OFF, not risk on.** Warming up, or a gap in the
-// series, is not evidence that the trend is up, and defaulting to invested
-// would make the filter silently absent for exactly the stretch where nobody
-// checked it. The equity curve then shows a flat opening stretch, which is the
-// honest picture of a strategy that could not yet see.
-func (f *TrendFilter) RiskOn(ctx context.Context, s engine.Session) (bool, string, error) {
+// Everything it cannot answer is Unknown, never RiskOff. Warming up is not
+// evidence the trend is down; neither is a session the archive is missing.
+// Unknown holds the book and opens nothing, so a strategy starting cold stays
+// in cash through its warm-up and a strategy already invested rides out a data
+// gap instead of paying a round trip to exit and re-enter it.
+func (f *TrendFilter) Stance(ctx context.Context, s engine.Session) (Stance, string, error) {
 	// Reach back far enough in calendar days to contain Days sessions with
 	// room for holidays: roughly 1.6 calendar days per session, plus a month.
 	from := s.Date.AddDate(0, 0, -(f.Days*8/5 + 30))
 	closes, err := s.Market.IndexCloses(ctx, f.IndexCode, from, s.Date)
 	if err != nil {
-		return false, fmt.Sprintf("index %s unreadable: %v", f.IndexCode, err), nil
+		return Unknown, fmt.Sprintf("index %s unreadable: %v", f.IndexCode, err), nil
 	}
 	if len(closes) < f.Days {
-		return false, fmt.Sprintf("%s has %d of %d sessions; warming up",
+		return Unknown, fmt.Sprintf("%s has %d of %d sessions; warming up",
 			f.IndexCode, len(closes), f.Days), nil
 	}
 	window := closes[len(closes)-f.Days:]
@@ -103,14 +136,15 @@ func (f *TrendFilter) RiskOn(ctx context.Context, s engine.Session) (bool, strin
 
 	// The last close must be the session being decided on. An index series
 	// missing today would otherwise let a stale close drive the rule, which is
-	// how a gap in the archive turns into a position.
+	// how a gap in the archive turns into a position. NSE's archive really is
+	// missing three sessions the equity archive has.
 	if !window[len(window)-1].Date.Equal(s.Date) {
-		return false, fmt.Sprintf("%s has no close for %s; last is %s",
+		return Unknown, fmt.Sprintf("%s has no close for %s; last is %s",
 			f.IndexCode, s.Date.Format(time.DateOnly),
 			window[len(window)-1].Date.Format(time.DateOnly)), nil
 	}
 	if last > mean {
-		return true, fmt.Sprintf("%s %.2f above its %d-day mean %.2f", f.IndexCode, last, f.Days, mean), nil
+		return RiskOn, fmt.Sprintf("%s %.2f above its %d-day mean %.2f", f.IndexCode, last, f.Days, mean), nil
 	}
-	return false, fmt.Sprintf("%s %.2f at or below its %d-day mean %.2f", f.IndexCode, last, f.Days, mean), nil
+	return RiskOff, fmt.Sprintf("%s %.2f at or below its %d-day mean %.2f", f.IndexCode, last, f.Days, mean), nil
 }
