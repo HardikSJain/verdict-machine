@@ -153,3 +153,84 @@ func TestIndexClosesRejectsAnInvertedRange(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "must be before")
 }
+
+// TestNameChangesIgnoresRetypesetting. NSE re-typesets its own index names --
+// "Nifty Midcap 100" became "NIFTY Midcap 100" in 2016 -- and reporting that as
+// a rename put a false rebasing in front of the operator on every run. A check
+// that cries wolf teaches people to ignore it, which is worse than not having
+// it.
+func TestNameChangesIgnoresRetypesetting(t *testing.T) {
+	ctx := context.Background()
+	store := market.NewStore(testutil.Pool(t))
+	for i, tc := range []struct {
+		d    time.Time
+		name string
+	}{
+		{market.Day(2016, 3, 30), "Nifty Midcap 100"},
+		{market.Day(2016, 3, 31), "Nifty Midcap 100"},
+		{market.Day(2016, 4, 1), "NIFTY  Midcap 100"}, // case and spacing
+		{market.Day(2016, 4, 4), "Nifty Midcap 100"},
+	} {
+		_, err := store.InsertIndexLevels(ctx, market.SourceNSEIndex,
+			[]market.IndexLevel{lvl("NIFTYMIDCAP100", tc.name, tc.d, 12000+float64(i))})
+		require.NoError(t, err)
+	}
+	changes, err := store.NameChanges(ctx, "NIFTYMIDCAP100", time.Now())
+	require.NoError(t, err)
+	require.Empty(t, changes, "capitalisation and spacing are not a rename")
+}
+
+// TestNameChangesCarriesTheGap. Across a hole in the archive a rebasing and an
+// ordinary market move cannot be told apart, so the caller needs the distance
+// to know the level comparison is meaningless rather than reassuring.
+func TestNameChangesCarriesTheGap(t *testing.T) {
+	ctx := context.Background()
+	store := market.NewStore(testutil.Pool(t))
+	for _, tc := range []struct {
+		d     time.Time
+		name  string
+		close float64
+	}{
+		{market.Day(2016, 3, 31), "CNX Midcap", 12752.60},
+		{market.Day(2016, 7, 7), "Nifty Midcap 100", 14095.35},
+	} {
+		_, err := store.InsertIndexLevels(ctx, market.SourceNSEIndex,
+			[]market.IndexLevel{lvl("NIFTYMIDCAP100", tc.name, tc.d, tc.close)})
+		require.NoError(t, err)
+	}
+	changes, err := store.NameChanges(ctx, "NIFTYMIDCAP100", time.Now())
+	require.NoError(t, err)
+	require.Len(t, changes, 1)
+	require.Equal(t, 98, changes[0].GapDays,
+		"a rename 98 days apart cannot be certified continuous by its levels")
+	jump := changes[0].Close/changes[0].PrevClose - 1
+	require.Greater(t, jump, 0.1, "and the apparent jump is the market, not a rebasing")
+}
+
+// TestGapsFindsAMissingStretch. An index can vanish from the archive for months
+// with no announcement inside the data: NIFTYMIDCAP100 is absent from
+// 2016-04-01 to 2016-07-06 on the live store. A moving average spanning such a
+// hole averages a different period from the one it reports.
+func TestGapsFindsAMissingStretch(t *testing.T) {
+	ctx := context.Background()
+	store := market.NewStore(testutil.Pool(t))
+	for _, d := range []time.Time{
+		market.Day(2016, 3, 29), market.Day(2016, 3, 30), market.Day(2016, 3, 31),
+		market.Day(2016, 7, 7), market.Day(2016, 7, 8),
+	} {
+		_, err := store.InsertIndexLevels(ctx, market.SourceNSEIndex,
+			[]market.IndexLevel{lvl("NIFTYMIDCAP100", "Nifty Midcap 100", d, 12000)})
+		require.NoError(t, err)
+	}
+	gaps, err := store.Gaps(ctx, "NIFTYMIDCAP100", 10, time.Now())
+	require.NoError(t, err)
+	require.Len(t, gaps, 1)
+	require.Equal(t, 98, gaps[0].GapDays)
+	require.Equal(t, market.Day(2016, 3, 31), gaps[0].After)
+	require.Equal(t, market.Day(2016, 7, 7), gaps[0].Before)
+
+	// Ordinary weekends are not gaps.
+	none, err := store.Gaps(ctx, "NIFTYMIDCAP100", 200, time.Now())
+	require.NoError(t, err)
+	require.Empty(t, none)
+}

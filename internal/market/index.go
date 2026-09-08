@@ -178,12 +178,24 @@ func (s *Store) IndexCloses(ctx context.Context, code string, from, to, asOfInge
 	return out, rows.Err()
 }
 
-// IndexNameChanges returns, for one code, every date on which the published
-// name differed from the previous session's, with both names and both closes.
+// IndexNameChange is one session where the published name differed from the
+// previous session's, with both names and both closes.
 //
 // It is the evidence behind the alias table: a rebrand must leave the level
 // alone, so a changeover whose close jumps is not a rebrand but a different
 // index wearing an old name.
+//
+// Names are compared CASE- AND WHITESPACE-INSENSITIVELY. NSE re-typesets its
+// own index names -- "Nifty Midcap 100" became "NIFTY Midcap 100" in 2016 --
+// and reporting that as a rename would put a false rebasing in front of a human
+// on every run until they learned to ignore this check, which is the worst
+// thing a check can teach.
+//
+// Gap is the calendar distance between the two sessions. It matters because the
+// level comparison is only meaningful when they are adjacent: the same
+// re-typesetting above straddled a three-month hole in the archive, and the
+// +10.53% across it was the market moving, not the index being rebased. Across
+// a gap the two cannot be told apart, and saying so beats guessing either way.
 type IndexNameChange struct {
 	Date      time.Time
 	PrevDate  time.Time
@@ -191,6 +203,7 @@ type IndexNameChange struct {
 	ToName    string
 	PrevClose float64
 	Close     float64
+	GapDays   int
 }
 
 // NameChanges finds them.
@@ -209,7 +222,10 @@ func (s *Store) NameChanges(ctx context.Context, code string, asOfIngest time.Ti
 			FROM latest
 		)
 		SELECT date, prev_date, prev_name, index_name, prev_close, close
-		FROM seq WHERE prev_name IS NOT NULL AND prev_name <> index_name
+		FROM seq
+		WHERE prev_name IS NOT NULL
+		  AND upper(regexp_replace(btrim(prev_name),  '\s+', ' ', 'g'))
+		   <> upper(regexp_replace(btrim(index_name), '\s+', ' ', 'g'))
 		ORDER BY date`, code, SourceNSEIndex, asOfIngest)
 	if err != nil {
 		return nil, fmt.Errorf("index name changes: %w", err)
@@ -223,7 +239,52 @@ func (s *Store) NameChanges(ctx context.Context, code string, asOfIngest time.Ti
 		}
 		c.Date = Day(c.Date.Year(), c.Date.Month(), c.Date.Day())
 		c.PrevDate = Day(c.PrevDate.Year(), c.PrevDate.Month(), c.PrevDate.Day())
+		c.GapDays = int(c.Date.Sub(c.PrevDate).Hours() / 24)
 		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// IndexGap is a stretch where an index vanished from the archive while other
+// indices kept being published.
+type IndexGap struct {
+	After   time.Time
+	Before  time.Time
+	GapDays int
+}
+
+// Gaps returns every stretch longer than minDays where one index is missing
+// from sessions the archive published for others.
+//
+// An index disappearing for months is a real and easy thing to miss: NIFTYMIDCAP100
+// is absent from 2016-04-01 to 2016-07-06 with no announcement inside the data.
+// A moving average that spanned such a hole would be averaging across a
+// discontinuity in TIME rather than in level, and a trend rule reading it would
+// act on a mean that covers a different period from the one it thinks.
+func (s *Store) Gaps(ctx context.Context, code string, minDays int, asOfIngest time.Time) ([]IndexGap, error) {
+	rows, err := s.pool.Query(ctx, `
+		WITH d AS (
+			SELECT DISTINCT date FROM index_levels
+			WHERE index_code = $1 AND source = $2 AND ingested_at <= $3
+		), seq AS (
+			SELECT date, lag(date) OVER (ORDER BY date) AS prev FROM d
+		)
+		SELECT prev, date, (date - prev) AS gap
+		FROM seq WHERE prev IS NOT NULL AND (date - prev) > $4
+		ORDER BY gap DESC`, code, SourceNSEIndex, asOfIngest, minDays)
+	if err != nil {
+		return nil, fmt.Errorf("index gaps: %w", err)
+	}
+	defer rows.Close()
+	var out []IndexGap
+	for rows.Next() {
+		var g IndexGap
+		if err := rows.Scan(&g.After, &g.Before, &g.GapDays); err != nil {
+			return nil, err
+		}
+		g.After = Day(g.After.Year(), g.After.Month(), g.After.Day())
+		g.Before = Day(g.Before.Year(), g.Before.Month(), g.Before.Day())
+		out = append(out, g)
 	}
 	return out, rows.Err()
 }

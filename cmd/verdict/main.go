@@ -563,17 +563,36 @@ func newIndexCheckCmd() *cobra.Command {
 				for _, c := range changes {
 					jump := c.Close/c.PrevClose - 1
 					status := "ok"
-					if jump > tol || jump < -tol {
+					switch {
+					case c.GapDays > 5:
+						// Across a hole in the archive a rebasing and an
+						// ordinary market move are indistinguishable. Reporting
+						// it as either would be a guess.
+						status = fmt.Sprintf("UNVERIFIABLE (%d-day gap)", c.GapDays)
+						failures++
+					case jump > tol || jump < -tol:
 						status = "REBASED?"
 						failures++
 					}
-					fmt.Fprintf(out, "  %s %-16s %10.2f  ->  %s %-16s %10.2f   %+.2f%%  %s\n",
+					fmt.Fprintf(out, "  %s %-18s %10.2f  ->  %s %-18s %10.2f   %+.2f%%  %s\n",
 						c.PrevDate.Format(time.DateOnly), c.FromName, c.PrevClose,
 						c.Date.Format(time.DateOnly), c.ToName, c.Close, 100*jump, status)
 				}
+				gaps, err := store.Gaps(cmd.Context(), code, 10, pin)
+				if err != nil {
+					return err
+				}
+				for i, g := range gaps {
+					if i >= 3 {
+						fmt.Fprintf(out, "  ... and %d more gaps over 10 days\n", len(gaps)-3)
+						break
+					}
+					fmt.Fprintf(out, "  GAP %d days: absent between %s and %s\n",
+						g.GapDays, g.After.Format(time.DateOnly), g.Before.Format(time.DateOnly))
+				}
 			}
 			if failures > 0 {
-				fmt.Fprintf(out, "\n%d rename(s) moved the level by more than %.1f%%: that is a rebasing, not a rebrand, and those names must not share a code\n",
+				fmt.Fprintf(out, "\n%d rename(s) could not be shown continuous within %.1f%%: a rebasing is a different index wearing an old name and must not share a code\n",
 					failures, 100*tol)
 				return fmt.Errorf("index check: %d suspect alias(es)", failures)
 			}
