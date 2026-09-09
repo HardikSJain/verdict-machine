@@ -81,16 +81,20 @@ type Strategy interface {
 
 // Result is one backtest or one evening, with everything that happened.
 type Result struct {
-	Strategy   string
-	From, To   time.Time
-	Sessions   int
-	Fills      []Fill
-	Unfilled   []Unfilled
-	Rejected   []risk.Rejection
-	Equity     []EquityPoint
-	Final      Portfolio
-	FinalCash  float64
-	TotalCosts float64
+	Strategy string
+	From, To time.Time
+	Sessions int
+	Fills    []Fill
+	Unfilled []Unfilled
+	Rejected []risk.Rejection
+	// Adjustments are the corporate actions that touched the book. A position
+	// that doubled overnight did so for a reason, and the reason belongs in the
+	// result rather than in a reader's assumptions.
+	Adjustments []AdjustmentApplied
+	Equity      []EquityPoint
+	Final       Portfolio
+	FinalCash   float64
+	TotalCosts  float64
 
 	// Unverified counts how many fills leaned on a charge rate that no
 	// document in this repository has reconciled. The design requires the
@@ -178,6 +182,33 @@ func (e *Engine) Run(ctx context.Context, cash float64) (Result, error) {
 		bars, err := e.market.Bars(ctx, date)
 		if err != nil {
 			return Result{}, fmt.Errorf("engine: bars for %s: %w", date.Format(time.DateOnly), err)
+		}
+
+		// 0: corporate actions, before anything else touches the book.
+		//
+		// A bonus or split changes the share count overnight, so it has to land
+		// before yesterday's orders meet today's price -- otherwise an order
+		// sized against the old share count trades at the new price. Pending
+		// orders are scaled by the same ratio for the same reason: an intent to
+		// buy 100 shares of a stock that split 1:5 yesterday evening is an
+		// intent to buy 500 today.
+		adj, err := e.market.Adjustments(ctx, date)
+		if err != nil {
+			return Result{}, fmt.Errorf("engine: adjustments for %s: %w", date.Format(time.DateOnly), err)
+		}
+		if len(adj) > 0 {
+			for _, a := range p.ApplyAdjustments(adj) {
+				res.Adjustments = append(res.Adjustments, a)
+			}
+			for i := range pending {
+				if r, ok := adj[pending[i].EntityID]; ok && r > 0 {
+					scaled := int64(float64(pending[i].Quantity) * r)
+					if scaled <= 0 {
+						scaled = 1
+					}
+					pending[i].Quantity = scaled
+				}
+			}
 		}
 
 		// 1 and 2: yesterday's orders meet today's open.

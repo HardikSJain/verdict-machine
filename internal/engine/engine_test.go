@@ -424,3 +424,80 @@ func TestARenamedHoldingCanStillBeSold(t *testing.T) {
 	}
 	require.Equal(t, "NEWNAME", sellFill.Scrip)
 }
+
+// TestABonusDoublesTheSharesInsteadOfHalvingTheBook is the regression for the
+// largest bug this project has had, and the one that made every published
+// result understate itself.
+//
+// NSE's archive of record prints the price actually traded, so a 1:1 bonus
+// halves it overnight. A real holder wakes up with twice the shares and exactly
+// the same money. A backtest that ignores the action wakes up with the same
+// shares at half the price and has silently lost half the position.
+//
+// It is not a rare edge case. Reliance did this in 2017 and again in 2024,
+// HDFC Bank in 2025, Infosys three times, HCL Tech twice — every name a liquid
+// Indian portfolio holds. Measured across the archive there are 15 to 83 such
+// events a year in liquid names, so a fifty-name book met several annually and
+// each cost it about a percent.
+func TestABonusDoublesTheSharesInsteadOfHalvingTheBook(t *testing.T) {
+	f := engine.NewFixture([]time.Time{d1, d2, d3, d4}).
+		AddBar(d1, engine.Bar{EntityID: 1, Scrip: "AAA", Open: 1000, Close: 1000}).
+		AddBar(d2, engine.Bar{EntityID: 1, Scrip: "AAA", Open: 1000, Close: 1000}).
+		// Ex-bonus: the price halves and the share count must double.
+		AddBar(d3, engine.Bar{EntityID: 1, Scrip: "AAA", Open: 500, Close: 500}).
+		AddBar(d4, engine.Bar{EntityID: 1, Scrip: "AAA", Open: 500, Close: 500}).
+		AddAdjustment(d3, 1, 2.0)
+
+	s := &scripted{name: "holds-through-a-bonus", on: map[string][]risk.Intent{
+		d1.Format(time.DateOnly): {buyIntent("AAA", 50, 1000)},
+	}}
+	res, err := harness(t, f, s, looseLimits()).Run(context.Background(), 100_000)
+	require.NoError(t, err)
+	require.Len(t, res.Fills, 1)
+
+	require.Len(t, res.Adjustments, 1, "the action must be recorded, not applied silently")
+	a := res.Adjustments[0]
+	require.Equal(t, 2.0, a.Ratio)
+	require.Equal(t, int64(50), a.FromQty)
+	require.Equal(t, int64(100), a.ToQty)
+
+	held := res.Final.Positions[1]
+	require.Equal(t, int64(100), held.Quantity, "fifty shares became a hundred")
+
+	// The whole point: equity is unchanged across the action. Before the fix
+	// this book would have been worth half as much on d3 as on d2.
+	var beforeEq, afterEq float64
+	for _, p := range res.Equity {
+		if p.Date.Equal(d2) {
+			beforeEq = p.Equity
+		}
+		if p.Date.Equal(d3) {
+			afterEq = p.Equity
+		}
+	}
+	require.InDelta(t, beforeEq, afterEq, 1.0,
+		"a bonus issue creates no wealth and destroys none; the book must be worth the same on both sides")
+}
+
+// TestAConsolidationHalvesTheSharesAndPaysTheFraction. The reverse action, and
+// the fractional entitlement is settled in cash rather than floored away —
+// which is what exchanges actually do, and what stops the book leaking value on
+// every odd lot.
+func TestAConsolidationHalvesTheSharesAndPaysTheFraction(t *testing.T) {
+	f := engine.NewFixture([]time.Time{d1, d2, d3, d4}).
+		AddBar(d1, engine.Bar{EntityID: 1, Scrip: "AAA", Open: 100, Close: 100}).
+		AddBar(d2, engine.Bar{EntityID: 1, Scrip: "AAA", Open: 100, Close: 100}).
+		AddBar(d3, engine.Bar{EntityID: 1, Scrip: "AAA", Open: 200, Close: 200}).
+		AddBar(d4, engine.Bar{EntityID: 1, Scrip: "AAA", Open: 200, Close: 200}).
+		AddAdjustment(d3, 1, 0.5)
+
+	s := &scripted{name: "consolidation", on: map[string][]risk.Intent{
+		d1.Format(time.DateOnly): {buyIntent("AAA", 101, 100)},
+	}}
+	res, err := harness(t, f, s, looseLimits()).Run(context.Background(), 100_000)
+	require.NoError(t, err)
+	require.Len(t, res.Adjustments, 1)
+	require.Equal(t, int64(50), res.Adjustments[0].ToQty, "101 shares consolidate to 50 and a half")
+	require.Greater(t, res.Adjustments[0].CashPaid, 0.0, "the half share is paid in cash")
+	require.Equal(t, int64(50), res.Final.Positions[1].Quantity)
+}

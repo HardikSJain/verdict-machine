@@ -27,6 +27,8 @@ type Fixture struct {
 
 	// indices holds synthetic index series by code.
 	indices map[string][]DatedClose
+	// adjustments by session then entity.
+	adjustments map[string]map[int64]float64
 }
 
 // NewFixture builds an empty fixture over a session calendar.
@@ -34,11 +36,12 @@ func NewFixture(sessions []time.Time) *Fixture {
 	s := append([]time.Time(nil), sessions...)
 	sort.Slice(s, func(i, j int) bool { return s[i].Before(s[j]) })
 	return &Fixture{
-		sessions: s,
-		bars:     map[string]map[int64]Bar{},
-		universe: map[string][]Member{},
-		refuse:   map[int64]string{},
-		indices:  map[string][]DatedClose{},
+		sessions:    s,
+		bars:        map[string]map[int64]Bar{},
+		universe:    map[string][]Member{},
+		refuse:      map[int64]string{},
+		indices:     map[string][]DatedClose{},
+		adjustments: map[string]map[int64]float64{},
 	}
 }
 
@@ -237,4 +240,23 @@ func (f *Fixture) Volatility(_ context.Context, entityIDs []int64, from, to time
 		vols[id] = math.Sqrt(ss/float64(len(rets)-1)) * math.Sqrt(252)
 	}
 	return vols, skipped, nil
+}
+
+// AddAdjustment records a corporate action on a session.
+func (f *Fixture) AddAdjustment(date time.Time, entityID int64, ratio float64) *Fixture {
+	k := key(date)
+	if f.adjustments[k] == nil {
+		f.adjustments[k] = map[int64]float64{}
+	}
+	f.adjustments[k][entityID] = ratio
+	return f
+}
+
+// Adjustments returns the corporate actions on a session.
+func (f *Fixture) Adjustments(_ context.Context, date time.Time) (map[int64]float64, error) {
+	out := map[int64]float64{}
+	for id, r := range f.adjustments[key(date)] {
+		out[id] = r
+	}
+	return out, nil
 }

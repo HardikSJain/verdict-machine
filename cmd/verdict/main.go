@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -46,6 +47,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newEntitiesCmd())
 	root.AddCommand(newIndexCmd())
 	root.AddCommand(newBacktestCmd())
+	root.AddCommand(newAdjustmentsCmd())
 	return root
 }
 
@@ -954,4 +956,105 @@ func newBacktestCmd() *cobra.Command {
 	cmd.Flags().Bool("record", true, "write a runs row so the result can be replayed and repeats detected")
 	cmd.Flags().String("database-url", "", "Postgres URL (default $VERDICT_DATABASE_URL)")
 	return cmd
+}
+
+func newAdjustmentsCmd() *cobra.Command {
+	adj := &cobra.Command{
+		Use:   "adjustments",
+		Short: "Corporate actions: detect share-count changes and report coverage",
+	}
+	detect := &cobra.Command{
+		Use:   "detect",
+		Short: "Derive corporate actions from the adjusted and unadjusted series and store them",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			minStep, _ := cmd.Flags().GetFloat64("min-step")
+			apply, _ := cmd.Flags().GetBool("write")
+			url, err := databaseURL(cmd)
+			if err != nil {
+				return err
+			}
+			pool, err := db.Connect(cmd.Context(), url)
+			if err != nil {
+				return err
+			}
+			defer pool.Close()
+			store := market.NewStore(pool)
+			pin := time.Now()
+			out := cmd.OutOrStdout()
+
+			both, bhavOnly, err := store.AdjustmentCoverage(cmd.Context(), pin)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(out, "coverage: %d entities have both series and can have factors derived;\n", both)
+			fmt.Fprintf(out, "          %d have only the unadjusted one and cannot -- eod2 is survivor-only,\n", bhavOnly)
+			fmt.Fprintf(out, "          so a delisted company's corporate actions stay invisible.\n\n")
+
+			fracTol, _ := cmd.Flags().GetFloat64("fraction-tolerance")
+			adjs, sum, err := store.DetectAdjustments(cmd.Context(), minStep, fracTol, pin)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(out, "%d ratio steps above %.1f%%\n", sum.Steps, 100*minStep)
+			fmt.Fprintf(out, "  %d match a share-count fraction AND the price confirms it -- kept\n", sum.ShareActions)
+			fmt.Fprintf(out, "  %d match none and are discarded: eod2 adjusts for dividends too,\n", sum.Unclassified)
+			fmt.Fprintf(out, "     and a dividend pays cash rather than changing what you hold\n")
+			fmt.Fprintf(out, "  %d match a fraction the PRICE DOES NOT CONFIRM and are discarded:\n", sum.Uncorroborated)
+			fmt.Fprintf(out, "     the two sources disagree about which session the action landed, and\n")
+			fmt.Fprintf(out, "     multiplying a share count with no matching price fall invents money\n\n")
+
+			buckets := map[string]int{}
+			for _, a := range adjs {
+				buckets[bucketRatio(a.Ratio)]++
+			}
+			var keys []string
+			for k := range buckets {
+				keys = append(keys, k)
+			}
+			sort.Slice(keys, func(i, j int) bool { return buckets[keys[i]] > buckets[keys[j]] })
+			for i, k := range keys {
+				if i >= 12 {
+					break
+				}
+				fmt.Fprintf(out, "  ratio %-8s %5d\n", k, buckets[k])
+			}
+			if !apply {
+				fmt.Fprintf(out, "\nnot written (--write=false)\n")
+				return nil
+			}
+			n, err := store.InsertAdjustments(cmd.Context(), market.SourceBhavcopy, adjs)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(out, "\nwrote %d new or corrected adjustment rows\n", n)
+			return nil
+		},
+	}
+	detect.Flags().Float64("min-step", 0.02,
+		"smallest change in the two sources' ratio that counts as a corporate action; below this the two round differently and the ratio wobbles")
+	detect.Flags().Float64("fraction-tolerance", 0.01,
+		"how close a ratio must be to a simple fraction to count as a share action")
+	detect.Flags().Bool("write", false, "write the detected adjustments to the store")
+	detect.Flags().String("database-url", "", "Postgres URL (default $VERDICT_DATABASE_URL)")
+	adj.AddCommand(detect)
+	return adj
+}
+
+// bucketRatio labels a measured ratio with the corporate action it looks like,
+// for a histogram that a human can sanity-check at a glance. A 1:1 bonus
+// doubles the share count; a 1:2 consolidation halves it.
+func bucketRatio(r float64) string {
+	for _, known := range []struct {
+		v     float64
+		label string
+	}{
+		{2, "2 (1:1)"}, {3, "3 (2:1)"}, {5, "5 (1:5 split)"}, {10, "10 (1:10)"},
+		{1.5, "1.5 (1:2)"}, {4, "4"}, {6, "6"}, {0.5, "0.5 (consolidate)"},
+		{1.2, "1.2 (1:5)"}, {1.1, "1.1 (1:10)"}, {20, "20"},
+	} {
+		if math.Abs(r/known.v-1) < 0.02 {
+			return known.label
+		}
+	}
+	return fmt.Sprintf("other %.3f", r)
 }

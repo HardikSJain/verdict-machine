@@ -78,6 +78,10 @@ type Market interface {
 	// would rank the split company as the most volatile name in the market on
 	// the strength of a corporate action.
 	Volatility(ctx context.Context, entityIDs []int64, from, to time.Time) (map[int64]float64, map[int64]string, error)
+
+	// Adjustments are the corporate actions effective on a session, keyed by
+	// entity: the multiplier applied to a share count. 2.0 for a 1:1 bonus.
+	Adjustments(ctx context.Context, date time.Time) (map[int64]float64, error)
 }
 
 // DatedClose is one session's close.

@@ -149,3 +149,8 @@ func (m *StoreMarket) IndexCloses(ctx context.Context, code string, from, to tim
 func (m *StoreMarket) Volatility(ctx context.Context, entityIDs []int64, from, to time.Time) (map[int64]float64, map[int64]string, error) {
 	return m.store.EntityVolatility(ctx, m.source, entityIDs, from, to, m.pin)
 }
+
+// Adjustments forwards to the store.
+func (m *StoreMarket) Adjustments(ctx context.Context, date time.Time) (map[int64]float64, error) {
+	return m.store.AdjustmentsOn(ctx, date, m.pin)
+}

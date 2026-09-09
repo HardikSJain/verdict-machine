@@ -3,6 +3,7 @@ package engine
 import (
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 
 	"github.com/HardikSJain/verdict-machine/internal/cost"
@@ -151,4 +152,65 @@ func (p *Portfolio) Held() []Position {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Scrip < out[j].Scrip })
 	return out
+}
+
+// AdjustmentApplied records one corporate action's effect on the book, so a
+// report can show that a position doubled because of a bonus rather than
+// leaving a reader to wonder.
+type AdjustmentApplied struct {
+	EntityID int64
+	Scrip    string
+	Ratio    float64
+	FromQty  int64
+	ToQty    int64
+	CashPaid float64
+}
+
+// ApplyAdjustments multiplies held share counts by their corporate action
+// ratio, before anything else happens on that session.
+//
+// This is the repair for the largest bug this project has had. Without it a
+// holder of Reliance through its 2024 bonus kept the same share count at half
+// the price and lost half the position to arithmetic; the same for HDFC Bank in
+// 2025, Infosys three times, and every liquid Indian name that has ever issued
+// a bonus. Cost basis is deliberately unchanged -- a bonus issue costs nothing
+// and creates no gain, it only divides the same ownership into more pieces.
+//
+// A fractional entitlement is paid in cash rather than rounded away, because
+// that is what actually happens: exchanges settle the odd-lot fraction and a
+// backtest that floored it would leak value on every action.
+func (p *Portfolio) ApplyAdjustments(ratios map[int64]float64) []AdjustmentApplied {
+	if len(ratios) == 0 {
+		return nil
+	}
+	var applied []AdjustmentApplied
+	for id, ratio := range ratios {
+		held, ok := p.Positions[id]
+		if !ok || ratio <= 0 || ratio == 1 {
+			continue
+		}
+		exact := float64(held.Quantity) * ratio
+		newQty := int64(math.Floor(exact))
+		frac := exact - float64(newQty)
+		adjustedMark := held.LastMark / ratio
+		cash := frac * adjustedMark
+
+		a := AdjustmentApplied{
+			EntityID: id, Scrip: held.Scrip, Ratio: ratio,
+			FromQty: held.Quantity, ToQty: newQty, CashPaid: cash,
+		}
+		p.Cash += cash
+		held.Quantity = newQty
+		held.LastMark = adjustedMark
+		if newQty <= 0 {
+			// A consolidation can leave nothing; the whole position becomes the
+			// cash payment.
+			delete(p.Positions, id)
+		} else {
+			p.Positions[id] = held
+		}
+		applied = append(applied, a)
+	}
+	sort.Slice(applied, func(i, j int) bool { return applied[i].Scrip < applied[j].Scrip })
+	return applied
 }
