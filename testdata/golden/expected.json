@@ -1,0 +1,17 @@
+{
+  "sessions": 743,
+  "fills": 144,
+  "unfilled": 0,
+  "risk_rejected": 94,
+  "trades": 87,
+  "final_equity": 680903.41,
+  "net_cagr": 0.1085,
+  "benchmark_cagr": 0.068832,
+  "excess_cagr": 0.039668,
+  "max_drawdown": 0.42381,
+  "total_costs": 3905.64,
+  "trade_mean": 0.166262,
+  "trade_stddev": 0.27145,
+  "turnover": 1.472968,
+  "min_notional": 5600
+}

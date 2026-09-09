@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    # The integration tests are not optional here. Most of what this repository
+    # gets wrong lives in SQL -- an ingested_at pin dropped from a CTE, a
+    # DISTINCT ON that picks the wrong version -- and none of it is visible to a
+    # test that mocks the store away.
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: verdict
+          POSTGRES_PASSWORD: verdict
+          POSTGRES_DB: verdict
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U verdict"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Create the test database
+        run: PGPASSWORD=verdict psql -h localhost -U verdict -d verdict -c 'CREATE DATABASE verdict_test'
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt'd:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: build
+        run: go build ./...
+
+      # The golden backtest runs here, inside `go test`. It needs no database:
+      # it replays a frozen slice of the NSE archive through the whole stack and
+      # compares every published figure to a committed expectation, so a change
+      # that quietly moves a number fails the build rather than surfacing a year
+      # later in a result nobody can reproduce.
+      - name: test
+        env:
+          VERDICT_TEST_DATABASE_URL: postgres://verdict:verdict@localhost:5432/verdict_test?sslmode=disable
+        run: go test ./... -count=1
+
+      - name: the golden backtest must not have been silently regenerated
+        run: |
+          if ! git diff --quiet -- testdata/golden/expected.json; then
+            echo "expected.json changed during the test run; UPDATE_GOLDEN must never be set in CI"
+            git --no-pager diff -- testdata/golden/expected.json
+            exit 1
+          fi
