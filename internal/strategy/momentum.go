@@ -74,6 +74,17 @@ type Selector struct {
 	// does, and it is why rebalance bands exist outside backtests.
 	MinTradeNotional float64
 
+	// RebalanceOnce buys the first selection and never trades again.
+	//
+	// It is a diagnostic rather than a strategy: comparing it against the same
+	// rule rebalanced on a cadence separates a signal's contribution from the
+	// mechanical effect of rebalancing itself. Equal-weighting a universe and
+	// restoring those weights every year means buying more of whatever fell,
+	// which in a turnover-ranked Indian universe holding eventual zeros is a
+	// value trap rather than a discipline. This is how to measure that.
+	RebalanceOnce  bool
+	rebalancedOnce bool
+
 	label     string
 	calendar  []time.Time
 	rebalance map[string]bool
@@ -204,6 +215,12 @@ func (m *Momentum) Decide(ctx context.Context, s engine.Session) ([]risk.Intent,
 
 	if !m.rebalance[s.Date.Format(time.DateOnly)] {
 		return nil, nil
+	}
+	if m.RebalanceOnce {
+		if m.rebalancedOnce {
+			return nil, nil
+		}
+		m.rebalancedOnce = true
 	}
 	return m.rebalanceTo(ctx, s)
 }

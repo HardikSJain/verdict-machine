@@ -769,6 +769,9 @@ func newBacktestCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if once, _ := cmd.Flags().GetBool("rebalance-once"); once {
+				strat.RebalanceOnce = true
+			}
 			// The band is the gate's own floor: an order the gate would refuse
 			// should not be raised, not merely rejected after the cash is freed.
 			strat.MinTradeNotional = gate.Limits().MinNotional
@@ -865,6 +868,24 @@ func newBacktestCmd() *cobra.Command {
 				}
 			}
 
+			if len(res.SuspiciousDrops) > 0 {
+				fmt.Fprintf(out, "\nUNEXPLAINED DROPS in held positions (%d): fell past %.0f%% in one\n",
+					len(res.SuspiciousDrops), 100*33.0/100)
+				fmt.Fprintf(out, "session with no corporate action recorded. Almost always an action this\n")
+				fmt.Fprintf(out, "project cannot recover, because eod2 is survivor-only and a delisted\n")
+				fmt.Fprintf(out, "company has no adjusted series to derive a factor from.\n")
+				shown := res.SuspiciousDrops
+				sort.Slice(shown, func(i, j int) bool { return shown[i].Change < shown[j].Change })
+				for i, d := range shown {
+					if i >= 15 {
+						fmt.Fprintf(out, "  ... and %d more\n", len(shown)-15)
+						break
+					}
+					fmt.Fprintf(out, "  %s  %-14s %10.2f -> %8.2f  %+7.1f%%\n",
+						d.Date.Format(time.DateOnly), d.Scrip, d.From, d.To, 100*d.Change)
+				}
+			}
+
 			j := strat.Journal()
 			fmt.Fprintf(out, "\nstrategy journal:\n")
 			fmt.Fprintf(out, "  rebalances              %14d\n", j.Rebalances)
@@ -936,6 +957,8 @@ func newBacktestCmd() *cobra.Command {
 	cmd.Flags().String("holdout", "2022-01-01", "refuse to read at or past this date; \"\" to spend the holdout")
 	cmd.Flags().Float64("capital", 500000, "starting capital in rupees")
 	cmd.Flags().Int("worst-days", 0, "print the N worst single sessions beside the market")
+	cmd.Flags().Bool("rebalance-once", false,
+		"buy the first selection and never trade again; isolates rebalancing from signal")
 	cmd.Flags().Bool("by-year", false, "print the book and the benchmark at each year end")
 	cmd.Flags().Bool("equities-only", false,
 		"drop fund units (INF/IN9 ISINs) from the universe; NSE lists ETFs in the same segment as shares")

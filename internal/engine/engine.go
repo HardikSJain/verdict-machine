@@ -91,10 +91,19 @@ type Result struct {
 	// that doubled overnight did so for a reason, and the reason belongs in the
 	// result rather than in a reader's assumptions.
 	Adjustments []AdjustmentApplied
-	Equity      []EquityPoint
-	Final       Portfolio
-	FinalCash   float64
-	TotalCosts  float64
+	// SuspiciousDrops are held positions that fell further in one session than
+	// any ordinary market move, with no corporate action recorded to explain it.
+	//
+	// This exists because its absence cost this project every number it had
+	// published. Held positions were never adjusted, so a bonus issue silently
+	// halved them, and nothing anywhere said so -- the loss looked exactly like
+	// a bad day. A guard that flags the shape would have caught it on the first
+	// run instead of after a user asked why the answers were all negative.
+	SuspiciousDrops []SuspiciousDrop
+	Equity          []EquityPoint
+	Final           Portfolio
+	FinalCash       float64
+	TotalCosts      float64
 
 	// Unverified counts how many fills leaned on a charge rate that no
 	// document in this repository has reconciled. The design requires the
@@ -108,6 +117,25 @@ type Result struct {
 	MinNotional      float64
 	SlippageModelled bool
 }
+
+// SuspiciousDrop is one held position falling implausibly far in a session with
+// no adjustment to account for it. Almost always an unrecovered corporate
+// action: the archive is unadjusted, and a company whose adjusted series is
+// missing -- eod2 is survivor-only, so every delisted name -- has no factor this
+// project can derive.
+type SuspiciousDrop struct {
+	Date     time.Time
+	EntityID int64
+	Scrip    string
+	From, To float64
+	Change   float64
+}
+
+// suspiciousDropThreshold is where an ordinary session ends and an unexplained
+// one begins. A liquid Indian name falling more than a third in a day without a
+// corporate action is possible and rare; below this the signal drowns in real
+// crashes.
+const suspiciousDropThreshold = -0.33
 
 // EquityPoint is the book marked at one session's close.
 type EquityPoint struct {
@@ -262,6 +290,24 @@ func (e *Engine) Run(ctx context.Context, cash float64) (Result, error) {
 		closes := make(map[int64]float64, len(bars))
 		for id, b := range bars {
 			closes[id] = b.Close
+		}
+		// Before marking: did anything fall implausibly with no action to
+		// explain it? Compare against the previous mark, which the adjustment
+		// step above has already rescaled for any action it did know about.
+		for id, held := range p.Positions {
+			c, ok := closes[id]
+			if !ok || c <= 0 || held.LastMark <= 0 {
+				continue
+			}
+			if _, adjusted := adj[id]; adjusted {
+				continue
+			}
+			if change := c/held.LastMark - 1; change <= suspiciousDropThreshold {
+				res.SuspiciousDrops = append(res.SuspiciousDrops, SuspiciousDrop{
+					Date: date, EntityID: id, Scrip: held.Scrip,
+					From: held.LastMark, To: c, Change: change,
+				})
+			}
 		}
 		p.Mark(closes)
 		p.relabel(bars)
