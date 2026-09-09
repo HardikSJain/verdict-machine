@@ -134,15 +134,27 @@ left broken, and the book is where the money is.
 
 | | published below | corrected |
 |---|---|---|
-| in-sample 2013–21 excess | +5.45% | **+10.64%** |
-| **holdout 2022–26 excess** | **+0.78%** | **+8.27%** |
+| in-sample 2013–21 excess | +5.45% | **+9.23%** |
+| **holdout 2022–26 excess** | **+0.78%** | **+9.14%** |
 | holdout max drawdown | 34.8% | 31.4% |
 
-(An earlier revision of this correction read +9.23% and +9.14%. The detector was
-then changed to join the two sources by TICKER rather than by entity, which
-recovers corporate actions that fall across an unlinked ISIN boundary -- Yes
-Bank's 2017 1:5 split among them -- and moved both figures. The numbers above
-are the current ones.)
+The detector's join has been revised twice since the first corrected figure, and
+each revision moved both numbers, so the reading order is worth stating:
+
+| detector join | in-sample | holdout |
+|---|---|---|
+| by entity | +9.23% | +9.14% |
+| by ticker | +10.64% | +8.27% |
+| **by entity AND ticker, unioned** | **+9.23%** | **+9.14%** |
+
+Joining by entity missed corporate actions that fall across an ISIN reissue the
+roster has not linked -- Yes Bank's 2017 1:5 split. Joining by ticker missed
+actions where the company also renamed at the reissue -- Ami Organics' 1:2 split
+in April 2025, since it later became Acutaas Chemicals. Neither key contains the
+other, so both are emitted and the candidates unioned. That is the last row and
+the current number. (It lands back on the first row's figures to two decimals,
+which is coincidence and not confirmation: the two joins recover overlapping but
+different sets of actions, 752 in total against 718 and 725.)
 
 Against the bar this experiment registered in advance -- Nifty 500, minus 1.2
 points for the price index, at 10 bps of slippage per leg -- the corrected
@@ -151,11 +163,21 @@ holdout reads **+8.67%**. It clears. Drawdown is inside the 50% disqualifier.
 **By its own pre-registered criteria, H2 is supported.** The verdict below is
 withdrawn.
 
+**And then attacked, in experiment 004, where it did not survive.** Six
+pre-registered attacks: it clears five. Against the Nifty Midcap 100, the
+benchmark closest to what this book actually holds, the excess after the
+dividend adjustment is +0.89 points, and the measurement's own noise -- measured
+there for the first time -- is about a point. Remove its best year and it is
+negative. `docs/experiments/004-attacking-the-momentum-result.md` has all six.
+**H2 is not established, and the holdout is now spent three times over.**
+
 ### Four reasons that is not yet a finding
 
 1. **The control's lag is now decomposed, and about two points of it are still
    artefact.** The equal-weight control -- fifty liquid stocks, no signal at all
-   -- lags the index by 5.25 points. Measured: **1.34 points** of that is
+   -- lags the index by 4.77 points (5.25 before the detector's join was
+   unioned; the components below were measured against the older figure and
+   have not been re-decomposed). Measured: **1.34 points** of that is
    re-selection, since buying the first basket and never trading returns 8.27%
    against 6.97% rebalanced annually, so ranking by turnover each year actively
    picks worse names; roughly **1.2 points** is cash the rebalance band leaves

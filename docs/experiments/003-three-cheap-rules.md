@@ -133,10 +133,17 @@ history rather than deleted.
 | rule | net CAGR | excess vs Nifty 500 | max drawdown | turnover |
 |---|---|---|---|---|
 | **H3 low volatility, annual** | 9.84% | **−2.38%** | 16.5% | 0.9x/yr |
-| **H4 short-term reversal, monthly** | −6.07% | **−18.28%** | 76.4% | 14.0x/yr |
-| **H5 equal weight, annual (yardstick)** | 6.92% | **−5.29%** | 49.5% | 0.5x/yr |
+| **H4 short-term reversal, monthly** | −6.12% | **−18.34%** | 74.1% | 14.0x/yr |
+| **H5 equal weight, annual (yardstick)** | 7.45% | **−4.77%** | 52.2% | 0.5x/yr |
 
 Benchmark: Nifty 500 at 12.21% over the same period.
+
+(Re-measured 2026-09-09 after the adjustment detector was changed to union its
+entity and ticker joins -- see experiment 004. H3 did not move at all; H4 moved
+by six basis points; H5 improved by half a point and its drawdown crossed 50%,
+so it is now **disqualified on drawdown as well as on return**. No verdict
+changes. H3 is run with `--equities-only`, which is what makes it a test of
+equities at all; H4 and H5 are not, and reproducing them requires the same.)
 
 The registered bar required a positive excess after all three adjustments
 together -- Nifty 500, minus 1.2 points for the price index, at 10 bps of

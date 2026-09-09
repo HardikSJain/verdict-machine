@@ -904,6 +904,30 @@ func newBacktestCmd() *cobra.Command {
 				fmt.Fprintf(out, "  summed at the equity of each date (an upper bound; they did not all happen at once).\n")
 			}
 
+			if len(res.Adjustments) > 0 {
+				// What the corporate action layer actually did to the book. A
+				// correct action is equity-neutral -- the share count rises by
+				// the ratio and the price falls by it -- so this is the place a
+				// wrong ratio or a misdated ex-date shows up as a position that
+				// changed size for no reason.
+				byScrip := map[string]int{}
+				for _, a := range res.Adjustments {
+					byScrip[a.Scrip]++
+				}
+				fmt.Fprintf(out, "\nCORPORATE ACTIONS applied to the book (%d across %d names):\n",
+					len(res.Adjustments), len(byScrip))
+				shown := append([]engine.AdjustmentApplied(nil), res.Adjustments...)
+				sort.Slice(shown, func(i, j int) bool { return shown[i].Ratio > shown[j].Ratio })
+				for i, a := range shown {
+					if i >= 12 {
+						fmt.Fprintf(out, "  ... and %d more\n", len(shown)-12)
+						break
+					}
+					fmt.Fprintf(out, "  %-14s ratio %8.4f  %7d -> %7d shares  cash %8.2f\n",
+						a.Scrip, a.Ratio, a.FromQty, a.ToQty, a.CashPaid)
+				}
+			}
+
 			j := strat.Journal()
 			fmt.Fprintf(out, "\nstrategy journal:\n")
 			fmt.Fprintf(out, "  rebalances              %14d\n", j.Rebalances)

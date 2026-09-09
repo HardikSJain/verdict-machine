@@ -21,23 +21,31 @@ recorded beside the originals rather than replacing them.
 | | first answer | corrected |
 |---|---|---|
 | 12-1 momentum **with** a 200-day trend filter | −5.73% | **−0.13%** — rejected |
-| 12-1 momentum **without** the filter, out-of-sample | +0.78% | **+9.14%** — withdrawn rejection |
+| 12-1 momentum **without** the filter, out-of-sample | +0.78% | **+9.14%** — attacked, not established |
 | Low volatility, annual | −5.78% | **−2.38%** — rejected |
-| Short-term reversal, monthly | −22.71% | **−18.28%** — rejected |
-| Equal weight, annual (the control) | −9.47% | **−5.29%** |
+| Short-term reversal, monthly | −22.71% | **−18.34%** — rejected |
+| Equal weight, annual (the control) | −9.47% | **−4.77%** |
 
 All excesses are against the Nifty 500 after every modelled cost.
 
-**The one that matters is the second row.** Against the bar registered in advance
-— Nifty 500, minus 1.2 points for the benchmark being a price index, at 10 basis
-points of slippage — it now reads +8.67% and clears. That is *not* being reported
-as a finding, for reasons kept in
-[docs/experiments](docs/experiments/002-momentum-unfiltered.md): the control
-still lags the index by 5.3 points that nobody has explained, so every number
-carries that error bar; against the Midcap 100, which is closer to what the book
-actually holds, the excess is about +0.9% after dividends; and turning a null
-into a positive is the exact shape of motivated reasoning, so the guards are
-listed and declared insufficient.
+**The one that matters is the second row, and it has since been attacked and did
+not survive.** Against the bar registered in advance — Nifty 500, minus 1.2
+points for the benchmark being a price index, at 10 basis points of slippage —
+it reads +8.67% and clears. So six attacks were registered in writing *before any
+was run*, and then run:
+[docs/experiments/004](docs/experiments/004-attacking-the-momentum-result.md).
+
+It clears five of the six. The one line that matters: **against the Nifty Midcap
+100 — the benchmark closest to what this book actually holds — the excess after
+dividends is +0.89 points, and the measurement's own noise is about a point.**
+Remove its single best year and it goes negative. What is left is a mid-cap size
+premium and one good year in 2023.
+
+**So it is recorded as not established.** The attacks also turned up a bug that
+three prior readings of the same period had not: a corporate action missed
+because the company renamed itself at the same time it reissued its ISIN. Fixing
+it moved the headline again, which is why the holdout is now spent three times
+over and why no further reading of 2022–2026 is evidence about momentum.
 
 ## The bug that changed all of it
 

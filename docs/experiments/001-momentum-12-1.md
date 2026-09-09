@@ -112,8 +112,24 @@ for the whole account; it cost roughly 5.6 points a year here.
 | control, no filter | +6.35% (N50) / +5.45% (N500) | **+9.23%** (N500) |
 
 **The verdict does not change and its reasoning is strengthened.** H1's excess is
-−0.13%, which is not positive, so the kill criterion still fires and the holdout
-was still not spent on it. And the gap between the filtered rule and the same
+−0.13%, which is not positive, so the kill criterion still fires.
+
+(Re-measured 2026-09-09 after two further repairs to the corporate action
+detector — see experiment 004. H1's in-sample excess is **unchanged to two
+decimals** at −0.13%, net CAGR 13.41%, drawdown 47.61%.)
+
+**The holdout HAS since been spent, and not deliberately.** On 2026-09-09, while
+refreshing a summary table, I ran this rule over 2022–2026. It read **+4.70%**
+excess against the Nifty 500, net CAGR 14.11%, drawdown 17.39%. That reading was
+not registered, was not preceded by a hypothesis, and should not have happened:
+the sentence above this one is the whole reason the period was sealed. It is
+recorded rather than discarded because discarding it would be worse, and because
+a number obtained by accident is still a number that has been seen.
+
+What it does NOT license is reviving H1. The kill criterion fired in-sample and
+that is where the decision was made; a holdout read after a rule is dead is not
+evidence for it, whatever it says. Experiment 004 records the same mistake from
+the other side. And the gap between the filtered rule and the same
 rule unfiltered widens from about 12 points to **9.4 points of pure cost** with
 none of the drawdown protection it promised — 47.6% filtered against 43.7%
 unfiltered, so the filter now looks slightly WORSE on drawdown as well as on
