@@ -281,6 +281,28 @@ change from experiment 002. None of that makes the remainder a finding.
 **Nothing is traded on this.** The holdout is spent three times over and no
 further reading of 2022–2026 is evidence about momentum.
 
+### Confirmed, with an error bar (2026-09-09, experiment 005)
+
+This verdict rested on a single reading of +0.89% against the Midcap 100 after
+dividends, set against a noise band A5 could only estimate. Both have since been
+measured properly, by sweeping the rebalance calendar across all 21 offsets:
+
+| | vs Nifty 500 | vs Nifty Midcap 100 |
+|---|---|---|
+| mean of 21 offsets | +8.16% | **+1.11%** |
+| standard deviation | ±2.50 | ±2.50 |
+| **after the −1.2pt dividend adjustment** | +6.96% | **−0.09%** |
+| offsets negative after dividends | 0 of 21 | **12 of 21** |
+
+**The ensemble mean against the fair benchmark is −0.09%.** The verdict does not
+change; its evidence went from one draw to a distribution. What this rule
+captures is a mid-cap size premium, and the part that is not size is zero.
+
+A consequence for the rest of this file: the ±1 point A5 inferred from the
+slippage sweep understated it. The real spread is ±2.5, and the range across
+calendars is 9.9 points against the Nifty 500 -- wider than the edge being
+claimed. Every figure above is one draw from that.
+
 ### What this experiment actually produced
 
 Not a result about momentum. Two things about the machine:

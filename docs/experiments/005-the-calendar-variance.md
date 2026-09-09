@@ -48,6 +48,46 @@ decimals, from a distribution nobody had looked at.
 
 **A rule whose claimed edge is 9 points has a calendar spread of 10.**
 
+## The same sweep against the fair benchmark, after the fence repair
+
+Repeated with the succession fence repaired (it now prices returns across
+explained corporate actions instead of refusing them), against both benchmarks:
+
+| | vs Nifty 500 | vs **Nifty Midcap 100** |
+|---|---|---|
+| mean of 21 offsets | +8.16% | **+1.11%** |
+| median | +7.46% | +0.41% |
+| standard deviation | ±2.50 | ±2.50 |
+| min / max | +4.96 / +14.88 | **−2.09 / +7.83** |
+| **after the −1.2pt dividend adjustment** | +6.96% | **−0.09%** |
+| offsets negative after dividends | 0 of 21 | **12 of 21** |
+
+**Against the benchmark closest to what the book holds, the ensemble mean is
+−0.09%: zero, with more than half the calendars negative.** Experiment 004
+called this rule not established from a single reading of +0.89%. Twenty-one
+readings say the same thing with an error bar, which is the difference between
+a suspicion and a measurement.
+
+The fence repair moved the Nifty 500 ensemble by +0.61 points, a quarter of one
+standard deviation. By the rule this experiment sets, that is not a change and
+gets no commentary.
+
+## A near-miss worth recording
+
+Before the sweep ran I predicted in writing that the Midcap ensemble would come
+back near zero and negative after dividends. Three offsets in, the readings were
++3.63, +4.81 and +2.00 -- all comfortably positive -- and I said the evidence
+was running against my own call.
+
+Those were the three best offsets in the whole distribution. The other eighteen
+average +0.66%.
+
+Flagging the uncertainty was right. The near-miss is the lesson: at ±2.5, three
+samples can point confidently the wrong way, and the only thing that prevented a
+confident retraction of a correct conclusion was waiting for the run to finish.
+It is the same error as narrating a 0.9-point move from a bug fix, arrived at
+faster.
+
 ## What this invalidates, and it is not the bug fixes
 
 Three corporate-action defects were found and fixed on 2026-09-09. The headline
