@@ -135,64 +135,86 @@ func (s *Store) DetectAdjustments(ctx context.Context, minStep, fracTol float64,
 	if minStep <= 0 || minStep >= 1 {
 		return nil, sum, fmt.Errorf("adjustments: minStep must be in (0,1), got %g", minStep)
 	}
-	// The two series are joined by TICKER, not by entity, and that choice is the
-	// difference between catching Yes Bank's 2017 split and missing it.
+	// The two series are joined by entity AND by ticker, and the candidates are
+	// unioned. Either key alone has a blind spot, and they are not the same one.
 	//
-	// eod2 files a ticker's whole history under ONE symbol -- its current ISIN --
-	// while the unadjusted archive splits that history across every ISIN the
-	// company ever had. Joining on entity therefore breaks wherever the roster
-	// has not linked two ISINs together, and the factor series is cut in two at
-	// exactly the boundary where the corporate action lives. Yes Bank holds
-	// three ISINs across two entities because the roster linked two and
-	// quarantined the third, so its 1:5 split fell across the seam and vanished.
+	// eod2 files a company's whole history under ONE symbol -- its current ISIN
+	// -- while the unadjusted archive splits that history across every ISIN the
+	// company ever had. So the factor series has a seam wherever an ISIN was
+	// reissued, and the corporate action lives exactly on that seam.
 	//
-	// A ticker spans that seam by construction. The risk it introduces is ticker
-	// REUSE -- one label meaning two companies at different times -- and the
-	// price corroboration below is what makes that safe: a reused ticker
-	// produces a ratio the price does not confirm, and is dropped.
+	// Joining by ENTITY closes the seam when the roster has linked the two
+	// ISINs. It fails when the roster has not: Yes Bank holds three ISINs across
+	// two entities because the roster linked two and quarantined the third, so
+	// its 1:5 split fell across the seam and vanished.
 	//
-	// The action is then attributed back to whichever entity holds that ticker
-	// on the ex-date, because that is what the engine's book is keyed on.
+	// Joining by TICKER closes the seam without needing the roster -- but only
+	// while the company keeps its name. Ami Organics reissued its ISIN at a 1:2
+	// split in April 2025 and later renamed to Acutaas Chemicals. Symbols are
+	// labelled by their latest ticker, so the pre-split unadjusted bars read
+	// AMIORG and the adjusted series reads ACUTAAS. They never met, the split
+	// was invisible, and a held position lost half its value to arithmetic. That
+	// was found by a backtest reporting a 51% one-session fall it could not
+	// explain, not by this query.
+	//
+	// So: both keys, union the steps, prefer the entity's answer where both
+	// fire. The union cannot manufacture an action, because every candidate --
+	// whichever key produced it -- must still match a simple share fraction AND
+	// be corroborated by the price move below. That is also what makes the
+	// ticker key safe against ticker REUSE, one label meaning two companies at
+	// different times: a reused ticker produces a ratio the price does not
+	// confirm, and is dropped.
+	//
+	// The action is attributed to whichever entity holds the bar on the ex-date,
+	// because that is what the engine's book is keyed on.
 	rows, err := s.pool.Query(ctx, `WITH `+entityMapCTE("$1")+`,
 		lbl AS (
 			SELECT DISTINCT ON (symbol_id) symbol_id, ticker
 			FROM symbols WHERE ingested_at <= $1
 			ORDER BY symbol_id, ingested_at DESC
 		),
+		keyed AS (
+			SELECT m.symbol_id, m.entity_id, k.key
+			FROM entity_map m
+			JOIN lbl l ON l.symbol_id = m.symbol_id
+			CROSS JOIN LATERAL (VALUES
+				('e:' || m.entity_id::text), ('t:' || l.ticker)
+			) k(key)
+		),
 		bhav AS (
-			SELECT DISTINCT ON (l.ticker, b.date) l.ticker, b.date,
-			       b.close::float8 AS close, m.entity_id
+			SELECT DISTINCT ON (k.key, b.date) k.key, b.date,
+			       b.close::float8 AS close, k.entity_id
 			FROM bars b
-			JOIN lbl l ON l.symbol_id = b.symbol_id
-			JOIN entity_map m ON m.symbol_id = b.symbol_id
+			JOIN keyed k ON k.symbol_id = b.symbol_id
 			WHERE b.source = $2 AND b.ingested_at <= $1 AND b.close > 0
-			ORDER BY l.ticker, b.date, b.ingested_at DESC
+			ORDER BY k.key, b.date, b.ingested_at DESC
 		),
 		adj AS (
-			SELECT DISTINCT ON (l.ticker, b.date) l.ticker, b.date, b.close::float8 AS close
+			SELECT DISTINCT ON (k.key, b.date) k.key, b.date, b.close::float8 AS close
 			FROM bars b
-			JOIN lbl l ON l.symbol_id = b.symbol_id
+			JOIN keyed k ON k.symbol_id = b.symbol_id
 			WHERE b.source = $3 AND b.ingested_at <= $1 AND b.close > 0
-			ORDER BY l.ticker, b.date, b.ingested_at DESC
+			ORDER BY k.key, b.date, b.ingested_at DESC
 		),
 		f AS (
-			SELECT bhav.ticker, bhav.date, bhav.entity_id,
+			SELECT bhav.key, bhav.date, bhav.entity_id,
 			       bhav.close AS bhav_close, bhav.close / adj.close AS factor
-			FROM bhav JOIN adj USING (ticker, date)
+			FROM bhav JOIN adj USING (key, date)
 		),
 		stepped AS (
-			SELECT ticker, date, entity_id, bhav_close, factor,
-			       lag(factor)     OVER (PARTITION BY ticker ORDER BY date) AS prev_factor,
-			       lag(bhav_close) OVER (PARTITION BY ticker ORDER BY date) AS prev_bhav,
-			       lag(date)       OVER (PARTITION BY ticker ORDER BY date) AS prev_date
+			SELECT key, date, entity_id, bhav_close, factor,
+			       lag(factor)     OVER (PARTITION BY key ORDER BY date) AS prev_factor,
+			       lag(bhav_close) OVER (PARTITION BY key ORDER BY date) AS prev_bhav,
+			       lag(date)       OVER (PARTITION BY key ORDER BY date) AS prev_date
 			FROM f
 		)
-		SELECT entity_id, date, prev_date, prev_factor / factor AS ratio,
+		SELECT DISTINCT ON (entity_id, date)
+		       entity_id, date, prev_date, prev_factor / factor AS ratio,
 		       prev_bhav, bhav_close, prev_factor, factor
 		FROM stepped
 		WHERE prev_factor IS NOT NULL
 		  AND abs(prev_factor / factor - 1) > $4
-		ORDER BY entity_id, date`,
+		ORDER BY entity_id, date, key`,
 		asOfIngest, SourceBhavcopy, SourceEod2, minStep)
 	if err != nil {
 		return nil, sum, fmt.Errorf("adjustments: detect: %w", err)

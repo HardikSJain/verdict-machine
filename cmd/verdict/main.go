@@ -874,16 +874,34 @@ func newBacktestCmd() *cobra.Command {
 				fmt.Fprintf(out, "session with no corporate action recorded. Almost always an action this\n")
 				fmt.Fprintf(out, "project cannot recover, because eod2 is survivor-only and a delisted\n")
 				fmt.Fprintf(out, "company has no adjusted series to derive a factor from.\n")
+				// Priced, not just counted. The residual is what the book still
+				// held after the fall; if the true event destroyed the position
+				// outright -- which is the worst case for an action this project
+				// cannot recover -- that residual is what the result overstates by.
+				eqAt := make(map[string]float64, len(res.Equity))
+				for _, e := range res.Equity {
+					eqAt[e.Date.Format(time.DateOnly)] = e.Equity
+				}
 				shown := res.SuspiciousDrops
 				sort.Slice(shown, func(i, j int) bool { return shown[i].Change < shown[j].Change })
+				worst := 0.0
 				for i, d := range shown {
+					residual := float64(d.Quantity) * d.To
+					share := 0.0
+					if eq := eqAt[d.Date.Format(time.DateOnly)]; eq > 0 {
+						share = residual / eq
+					}
+					worst += share
 					if i >= 15 {
 						fmt.Fprintf(out, "  ... and %d more\n", len(shown)-15)
-						break
+						continue
 					}
-					fmt.Fprintf(out, "  %s  %-14s %10.2f -> %8.2f  %+7.1f%%\n",
-						d.Date.Format(time.DateOnly), d.Scrip, d.From, d.To, 100*d.Change)
+					fmt.Fprintf(out, "  %s  %-14s %10.2f -> %8.2f  %+7.1f%%   residual %12.0f  %5.2f%% of book\n",
+						d.Date.Format(time.DateOnly), d.Scrip, d.From, d.To, 100*d.Change,
+						residual, 100*share)
 				}
+				fmt.Fprintf(out, "  worst case if every one of them was in truth a total loss: %.2f%% of the book,\n", 100*worst)
+				fmt.Fprintf(out, "  summed at the equity of each date (an upper bound; they did not all happen at once).\n")
 			}
 
 			j := strat.Journal()

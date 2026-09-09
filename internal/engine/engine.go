@@ -129,6 +129,11 @@ type SuspiciousDrop struct {
 	Scrip    string
 	From, To float64
 	Change   float64
+
+	// Quantity is the shares held when it happened, so the drop can be priced
+	// rather than only counted. Without it a report can say a name fell 77% but
+	// not whether that cost the book a rounding error or a fifth of a year.
+	Quantity int64
 }
 
 // suspiciousDropThreshold is where an ordinary session ends and an unexplained
@@ -306,6 +311,7 @@ func (e *Engine) Run(ctx context.Context, cash float64) (Result, error) {
 				res.SuspiciousDrops = append(res.SuspiciousDrops, SuspiciousDrop{
 					Date: date, EntityID: id, Scrip: held.Scrip,
 					From: held.LastMark, To: c, Change: change,
+					Quantity: held.Quantity,
 				})
 			}
 		}

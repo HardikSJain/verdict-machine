@@ -279,8 +279,16 @@ func (b Backtest) ByYear(benchmark []engine.DatedClose) []Yearly {
 	for _, c := range benchmark {
 		bench[c.Date.Year()] = c.Close
 	}
+	// The first row is a measured period, not an anchor. Seeding these at zero
+	// made year one print +0.00% for both the book and the benchmark, which hid
+	// a real year: the 2022 holdout stub read "flat" while the book had in fact
+	// fallen 2.2% from its starting capital. A concentration test that silently
+	// discards its first observation is not a concentration test.
 	var out []Yearly
-	prevEq, prevBench := 0.0, 0.0
+	prevEq, prevBench := b.StartCash, 0.0
+	if len(benchmark) > 0 {
+		prevBench = benchmark[0].Close
+	}
 	lastOfYear := map[int]engine.EquityPoint{}
 	var years []int
 	for _, p := range b.equity {
