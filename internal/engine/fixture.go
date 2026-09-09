@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"time"
 )
@@ -191,4 +192,49 @@ func (f *Fixture) IndexCloses(_ context.Context, code string, from, to time.Time
 		out = append(out, c)
 	}
 	return out, nil
+}
+
+// Volatility computes from the fixture's own bars, using log returns and the
+// same annualisation as the store so a strategy tested here meets the same
+// numbers it meets in production.
+func (f *Fixture) Volatility(_ context.Context, entityIDs []int64, from, to time.Time) (map[int64]float64, map[int64]string, error) {
+	if !from.Before(to) {
+		return nil, nil, fmt.Errorf("engine: fixture volatility needs from before to")
+	}
+	vols := map[int64]float64{}
+	skipped := map[int64]string{}
+	for _, id := range entityIDs {
+		if why, ok := f.refuse[id]; ok {
+			skipped[id] = why
+			continue
+		}
+		var closes []float64
+		for _, d := range f.sessions {
+			if !d.After(from) || d.After(to) {
+				continue
+			}
+			if b, ok := f.bars[key(d)][id]; ok && b.Close > 0 {
+				closes = append(closes, b.Close)
+			}
+		}
+		if len(closes) < 3 {
+			skipped[id] = fmt.Sprintf("only %d closes in the window", len(closes))
+			continue
+		}
+		rets := make([]float64, 0, len(closes)-1)
+		for i := 1; i < len(closes); i++ {
+			rets = append(rets, math.Log(closes[i]/closes[i-1]))
+		}
+		var mean float64
+		for _, r := range rets {
+			mean += r
+		}
+		mean /= float64(len(rets))
+		var ss float64
+		for _, r := range rets {
+			ss += (r - mean) * (r - mean)
+		}
+		vols[id] = math.Sqrt(ss/float64(len(rets)-1)) * math.Sqrt(252)
+	}
+	return vols, skipped, nil
 }

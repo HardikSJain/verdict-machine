@@ -71,6 +71,13 @@ type Market interface {
 	// of their own, handled in internal/market/nseindex before a name is ever
 	// mapped to a code.
 	IndexCloses(ctx context.Context, code string, from, to time.Time) ([]DatedClose, error)
+
+	// Volatility is each entity's annualised daily-return standard deviation
+	// over the window, refusing any whose window touches a succession boundary.
+	// A single split inside the window contributes one -90% daily return, which
+	// would rank the split company as the most volatile name in the market on
+	// the strength of a corporate action.
+	Volatility(ctx context.Context, entityIDs []int64, from, to time.Time) (map[int64]float64, map[int64]string, error)
 }
 
 // DatedClose is one session's close.

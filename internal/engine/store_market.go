@@ -21,6 +21,13 @@ type StoreMarket struct {
 	lookback int
 	n        int
 	pin      time.Time
+	opts     []market.UniverseOption
+}
+
+// WithUniverseOptions applies membership options to every Universe read.
+func (m *StoreMarket) WithUniverseOptions(opts ...market.UniverseOption) *StoreMarket {
+	m.opts = append(m.opts, opts...)
+	return m
 }
 
 // NewStoreMarket wires the store to a date range and a universe rule.
@@ -73,7 +80,7 @@ func (m *StoreMarket) Bars(ctx context.Context, date time.Time) (map[int64]Bar, 
 }
 
 func (m *StoreMarket) Universe(ctx context.Context, asOf time.Time) ([]Member, error) {
-	u, err := m.store.UniverseAsOf(ctx, m.source, asOf, m.lookback, m.n, m.pin)
+	u, err := m.store.UniverseAsOf(ctx, m.source, asOf, m.lookback, m.n, m.pin, m.opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -136,4 +143,9 @@ func (m *StoreMarket) IndexCloses(ctx context.Context, code string, from, to tim
 		out = append(out, DatedClose{Date: r.Date, Close: r.Close})
 	}
 	return out, nil
+}
+
+// Volatility forwards to the store, which applies the same succession fence.
+func (m *StoreMarket) Volatility(ctx context.Context, entityIDs []int64, from, to time.Time) (map[int64]float64, map[int64]string, error) {
+	return m.store.EntityVolatility(ctx, m.source, entityIDs, from, to, m.pin)
 }

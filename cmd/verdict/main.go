@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"time"
 
@@ -237,6 +238,9 @@ func newUniverseCmd() *cobra.Command {
 			}
 			defer pool.Close()
 			var opts []market.UniverseOption
+			if eqOnly, _ := cmd.Flags().GetBool("equities-only"); eqOnly {
+				opts = append(opts, market.EquitiesOnly())
+			}
 			if allowStale {
 				opts = append(opts, market.AllowStaleMembers())
 			}
@@ -252,6 +256,7 @@ func newUniverseCmd() *cobra.Command {
 	cmd.Flags().Int("lookback", 125, "sessions in the ranking window (about six months)")
 	cmd.Flags().Int("n", 500, "universe size")
 	cmd.Flags().String("source", market.SourceBhavcopy, "bar source: nse-bhavcopy or eod2")
+	cmd.Flags().Bool("equities-only", false, "drop fund units (INF/IN9 ISINs)")
 	cmd.Flags().Bool("allow-stale", false, "keep names whose last bar predates the window's final session (halted/suspended names); default drops them")
 	cmd.Flags().String("database-url", "", "Postgres URL (default $VERDICT_DATABASE_URL)")
 	return cmd
@@ -619,6 +624,11 @@ func newIndexCheckCmd() *cobra.Command {
 // for a `go build` from a repository; VERDICT_GIT_SHA overrides it for a `go
 // run`, where the stamp is absent. A run recorded without it is still a run, but
 // its code cannot be recovered, so the value says so rather than being blank.
+func mustBool(cmd *cobra.Command, name string) bool {
+	v, _ := cmd.Flags().GetBool(name)
+	return v
+}
+
 func gitSHA() string {
 	if v := os.Getenv("VERDICT_GIT_SHA"); v != "" {
 		return v
@@ -706,6 +716,9 @@ func newBacktestCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if eq, _ := cmd.Flags().GetBool("equities-only"); eq {
+				mk = mk.WithUniverseOptions(market.EquitiesOnly())
+			}
 			sched, err := cost.NewSchedule(cost.Broker(brokerS))
 			if err != nil {
 				return err
@@ -716,6 +729,10 @@ func newBacktestCmd() *cobra.Command {
 			}
 			limits := risk.DefaultLimits()
 			limits.SlippageBps = slippage
+			// The gate caps how many names the book may hold; a strategy that
+			// selects more than the cap would have every extra name rejected and
+			// silently become a smaller strategy.
+			limits.MaxPositions = top
 			// Overriding the floor is how a slippage sensitivity isolates the
 			// cost of slippage from its effect on what is tradeable at all.
 			// Both are real; conflating them makes neither readable.
@@ -733,9 +750,30 @@ func newBacktestCmd() *cobra.Command {
 					return err
 				}
 			}
-			strat, err := strategy.NewMomentum(top, formation, skip, filter)
+			rule, _ := cmd.Flags().GetString("strategy")
+			var strat *strategy.Selector
+			switch rule {
+			case "momentum":
+				strat, err = strategy.NewMomentum(top, formation, skip, filter)
+			case "lowvol":
+				strat, err = strategy.NewLowVolatility(top, formation, filter)
+			case "reversal":
+				strat, err = strategy.NewShortTermReversal(top, filter)
+			case "equalweight":
+				strat, err = strategy.NewEqualWeightUniverse(top, filter)
+			default:
+				return fmt.Errorf("--strategy %q: want momentum, lowvol, reversal or equalweight", rule)
+			}
 			if err != nil {
 				return err
+			}
+			// The band is the gate's own floor: an order the gate would refuse
+			// should not be raised, not merely rejected after the cash is freed.
+			strat.MinTradeNotional = gate.Limits().MinNotional
+			if strat.MinTradeNotional <= 0 {
+				if d, derr := gate.Check(from, risk.Book{}, nil); derr == nil {
+					strat.MinTradeNotional = d.MinNotional
+				}
 			}
 			e, err := engine.New(mk, broker, gate, strat)
 			if err != nil {
@@ -754,7 +792,7 @@ func newBacktestCmd() *cobra.Command {
 			}
 			cfg := map[string]any{
 				"strategy": strat.Name(), "source": source, "capital": capital,
-				"top": top, "formation": formation, "skip": skip,
+				"rule": rule, "equities_only": mustBool(cmd, "equities-only"), "top": top, "formation": formation, "skip": skip,
 				"lookback": lookback, "universe_n": n,
 				"filter": useFilter, "filter_days": filterDays, "index": indexCode,
 				"broker": brokerS, "slippage_bps": slippage,
@@ -784,6 +822,46 @@ func newBacktestCmd() *cobra.Command {
 			out := cmd.OutOrStdout()
 			rep := report.Build(res, benchCode, bench, capital)
 			fmt.Fprintln(out, rep.String())
+
+			if byYear, _ := cmd.Flags().GetBool("by-year"); byYear {
+				fmt.Fprintf(out, "\nyear    equity        cash   held    return   benchmark\n")
+				for _, y := range rep.ByYear(bench) {
+					fmt.Fprintf(out, "%d  %12.0f %11.0f %6d  %+7.2f%%    %+7.2f%%\n",
+						y.Year, y.Equity, y.Cash, y.Held, 100*y.Return, 100*y.Benchmark)
+				}
+			}
+
+			if worst, _ := cmd.Flags().GetInt("worst-days"); worst > 0 {
+				// The book's biggest single-session moves beside the
+				// benchmark's. A drop the market did not have is not a market
+				// move, it is an accounting event.
+				type day struct {
+					d         time.Time
+					book, mkt float64
+				}
+				bm := map[string]float64{}
+				for i := 1; i < len(bench); i++ {
+					if bench[i-1].Close > 0 {
+						bm[bench[i].Date.Format(time.DateOnly)] = bench[i].Close/bench[i-1].Close - 1
+					}
+				}
+				var days []day
+				eq := rep.EquityCurve()
+				for i := 1; i < len(eq); i++ {
+					if eq[i-1].Equity <= 0 {
+						continue
+					}
+					days = append(days, day{eq[i].Date, eq[i].Equity/eq[i-1].Equity - 1,
+						bm[eq[i].Date.Format(time.DateOnly)]})
+				}
+				sort.Slice(days, func(i, j int) bool { return days[i].book < days[j].book })
+				fmt.Fprintf(out, "\nworst single sessions for the book, with the market that day:\n")
+				for i := 0; i < worst && i < len(days); i++ {
+					fmt.Fprintf(out, "  %s  book %+7.2f%%   market %+6.2f%%   gap %+7.2f%%\n",
+						days[i].d.Format(time.DateOnly), 100*days[i].book, 100*days[i].mkt,
+						100*(days[i].book-days[i].mkt))
+				}
+			}
 
 			j := strat.Journal()
 			fmt.Fprintf(out, "\nstrategy journal:\n")
@@ -855,6 +933,11 @@ func newBacktestCmd() *cobra.Command {
 	cmd.Flags().String("to", "2021-12-31", "last session")
 	cmd.Flags().String("holdout", "2022-01-01", "refuse to read at or past this date; \"\" to spend the holdout")
 	cmd.Flags().Float64("capital", 500000, "starting capital in rupees")
+	cmd.Flags().Int("worst-days", 0, "print the N worst single sessions beside the market")
+	cmd.Flags().Bool("by-year", false, "print the book and the benchmark at each year end")
+	cmd.Flags().Bool("equities-only", false,
+		"drop fund units (INF/IN9 ISINs) from the universe; NSE lists ETFs in the same segment as shares")
+	cmd.Flags().String("strategy", "momentum", "momentum, lowvol, reversal or equalweight (see docs/experiments)")
 	cmd.Flags().Int("top", 20, "positions held")
 	cmd.Flags().Int("formation", 12, "months back for the far end of the ranking window")
 	cmd.Flags().Int("skip", 1, "months skipped at the near end")

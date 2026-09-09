@@ -470,3 +470,109 @@ func (s *Store) EntityCloses(ctx context.Context, source string, entityID int64,
 
 // Error makes BoundaryRefusal usable with %w.
 var _ error = BoundaryRefusal{}
+
+// EntityVolatility returns the standard deviation of each entity's daily
+// returns over (from, to], annualised, refusing any entity whose window touches
+// a succession boundary's guard band.
+//
+// The refusal is not optional here and the reason is arithmetic. A 1:10 split
+// inside the window contributes a single -90% daily return, and one such
+// observation in 250 raises the measured standard deviation by roughly an order
+// of magnitude. A low-volatility rule reading that would rank the split company
+// as the most volatile name in the market on the strength of a corporate action,
+// which is the exact inverse of the truth.
+//
+// Annualised by sqrt(252) so the number is readable beside anything else quoted
+// as annual volatility. Ranking is unaffected by the constant; legibility is not.
+func (s *Store) EntityVolatility(ctx context.Context, source string, entityIDs []int64, from, to, asOfIngest time.Time) (map[int64]float64, map[int64]string, error) {
+	vols := map[int64]float64{}
+	skipped := map[int64]string{}
+	ids := uniqueSorted(entityIDs)
+	if len(ids) == 0 {
+		return vols, skipped, nil
+	}
+	if !from.Before(to) {
+		return nil, nil, fmt.Errorf("entity volatility: from %s must be before to %s",
+			from.Format(time.DateOnly), to.Format(time.DateOnly))
+	}
+
+	boundaries, err := s.EntityBoundaries(ctx, ids, asOfIngest)
+	if err != nil {
+		return nil, nil, err
+	}
+	guards, err := s.guardStarts(ctx, source, boundaries, asOfIngest)
+	if err != nil {
+		return nil, nil, err
+	}
+	var clean []int64
+	for _, id := range ids {
+		if r, refused := firstRefusal(id, from, to, boundaries[id], guards); refused {
+			skipped[id] = r.Error()
+			continue
+		}
+		clean = append(clean, id)
+	}
+	if len(clean) == 0 {
+		return vols, skipped, nil
+	}
+
+	// stddev_samp over log returns, computed per entity in one pass. Log
+	// returns rather than simple ones because they add across sessions, which
+	// is what makes the sqrt(252) scaling meaningful.
+	rows, err := s.pool.Query(ctx, `WITH `+entityMapCTE("$5")+`,
+		sel AS (SELECT unnest($4::bigint[]) AS entity_id),
+		mem AS (
+			SELECT m.symbol_id, m.entity_id
+			FROM entity_map m JOIN sel ON sel.entity_id = m.entity_id
+		),
+		latest AS (
+			SELECT DISTINCT ON (b.symbol_id, b.date) b.symbol_id, b.date, b.close
+			FROM bars b JOIN mem ON mem.symbol_id = b.symbol_id
+			WHERE b.source = $1 AND b.date > $2 AND b.date <= $3 AND b.ingested_at <= $5
+			ORDER BY b.symbol_id, b.date, b.ingested_at DESC
+		),
+		ent AS (
+			SELECT mem.entity_id, l.date, l.close::float8 AS close
+			FROM latest l JOIN mem ON mem.symbol_id = l.symbol_id
+			WHERE l.close > 0
+		),
+		rets AS (
+			SELECT entity_id,
+			       ln(close / lag(close) OVER (PARTITION BY entity_id ORDER BY date)) AS r
+			FROM ent
+		)
+		SELECT entity_id, stddev_samp(r) * sqrt(252.0), count(r)
+		FROM rets WHERE r IS NOT NULL
+		GROUP BY entity_id`,
+		source, from, to, clean, asOfIngest)
+	if err != nil {
+		return nil, nil, fmt.Errorf("entity volatility: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var sd *float64
+		var n int64
+		if err := rows.Scan(&id, &sd, &n); err != nil {
+			return nil, nil, err
+		}
+		// A handful of sessions gives a standard deviation that is noise
+		// wearing a number's clothes. 120 is roughly six months of trading.
+		if sd == nil || n < 120 {
+			skipped[id] = fmt.Sprintf("only %d usable daily returns in the window", n)
+			continue
+		}
+		vols[id] = *sd
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	for _, id := range clean {
+		if _, ok := vols[id]; !ok {
+			if _, already := skipped[id]; !already {
+				skipped[id] = "no bars in the window"
+			}
+		}
+	}
+	return vols, skipped, nil
+}

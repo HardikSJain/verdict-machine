@@ -6,7 +6,6 @@ package strategy
 import (
 	"context"
 	"fmt"
-	"sort"
 	"time"
 
 	"github.com/HardikSJain/verdict-machine/internal/cost"
@@ -14,27 +13,31 @@ import (
 	"github.com/HardikSJain/verdict-machine/internal/risk"
 )
 
-// Momentum is 12-1 cross-sectional momentum: rank the liquid point-in-time
-// universe by its return from twelve months ago to one month ago, hold the top
-// N equal-weighted, rebalance monthly, and sit in cash whenever the market
-// filter says the trend is down.
+// Selector is the shared harness for every rule in docs/experiments: rank the
+// point-in-time universe with a Ranker, hold the top N equal-weighted, rebalance
+// on a cadence, and sit in cash whenever the market filter says the trend is
+// down.
 //
-// The skipped final month is not a detail. Cross-sectional momentum reverses
-// at the one-month horizon, so ranking on the most recent month buys what has
-// just run and sells what has just fallen, which is a different and worse
-// strategy wearing the same name.
+// Everything except the ranking is deliberately common. Two rules compared on
+// different cadences, different sizing or a different fill assumption are not
+// being compared at all, and the easiest way to accidentally produce a winner is
+// to give it a harness the others did not have.
 //
-// **The decision is made on the LAST session of a month and fills at the first
-// open of the next**, which is what the design specifies and what the engine's
-// next-open discipline enforces. The strategy never has to think about it: it
-// emits intents on a close and the engine decides when they meet a price.
-type Momentum struct {
-	// FormationMonths is the far end of the ranking window (12).
-	FormationMonths int
-	// SkipMonths is the near end, excluded (1).
-	SkipMonths int
-	// Top is how many names to hold (20).
+// **The decision is made on the LAST session of a rebalance period and fills at
+// the first open of the next**, which the engine's next-open discipline
+// enforces. The strategy never has to think about it: it emits intents on a
+// close and the engine decides when they meet a price.
+type Selector struct {
+	// Ranker decides the order. It is the only thing that differs between the
+	// registered strategies.
+	Ranker Ranker
+	// Top is how many names to hold.
 	Top int
+	// RebalanceMonths is the cadence: 1 is monthly, 12 is annual. Cost is the
+	// binding constraint on every rule tested here -- experiment 002 paid 6.7%
+	// of capital at 7.4x turnover -- so the cadence is a first-class parameter
+	// rather than an assumption baked into the loop.
+	RebalanceMonths int
 	// Filter decides risk-on or risk-off. Never nil; use AlwaysOn to disable.
 	Filter MarketFilter
 
@@ -52,34 +55,70 @@ type Momentum struct {
 	// Result.Unfilled); too large and the book carries permanent cash drag.
 	CashBuffer float64
 
+	// MinTradeNotional is the smallest rupee delta worth trading. Below it a
+	// position is left to drift rather than adjusted.
+	//
+	// It exists because omitting it produced a silent, compounding cash leak.
+	// A rebalance computes a target per name and trades the difference. The
+	// SELL side of that difference always executes -- reducing an overweight
+	// name raises real cash -- while the BUY side is a small top-up that the
+	// risk gate refuses for being below its minimum notional. One side of the
+	// rebalance completes and the other does not, so cash accumulates every
+	// period and never returns to the market. Measured on the equal-weight
+	// yardstick over 2013-2026, the book sat on 15-20% cash permanently and
+	// 152 of its buys were refused on notional alone.
+	//
+	// A band fixes it by making the rule symmetric: a name whose drift is too
+	// small to be worth buying is also too small to be worth selling, so the
+	// cash is never raised in the first place. That is also what a real manager
+	// does, and it is why rebalance bands exist outside backtests.
+	MinTradeNotional float64
+
+	label     string
 	calendar  []time.Time
 	rebalance map[string]bool
 	journal   Journal
 }
 
-// NewMomentum returns the design's v1 parameters unless overridden.
-func NewMomentum(top, formationMonths, skipMonths int, f MarketFilter) (*Momentum, error) {
+// Momentum is retained as the name experiments 001 and 002 were run under.
+type Momentum = Selector
+
+// New builds a Selector.
+func New(label string, r Ranker, top, rebalanceMonths int, f MarketFilter) (*Selector, error) {
+	if r == nil {
+		return nil, fmt.Errorf("strategy: a ranker is required")
+	}
 	if top <= 0 {
 		return nil, fmt.Errorf("strategy: top must be positive, got %d", top)
 	}
-	if formationMonths <= skipMonths || skipMonths < 0 {
-		return nil, fmt.Errorf("strategy: formation %d must exceed skip %d and skip must not be negative",
-			formationMonths, skipMonths)
+	if rebalanceMonths <= 0 || 12%rebalanceMonths != 0 {
+		return nil, fmt.Errorf(
+			"strategy: rebalance months must divide 12 (1, 2, 3, 4, 6 or 12), got %d", rebalanceMonths)
 	}
 	if f == nil {
 		return nil, fmt.Errorf("strategy: a market filter is required; pass AlwaysOn{} to disable it")
 	}
-	return &Momentum{
-		FormationMonths: formationMonths, SkipMonths: skipMonths, Top: top, Filter: f,
-		CashBuffer: 0.01,
-		journal:    Journal{RefusedByScrip: map[string]int{}},
+	return &Selector{
+		Ranker: r, Top: top, RebalanceMonths: rebalanceMonths, Filter: f,
+		CashBuffer: 0.01, label: label,
+		journal: Journal{RefusedByScrip: map[string]int{}},
 	}, nil
 }
 
-func (m *Momentum) Name() string {
-	return fmt.Sprintf("momentum-%d-%d-top%d/%s",
-		m.FormationMonths, m.SkipMonths, m.Top, m.Filter.Name())
+// NewMomentum is experiment 001 and 002's rule, kept so those results stay
+// reproducible from the same call.
+func NewMomentum(top, formationMonths, skipMonths int, f MarketFilter) (*Momentum, error) {
+	if formationMonths <= skipMonths || skipMonths < 0 {
+		return nil, fmt.Errorf("strategy: formation %d must exceed skip %d and skip must not be negative",
+			formationMonths, skipMonths)
+	}
+	label := fmt.Sprintf("momentum-%d-%d-top%d", formationMonths, skipMonths, top)
+	return New(label, ReturnRanker{
+		FormationMonths: formationMonths, SkipMonths: skipMonths, Label: label,
+	}, top, 1, f)
 }
+
+func (m *Selector) Name() string { return m.label + "/" + m.Filter.Name() }
 
 // Journal reports what the strategy saw but could not act on. The engine's
 // Result carries fills, unfilled orders and risk rejections; this carries the
@@ -96,6 +135,10 @@ type Journal struct {
 	// warm-up, or a session missing from the index archive. They are counted
 	// apart from RiskOffSessions because sitting out on a signal and sitting
 	// out on a gap are different facts about a backtest.
+	// DriftSkipped counts adjustments left untraded because they fell inside
+	// the rebalance band. They are a deliberate choice, not a failure, and the
+	// count says how often the book was allowed to drift.
+	DriftSkipped      int
 	UnknownSessions   int
 	LastUnknownReason string
 	Liquidations      int
@@ -184,7 +227,12 @@ func (m *Momentum) loadCalendar(ctx context.Context, s engine.Session) error {
 	m.calendar = sessions
 	m.rebalance = make(map[string]bool, 200)
 	for i := 0; i < len(sessions)-1; i++ {
-		if sessions[i].Month() != sessions[i+1].Month() || sessions[i].Year() != sessions[i+1].Year() {
+		if sessions[i].Month() == sessions[i+1].Month() && sessions[i].Year() == sessions[i+1].Year() {
+			continue
+		}
+		// The last session of a month. Whether it is also a rebalance depends
+		// on the cadence: monthly takes every one, annual takes December's.
+		if int(sessions[i].Month())%m.RebalanceMonths == 0 {
 			m.rebalance[sessions[i].Format(time.DateOnly)] = true
 		}
 	}
@@ -199,44 +247,25 @@ func (m *Momentum) rebalanceTo(ctx context.Context, s engine.Session) ([]risk.In
 	if len(universe) == 0 {
 		return nil, nil
 	}
-	ids := make([]int64, 0, len(universe))
 	scrip := make(map[int64]string, len(universe))
 	for _, u := range universe {
-		ids = append(ids, u.EntityID)
 		scrip[u.EntityID] = u.Scrip
 	}
 
-	from := s.Date.AddDate(0, -m.FormationMonths, 0)
-	to := s.Date.AddDate(0, -m.SkipMonths, 0)
-	rs, err := s.Market.Returns(ctx, ids, from, to)
+	order, refused, absent, err := m.Ranker.Rank(ctx, s, universe)
 	if err != nil {
 		return nil, err
 	}
 
 	m.journal.Rebalances++
-	m.journal.ReturnsRefused += len(rs.Refused)
-	m.journal.ReturnsAbsent += len(rs.Absent)
-	for id := range rs.Refused {
+	m.journal.ReturnsRefused += len(refused)
+	m.journal.ReturnsAbsent += len(absent)
+	for id := range refused {
 		m.journal.RefusedByScrip[scrip[id]]++
 	}
 
-	type scored struct {
-		id  int64
-		ret float64
-	}
-	ranked := make([]scored, 0, len(rs.Priced))
-	for id, r := range rs.Priced {
-		ranked = append(ranked, scored{id, r})
-	}
-	// Descending by return; entity id breaks ties so two identical runs rank
-	// identically. Ranging a map and hoping is how a backtest stops being
-	// reproducible.
-	sort.Slice(ranked, func(i, j int) bool {
-		if ranked[i].ret != ranked[j].ret {
-			return ranked[i].ret > ranked[j].ret
-		}
-		return ranked[i].id < ranked[j].id
-	})
+	priced := len(order)
+	ranked := order
 	if len(ranked) > m.Top {
 		ranked = ranked[:m.Top]
 	}
@@ -244,8 +273,8 @@ func (m *Momentum) rebalanceTo(ctx context.Context, s engine.Session) ([]risk.In
 	target := map[int64]int64{}
 	perName := s.Equity * (1 - m.CashBuffer) / float64(m.Top)
 	var selected []string
-	for _, r := range ranked {
-		px, ok := s.Closes[r.id]
+	for _, id := range ranked {
+		px, ok := s.Closes[id]
 		if !ok || px <= 0 {
 			continue
 		}
@@ -253,12 +282,12 @@ func (m *Momentum) rebalanceTo(ctx context.Context, s engine.Session) ([]risk.In
 		if qty <= 0 {
 			continue
 		}
-		target[r.id] = qty
-		selected = append(selected, scrip[r.id])
+		target[id] = qty
+		selected = append(selected, scrip[id])
 	}
 	m.journal.Rankings = append(m.journal.Rankings, Ranking{
-		Date: s.Date, Universe: len(universe), Priced: len(rs.Priced),
-		Refused: len(rs.Refused), Absent: len(rs.Absent), Selected: selected,
+		Date: s.Date, Universe: len(universe), Priced: priced,
+		Refused: len(refused), Absent: len(absent), Selected: selected,
 	})
 
 	// Sells first, then buys. The engine applies them in that order anyway,
@@ -276,23 +305,39 @@ func (m *Momentum) rebalanceTo(ctx context.Context, s engine.Session) ([]risk.In
 		if want >= h.Quantity {
 			continue
 		}
+		qty := h.Quantity - want
+		// A full exit always trades: a name that has left the target set has to
+		// go regardless of how small the remaining stub is, or it stays in the
+		// book forever. Only a partial trim is subject to the band.
+		if want > 0 && float64(qty)*px < m.MinTradeNotional {
+			m.journal.DriftSkipped++
+			continue
+		}
 		sells = append(sells, risk.Intent{
 			EntityID: h.EntityID, Scrip: h.Scrip, Side: cost.Sell,
-			Product: cost.EquityDelivery, Quantity: h.Quantity - want, Price: px,
+			Product: cost.EquityDelivery, Quantity: qty, Price: px,
 		})
 	}
-	for _, r := range ranked {
-		want, ok := target[r.id]
+	for _, id := range ranked {
+		want, ok := target[id]
 		if !ok {
 			continue
 		}
-		have := s.Portfolio.Positions[r.id].Quantity
+		have := s.Portfolio.Positions[id].Quantity
 		if want <= have {
 			continue
 		}
+		qty := want - have
+		// The same band on the buy side. A new position always trades; a
+		// top-up of an existing one must clear the band, or the gate would
+		// refuse it and the cash raised to fund it would sit idle.
+		if have > 0 && float64(qty)*s.Closes[id] < m.MinTradeNotional {
+			m.journal.DriftSkipped++
+			continue
+		}
 		buys = append(buys, risk.Intent{
-			EntityID: r.id, Scrip: scrip[r.id], Side: cost.Buy,
-			Product: cost.EquityDelivery, Quantity: want - have, Price: s.Closes[r.id],
+			EntityID: id, Scrip: scrip[id], Side: cost.Buy,
+			Product: cost.EquityDelivery, Quantity: qty, Price: s.Closes[id],
 		})
 	}
 	return append(sells, buys...), nil

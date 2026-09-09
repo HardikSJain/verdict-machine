@@ -61,7 +61,12 @@ type Backtest struct {
 	// reason has to be visible next to the result rather than a page away.
 	UnfilledBy   map[string]int
 	RiskRejected int
-	Unverified   map[cost.Component]int
+	// RejectedBy groups risk rejections by rule. A backtest with a large
+	// rejection count is not running the strategy that was written -- it is
+	// running whatever survived the gate -- and the reason has to be visible
+	// beside the result rather than discoverable only by rerunning.
+	RejectedBy map[string]int
+	Unverified map[cost.Component]int
 
 	// BenchmarkIsPriceIndex records that the benchmark carries no dividends,
 	// which understates it by roughly the index's yield and therefore
@@ -72,6 +77,8 @@ type Backtest struct {
 	BenchmarkIsPriceIndex bool
 	SlippageModelled      bool
 	MinNotional           float64
+
+	equity []engine.EquityPoint
 }
 
 // Build computes the summary from an engine result and a benchmark series.
@@ -87,6 +94,7 @@ func Build(res engine.Result, benchmarkName string, benchmark []engine.DatedClos
 	if len(res.Equity) == 0 {
 		return b
 	}
+	b.equity = res.Equity
 	b.FinalNet = res.Equity[len(res.Equity)-1].Equity
 	b.Years = res.To.Sub(res.From).Hours() / 24 / 365.25
 	b.NetCAGR = cagr(startCash, b.FinalNet, b.Years)
@@ -124,6 +132,10 @@ func Build(res engine.Result, benchmarkName string, benchmark []engine.DatedClos
 	b.UnfilledBy = map[string]int{}
 	for _, u := range res.Unfilled {
 		b.UnfilledBy[classify(u.Reason)]++
+	}
+	b.RejectedBy = map[string]int{}
+	for _, r := range res.Rejected {
+		b.RejectedBy[r.Rule]++
 	}
 	b.Trades = roundTrips(res.Fills)
 	b.TradeMean, b.TradeStdDev, b.TradeWinRate = tradeStats(b.Trades)
@@ -244,6 +256,57 @@ func turnover(res engine.Result, years float64) float64 {
 	return traded / avgEquity / years
 }
 
+// EquityCurve exposes the daily book for diagnostics.
+func (b Backtest) EquityCurve() []engine.EquityPoint { return b.equity }
+
+// Yearly is the book at each year end beside the benchmark, so a result that
+// looks wrong can be located in time instead of argued about in aggregate.
+type Yearly struct {
+	Year      int
+	Equity    float64
+	Cash      float64
+	Held      int
+	Return    float64
+	Benchmark float64
+}
+
+// ByYear walks the equity curve and the benchmark together.
+func (b Backtest) ByYear(benchmark []engine.DatedClose) []Yearly {
+	if len(b.equity) == 0 {
+		return nil
+	}
+	bench := map[int]float64{}
+	for _, c := range benchmark {
+		bench[c.Date.Year()] = c.Close
+	}
+	var out []Yearly
+	prevEq, prevBench := 0.0, 0.0
+	lastOfYear := map[int]engine.EquityPoint{}
+	var years []int
+	for _, p := range b.equity {
+		if _, seen := lastOfYear[p.Date.Year()]; !seen {
+			years = append(years, p.Date.Year())
+		}
+		lastOfYear[p.Date.Year()] = p
+	}
+	for _, y := range years {
+		p := lastOfYear[y]
+		row := Yearly{Year: y, Equity: p.Equity, Cash: p.Cash, Held: p.Held}
+		if prevEq > 0 {
+			row.Return = p.Equity/prevEq - 1
+		}
+		if bv, ok := bench[y]; ok {
+			if prevBench > 0 {
+				row.Benchmark = bv/prevBench - 1
+			}
+			prevBench = bv
+		}
+		prevEq = p.Equity
+		out = append(out, row)
+	}
+	return out
+}
+
 // String renders the report. The caveats are part of it, not an appendix.
 func (b Backtest) String() string {
 	var s strings.Builder
@@ -273,6 +336,16 @@ func (b Backtest) String() string {
 
 	p("  fills %d, unfilled %d, risk-rejected %d, min notional %s\n",
 		b.Fills, b.Unfilled, b.RiskRejected, rupees(b.MinNotional))
+	if len(b.RejectedBy) > 0 {
+		var kinds []string
+		for k := range b.RejectedBy {
+			kinds = append(kinds, k)
+		}
+		sort.Slice(kinds, func(i, j int) bool { return b.RejectedBy[kinds[i]] > b.RejectedBy[kinds[j]] })
+		for _, k := range kinds {
+			p("    rejected: %-34s %6d\n", k, b.RejectedBy[k])
+		}
+	}
 	if len(b.UnfilledBy) > 0 {
 		var kinds []string
 		for k := range b.UnfilledBy {

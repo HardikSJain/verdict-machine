@@ -57,7 +57,8 @@ type Universe struct {
 
 // universeOptions holds UniverseAsOf's optional membership-rule overrides.
 type universeOptions struct {
-	allowStale bool
+	allowStale   bool
+	equitiesOnly bool
 }
 
 // UniverseOption customizes UniverseAsOf's membership rule.
@@ -72,6 +73,28 @@ type UniverseOption func(*universeOptions)
 // halted and suspended names in the panel.
 func AllowStaleMembers() UniverseOption {
 	return func(o *universeOptions) { o.allowStale = true }
+}
+
+// EquitiesOnly restricts the universe to companies, dropping fund units.
+//
+// It exists because a ranking rule found the hole. NSE lists ETFs and other
+// fund units in the same cash segment as shares, with the same 'EQ' series, so
+// a universe built from turnover alone contains both: 361 of 2,884 tradeable
+// entities in a recent window, 12.5%, are fund units rather than companies.
+//
+// A momentum rule never noticed, because a money-market ETF has no twelve-month
+// momentum to speak of. A LOW-VOLATILITY rule notices immediately and
+// catastrophically: LIQUIDBEES and its siblings are cash funds whose daily
+// standard deviation is near zero by construction, so "hold the twenty least
+// volatile names" selects six money-market ETFs and some gold, and tests
+// nothing about equities at all.
+//
+// The discriminator is the ISIN prefix, which is the same distinction the
+// succession work already relies on: INE is a company, INF and IN9 are fund
+// units. It is an option rather than the default because experiments 001 and
+// 002 ran without it and their recorded results must stay reproducible.
+func EquitiesOnly() UniverseOption {
+	return func(o *universeOptions) { o.equitiesOnly = true }
 }
 
 // windowCTE defines the point-in-time window. The ranking and the realised
@@ -235,8 +258,9 @@ func (s *Store) UniverseAsOf(ctx context.Context, source string, asOf time.Time,
 		LEFT JOIN entity_label el ON el.entity_id = r.entity_id
 		LEFT JOIN entity_break eb ON eb.entity_id = r.entity_id
 		LEFT JOIN overlap o ON true
+		WHERE $8 = false OR r.entity_id IS NULL OR el.isin LIKE 'INE%'
 		ORDER BY r.median_turnover DESC NULLS LAST, el.ticker
-		LIMIT $6`, source, asOf, since, asOfIngest, lookbackDays, n, requireLastSession)
+		LIMIT $6`, source, asOf, since, asOfIngest, lookbackDays, n, requireLastSession, cfg.equitiesOnly)
 	if err != nil {
 		return Universe{}, fmt.Errorf("universe: %w", err)
 	}
