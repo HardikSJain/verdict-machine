@@ -2,6 +2,7 @@ package strategy_test
 
 import (
 	"context"
+	"sort"
 	"testing"
 	"time"
 
@@ -344,4 +345,86 @@ func (b *blindAt) Stance(_ context.Context, s engine.Session) (strategy.Stance, 
 		return strategy.Unknown, "no index close for this session", nil
 	}
 	return strategy.RiskOn, "test", nil
+}
+
+// TestRebalanceOffsetShiftsTheCalendarInSessions is the fix for a variance the
+// estimate carried unmeasured until experiment 004.
+//
+// Rebalancing on the last session of the month is arbitrary. The risk gate
+// refuses trades under a hard notional floor, so a slightly different fill
+// price can push one order across it and send the book down a different path;
+// a five-basis-point slippage change moved a 4.7-year excess by more than a
+// point. One calendar is one draw. Sweeping the offset and averaging is what
+// makes the number a measurement instead of a coin flip.
+//
+// Two things have to hold for that sweep to mean anything, and both are here:
+// offset 0 must be EXACTLY the old behaviour, or every published result
+// silently changes; and a non-zero offset must move the decisions by that many
+// SESSIONS, not days, or it lands on holidays and drifts.
+func TestRebalanceOffsetShiftsTheCalendarInSessions(t *testing.T) {
+	sessions := weekdays(day(2024, 1, 1), day(2025, 6, 30))
+
+	decisionDates := func(offset int) []time.Time {
+		f := trending(sessions, 5)
+		m, err := strategy.NewMomentum(2, 12, 1, strategy.AlwaysOn{})
+		require.NoError(t, err)
+		m.RebalanceOffset = offset
+
+		sched, _ := cost.NewSchedule(cost.Zerodha)
+		broker, _ := engine.NewPaper(sched, 0)
+		l := risk.DefaultLimits()
+		l.MinNotional = 1000
+		l.MaxStockFraction = 1
+		g, _ := risk.NewGate(l, sched)
+		e, _ := engine.New(f, broker, g, m)
+		res, err := e.Run(context.Background(), 1_000_000)
+		require.NoError(t, err)
+
+		seen := map[time.Time]bool{}
+		var out []time.Time
+		for _, fill := range res.Fills {
+			if !seen[fill.DecidedOn] {
+				seen[fill.DecidedOn] = true
+				out = append(out, fill.DecidedOn)
+			}
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].Before(out[j]) })
+		return out
+	}
+
+	base := decisionDates(0)
+	require.NotEmpty(t, base, "the unshifted rule must trade at all")
+
+	// Offset 0 is the published behaviour: every decision is a month end.
+	index := map[time.Time]int{}
+	for i, d := range sessions {
+		index[d] = i
+	}
+	for _, d := range base {
+		i, ok := index[d]
+		require.True(t, ok, "%s is not a session", d.Format(time.DateOnly))
+		require.NotEqual(t, sessions[i].Month(), sessions[i+1].Month(),
+			"offset 0 must still decide on the LAST session of a month")
+	}
+
+	for _, offset := range []int{1, 3, 7} {
+		shifted := decisionDates(offset)
+		require.NotEmpty(t, shifted)
+
+		// Each shifted decision sits exactly `offset` SESSIONS after a month
+		// end -- counted in the archive's own calendar, so holidays and the
+		// Saturdays NSE trades cannot make it drift.
+		for _, d := range shifted {
+			i, ok := index[d]
+			require.True(t, ok, "%s is not a session", d.Format(time.DateOnly))
+			require.GreaterOrEqual(t, i, offset)
+			prev := sessions[i-offset]
+			require.NotEqual(t, prev.Month(), sessions[i-offset+1].Month(),
+				"offset %d decided on %s, which is not %d sessions past a month end",
+				offset, d.Format(time.DateOnly), offset)
+		}
+
+		require.NotEqual(t, base, shifted,
+			"offset %d produced the same calendar as offset 0, so the sweep would measure nothing", offset)
+	}
 }

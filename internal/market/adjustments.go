@@ -347,3 +347,105 @@ func (s *Store) AdjustmentCoverage(ctx context.Context, asOfIngest time.Time) (b
 		asOfIngest, SourceBhavcopy, SourceEod2).Scan(&both, &bhavOnly)
 	return both, bhavOnly, err
 }
+
+// WindowAdjustment is every share action one entity underwent inside a window,
+// collapsed to the single multiplier a holder would have experienced.
+//
+// Ratio is the product, so a holder of one share at the start of the window
+// holds Ratio shares at the end. ExDates are kept beside it because the fence
+// needs to know not just how much the share count moved but WHEN, in order to
+// tell an explained price break from an unexplained one.
+type WindowAdjustment struct {
+	Ratio   float64
+	ExDates []time.Time
+	// Actions are the individual (ex-date, ratio) pairs, ascending, so a
+	// caller whose real window is narrower than the one queried can take the
+	// product over just its own interval rather than trusting Ratio.
+	Actions []DatedRatio
+}
+
+// DatedRatio is one share action: the session it took effect and what it did
+// to the share count.
+type DatedRatio struct {
+	Date  time.Time
+	Ratio float64
+}
+
+// RatioOver is the product of the actions in (from, to], which is what one
+// share at `from` had become by `to`.
+func (w WindowAdjustment) RatioOver(from, to time.Time) (float64, []time.Time) {
+	ratio := 1.0
+	var dates []time.Time
+	for _, a := range w.Actions {
+		if a.Date.After(from) && !a.Date.After(to) {
+			ratio *= a.Ratio
+			dates = append(dates, a.Date)
+		}
+	}
+	return ratio, dates
+}
+
+// AdjustmentsBetween returns each entity's share actions with an ex-date in
+// (from, to].
+//
+// The half-open interval is the whole correctness argument. An action's
+// ex-date is the first session priced on the NEW share count, so a close ON
+// the ex-date already reflects it. An action at exactly `from` is therefore
+// baked into the opening close and must NOT be applied again; one after `from`
+// and up to `to` happened inside the window and must be.
+//
+// This is what lets the succession fence stop refusing. The fence was built
+// when nothing could recover a corporate action, so its only safe move was to
+// decline the return. It also read ISIN succession dates -- a PROXY for the
+// action, recorded by NSE up to four sessions after the price actually broke,
+// which is why the fence carries a guard band and why it ended up consulting
+// dates in the future. Ex-dates are the event itself and are always in the
+// past when they matter, so a fence built on them cannot look forward.
+func (s *Store) AdjustmentsBetween(ctx context.Context, entityIDs []int64, from, to, asOfIngest time.Time) (map[int64]WindowAdjustment, error) {
+	out := map[int64]WindowAdjustment{}
+	if len(entityIDs) == 0 {
+		return out, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT ON (entity_id, ex_date) entity_id, ex_date, ratio::float8
+		FROM adjustments
+		WHERE entity_id = ANY($1) AND ex_date > $2 AND ex_date <= $3 AND ingested_at <= $4
+		ORDER BY entity_id, ex_date, ingested_at DESC`,
+		entityIDs, from, to, asOfIngest)
+	if err != nil {
+		return nil, fmt.Errorf("adjustments between %s and %s: %w",
+			from.Format(time.DateOnly), to.Format(time.DateOnly), err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var ex time.Time
+		var ratio float64
+		if err := rows.Scan(&id, &ex, &ratio); err != nil {
+			return nil, err
+		}
+		if ratio <= 0 {
+			continue
+		}
+		d := Day(ex.Year(), ex.Month(), ex.Day())
+		w := out[id]
+		if w.Ratio == 0 {
+			w.Ratio = 1
+		}
+		w.Ratio *= ratio
+		w.ExDates = append(w.ExDates, d)
+		w.Actions = append(w.Actions, DatedRatio{Date: d, Ratio: ratio})
+		out[id] = w
+	}
+	return out, rows.Err()
+}
+
+// anyExDateIn reports whether any of these ex-dates falls in [lo, hi].
+func anyExDateIn(exDates []time.Time, lo, hi time.Time) bool {
+	for _, d := range exDates {
+		if !d.Before(lo) && !d.After(hi) {
+			return true
+		}
+	}
+	return false
+}

@@ -769,6 +769,12 @@ func newBacktestCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if off, _ := cmd.Flags().GetInt("rebalance-offset"); off != 0 {
+				if off < 0 {
+					return fmt.Errorf("rebalance-offset must not be negative, got %d", off)
+				}
+				strat.RebalanceOffset = off
+			}
 			if once, _ := cmd.Flags().GetBool("rebalance-once"); once {
 				strat.RebalanceOnce = true
 			}
@@ -999,6 +1005,8 @@ func newBacktestCmd() *cobra.Command {
 	cmd.Flags().String("holdout", "2022-01-01", "refuse to read at or past this date; \"\" to spend the holdout")
 	cmd.Flags().Float64("capital", 500000, "starting capital in rupees")
 	cmd.Flags().Int("worst-days", 0, "print the N worst single sessions beside the market")
+	cmd.Flags().Int("rebalance-offset", 0,
+		"shift every rebalance N sessions past the month end; sweep 0..20 and average to remove the arbitrary calendar (see experiment 005)")
 	cmd.Flags().Bool("rebalance-once", false,
 		"buy the first selection and never trade again; isolates rebalancing from signal")
 	cmd.Flags().Bool("by-year", false, "print the book and the benchmark at each year end")

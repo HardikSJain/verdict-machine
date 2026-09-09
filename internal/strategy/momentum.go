@@ -74,6 +74,26 @@ type Selector struct {
 	// does, and it is why rebalance bands exist outside backtests.
 	MinTradeNotional float64
 
+	// RebalanceOffset shifts every rebalance this many sessions later than the
+	// month end, and it exists to kill a variance the estimate had all along
+	// and nobody had measured.
+	//
+	// Rebalancing on the last session of the month is an arbitrary choice, not
+	// a feature of any strategy. The engine's risk gate refuses a trade below a
+	// hard notional floor, so a fill price a few paise different can push one
+	// order across that line and send the whole book down a different path.
+	// Experiment 004 measured the size of it: perturbing slippage by five basis
+	// points moved a 4.7-year excess by more than a point, NON-MONOTONICALLY.
+	// A single calendar is therefore one draw from a distribution, and
+	// reporting it alone is reporting a coin flip as a measurement.
+	//
+	// Running every offset from 0 to the length of the cycle and averaging is
+	// what a real trader does when they stagger entries, and it cuts the path
+	// variance by roughly the square root of the number of offsets. It is also
+	// the honest denominator: if the spread across offsets is wide, the rule
+	// does not have an edge, it has a lucky calendar.
+	RebalanceOffset int
+
 	// RebalanceOnce buys the first selection and never trades again.
 	//
 	// It is a diagnostic rather than a strategy: comparing it against the same
@@ -249,9 +269,17 @@ func (m *Momentum) loadCalendar(ctx context.Context, s engine.Session) error {
 		}
 		// The last session of a month. Whether it is also a rebalance depends
 		// on the cadence: monthly takes every one, annual takes December's.
-		if int(sessions[i].Month())%m.RebalanceMonths == 0 {
-			m.rebalance[sessions[i].Format(time.DateOnly)] = true
+		if int(sessions[i].Month())%m.RebalanceMonths != 0 {
+			continue
 		}
+		// Offset shifts the date forward in SESSIONS, not days, for the same
+		// reason the month end is read off the archive rather than computed:
+		// a calendar offset would land on holidays and drift.
+		j := i + m.RebalanceOffset
+		if j >= len(sessions) {
+			continue
+		}
+		m.rebalance[sessions[j].Format(time.DateOnly)] = true
 	}
 	return nil
 }

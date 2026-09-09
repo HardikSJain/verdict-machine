@@ -2,6 +2,7 @@ package market_test
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 
@@ -373,4 +374,65 @@ func TestReturnSetAccountedCatchesABookkeepingSlip(t *testing.T) {
 	err = rs.Accounted([]int64{1})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "unrequested [9]")
+}
+
+// TestEntityReturns_PricesAcrossAnExplainedSplitInsteadOfRefusingIt is the
+// fence's purpose changing once the adjustments layer existed.
+//
+// The fence was built when nothing in this project could recover a corporate
+// action, so the only safe response to a window straddling one was to decline
+// the return: better a missing name than a -89.4% that never happened. That
+// cost real candidates -- 353 of the 444 succession boundaries in the live
+// roster have a corroborated action beside them, so four out of five refusals
+// were declining a return that was perfectly computable.
+//
+// With the ratio known, the arithmetic is the same one the portfolio does: a
+// holder of one share before the split holds ten after, so the return is what
+// ten shares are worth against what one cost. 100.35 * 10 / 950 - 1 = +5.6%,
+// and the ranking gets a name it should always have had.
+//
+// The refusal is not deleted, it is narrowed to the cases that still deserve
+// it, which the sibling test above pins: no adjustment, still refused.
+func TestEntityReturns_PricesAcrossAnExplainedSplitInsteadOfRefusingIt(t *testing.T) {
+	ctx := context.Background()
+	pool := testutil.Pool(t)
+	store := market.NewStore(pool)
+	entity := seedSplit(t, store, pool)
+	now := time.Now()
+
+	from, to := market.Day(2022, 7, 1), market.Day(2022, 7, 28)
+
+	// Without the action recorded, the window is refused. That is the old
+	// behaviour and it must survive, because it is the only thing standing
+	// between the ranking and a split-sized fake return.
+	before, err := store.EntityReturns(ctx, "nse-bhavcopy", []int64{entity}, from, to, now)
+	require.NoError(t, err)
+	require.Contains(t, before.Refused, entity, "an unexplained split must still be refused")
+
+	// Now record what actually happened: 1:10, ex-date the 28th. Note the
+	// ex-date is the session the PRICE broke, one before the ISIN changed on
+	// the 29th -- which is exactly why a fence built on ex-dates does not have
+	// to look forward and one built on ISIN boundaries does.
+	n, err := store.InsertAdjustments(ctx, "nse-bhavcopy", []market.Adjustment{{
+		EntityID: entity, ExDate: market.Day(2022, 7, 28), Ratio: 10,
+		Method: "test fixture", Evidence: map[string]any{"fixture": true},
+	}})
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+
+	after, err := store.EntityReturns(ctx, "nse-bhavcopy", []int64{entity}, from, to, time.Now())
+	require.NoError(t, err)
+	require.Empty(t, after.Refused, "the action explains the break; there is nothing left to refuse")
+	require.Empty(t, after.Absent)
+
+	got, ok := after.Priced[entity]
+	require.True(t, ok, "an explained split must produce a number, not a hole in the universe")
+	require.InDelta(t, 10.0, got.ShareRatio, 1e-9)
+	require.Equal(t, []time.Time{market.Day(2022, 7, 28)}, got.ExDates)
+	require.InDelta(t, exDayClose*10/preSplitClose-1, got.Return, 1e-9)
+	require.Greater(t, got.Return, 0.0,
+		"the split was a 5.6%% gain for a holder; the raw closes say -89.4%%")
+
+	// And the number the fence exists to keep out is still not the answer.
+	require.Greater(t, math.Abs(got.Return-(exDayClose/preSplitClose-1)), 0.5)
 }

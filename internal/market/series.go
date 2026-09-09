@@ -80,7 +80,16 @@ type EntityReturn struct {
 	FromClose float64
 	ToDate    time.Time
 	ToClose   float64
-	Return    float64
+
+	// ShareRatio is what one share at FromDate became by ToDate: 2.0 across a
+	// 1:1 bonus, 1.0 when nothing happened. Return already includes it. It is
+	// reported rather than folded away because a return that depended on a
+	// corporate action should be able to say so.
+	ShareRatio float64
+	// ExDates are the actions inside the window, ascending.
+	ExDates []time.Time
+
+	Return float64
 }
 
 // BoundaryRefusal is one entity whose window touches a succession boundary's
@@ -206,6 +215,14 @@ func (s *Store) EntityReturns(ctx context.Context, source string, entityIDs []in
 	if err != nil {
 		return rs, err
 	}
+	// Over a superset of the window: each entity's endpoints can resolve up to
+	// EndpointStaleDays earlier than the requested dates, so the per-entity
+	// interval is applied below rather than here.
+	adjs, err := s.AdjustmentsBetween(ctx, ids,
+		from.AddDate(0, 0, -EndpointStaleDays-1), to, asOfIngest)
+	if err != nil {
+		return rs, err
+	}
 
 	for _, id := range ids {
 		f, t := fromEnd[id], toEnd[id]
@@ -228,7 +245,10 @@ func (s *Store) EntityReturns(ctx context.Context, source string, entityIDs []in
 				f.date.Format(time.DateOnly))
 			continue
 		}
-		if refusal, refused := firstRefusal(id, f.date, t.date, boundaries[id], guards); refused {
+		// The share actions that actually landed inside THIS entity's window,
+		// whose endpoints can sit earlier than the requested dates.
+		ratio, exDates := adjs[id].RatioOver(f.date, t.date)
+		if refusal, refused := firstRefusal(id, f.date, t.date, boundaries[id], guards, adjs[id].ExDates); refused {
 			rs.Refused[id] = refusal
 			continue
 		}
@@ -236,13 +256,18 @@ func (s *Store) EntityReturns(ctx context.Context, source string, entityIDs []in
 			rs.Absent[id] = fmt.Sprintf("non-positive close %g on %s", f.close, f.date.Format(time.DateOnly))
 			continue
 		}
+		// A holder of one share at FromDate holds `ratio` shares at ToDate, so
+		// the return is what those shares are worth, not what one of them is.
+		// Without this a 1:1 bonus reads as -50%.
 		rs.Priced[id] = EntityReturn{
-			EntityID:  id,
-			FromDate:  f.date,
-			FromClose: f.close,
-			ToDate:    t.date,
-			ToClose:   t.close,
-			Return:    t.close/f.close - 1,
+			EntityID:   id,
+			FromDate:   f.date,
+			FromClose:  f.close,
+			ToDate:     t.date,
+			ToClose:    t.close,
+			ShareRatio: ratio,
+			ExDates:    exDates,
+			Return:     t.close*ratio/f.close - 1,
 		}
 	}
 	if err := rs.Accounted(ids); err != nil {
@@ -252,14 +277,54 @@ func (s *Store) EntityReturns(ctx context.Context, source string, entityIDs []in
 }
 
 // firstRefusal returns the earliest boundary whose guard band the window
-// touches.
+// touches AND which no corporate action explains.
 //
 // The window (fromDate, toDate] is unsafe when the price break could lie
 // inside it, and the break lies somewhere in [guardStart, boundary]. So the
 // test is: the window starts before the boundary AND reaches the band. Both
 // endpoints strictly after the boundary is safe (post-split throughout), and
 // both strictly before the band is safe (pre-split throughout).
-func firstRefusal(id int64, fromDate, toDate time.Time, bs []EntityBoundary, guards map[time.Time]time.Time) (BoundaryRefusal, bool) {
+//
+// Two things changed once the adjustments layer existed, and both matter.
+//
+// THE REFUSAL ITSELF NOW HAS AN ALTERNATIVE. The old comment said the only
+// safe move was to decline the return "while adjustments is unbuilt". It is
+// built. A boundary with a corporate action inside its band is an EXPLAINED
+// break: the caller multiplies by the known ratio and gets the return a holder
+// actually earned, so there is nothing to refuse. 353 of 444 boundaries
+// (79.5%) are explained this way and are no longer refused at all.
+//
+// What stays refused is the honest remainder -- a price break with no action
+// this project can recover: a demerger, or an entity with no adjusted series
+// to derive a factor from.
+//
+// ON THE FORWARD REACH, which an audit flagged as lookahead and which is kept
+// deliberately for the unexplained remainder. A boundary is NSE reissuing an
+// ISIN, and NSE records that up to four sessions AFTER the price broke, which
+// is what the guard band measures. Read backwards, that means a boundary up to
+// five sessions past toDate can still refuse the window -- on decision date D,
+// a name dropped because its ISIN changes next week.
+//
+// Clamping it away was tried and is wrong. Tata Steel's 1:10 split has its ex
+// date on 2022-07-28 and its ISIN change on 07-29, so a window ending 07-28
+// loses its protection and prices the -89.4% that the entire fence exists to
+// prevent. The regression test for it is the one that caught this.
+//
+// The resolution is that the boundary is only late EVIDENCE. The fact it
+// stands for -- a 1:10 split effective 2022-07-28 -- was announced weeks ahead
+// and is plainly visible in that session's own price. A trader on 07-28 knows.
+// So the forward reach buys protection from a data artefact rather than
+// foresight about returns, and it can only ever REMOVE a candidate, never
+// invent a winner.
+//
+// It is still second best, so it is now the fallback rather than the rule:
+// with adjustments explaining 79.5% of boundaries, the forward-looking branch
+// is reached in roughly a fifth of the cases it used to be. Replacing it
+// outright means detecting the break from the prices in the window's last few
+// sessions, which needs the daily series the endpoint query does not fetch.
+// That is the remaining work, and it is recorded rather than pretended away.
+func firstRefusal(id int64, fromDate, toDate time.Time, bs []EntityBoundary,
+	guards map[time.Time]time.Time, exDates []time.Time) (BoundaryRefusal, bool) {
 	for _, b := range bs {
 		guard, ok := guards[b.Date]
 		if !ok {
@@ -267,12 +332,16 @@ func firstRefusal(id int64, fromDate, toDate time.Time, bs []EntityBoundary, gua
 			// back to the boundary itself rather than to no guard at all.
 			guard = b.Date
 		}
-		if fromDate.Before(b.Date) && !toDate.Before(guard) {
-			return BoundaryRefusal{
-				EntityID: id, FromDate: fromDate, ToDate: toDate,
-				GuardStart: guard, Boundary: b,
-			}, true
+		if !fromDate.Before(b.Date) || toDate.Before(guard) {
+			continue
 		}
+		if anyExDateIn(exDates, guard, b.Date) {
+			continue
+		}
+		return BoundaryRefusal{
+			EntityID: id, FromDate: fromDate, ToDate: toDate,
+			GuardStart: guard, Boundary: b,
+		}, true
 	}
 	return BoundaryRefusal{}, false
 }
@@ -435,12 +504,16 @@ func (s *Store) EntityCloses(ctx context.Context, source string, entityID int64,
 	if err != nil {
 		return nil, err
 	}
+	adjs, err := s.AdjustmentsBetween(ctx, []int64{entityID}, from, to, asOfIngest)
+	if err != nil {
+		return nil, err
+	}
 	if bs := boundaries[entityID]; len(bs) > 0 {
 		guards, err := s.guardStarts(ctx, source, boundaries, asOfIngest)
 		if err != nil {
 			return nil, err
 		}
-		if refusal, refused := firstRefusal(entityID, from, to, bs, guards); refused {
+		if refusal, refused := firstRefusal(entityID, from, to, bs, guards, adjs[entityID].ExDates); refused {
 			return nil, fmt.Errorf("entity closes: %w", refusal)
 		}
 	}
@@ -463,7 +536,17 @@ func (s *Store) EntityCloses(ctx context.Context, source string, entityID int64,
 		if err := rows.Scan(&d, &c); err != nil {
 			return nil, err
 		}
-		out = append(out, DatedClose{Date: Day(d.Year(), d.Month(), d.Day()), Close: c})
+		day := Day(d.Year(), d.Month(), d.Day())
+		// Back-adjust onto one share basis. The archive prints the price
+		// actually traded, so a 1:1 bonus halves it overnight and a raw series
+		// carries a -50% day that never happened to a holder. Scaling every
+		// close by the actions up TO AND INCLUDING that session makes
+		// consecutive closes comparable, which is what any measure taken over
+		// the series -- a volatility, a drawdown, a moving average -- assumes.
+		if r, _ := adjs[entityID].RatioOver(from.AddDate(0, 0, -1), day); r != 1 {
+			c *= r
+		}
+		out = append(out, DatedClose{Date: day, Close: c})
 	}
 	return out, rows.Err()
 }
@@ -504,9 +587,13 @@ func (s *Store) EntityVolatility(ctx context.Context, source string, entityIDs [
 	if err != nil {
 		return nil, nil, err
 	}
+	adjs, err := s.AdjustmentsBetween(ctx, ids, from, to, asOfIngest)
+	if err != nil {
+		return nil, nil, err
+	}
 	var clean []int64
 	for _, id := range ids {
-		if r, refused := firstRefusal(id, from, to, boundaries[id], guards); refused {
+		if r, refused := firstRefusal(id, from, to, boundaries[id], guards, adjs[id].ExDates); refused {
 			skipped[id] = r.Error()
 			continue
 		}
@@ -531,8 +618,23 @@ func (s *Store) EntityVolatility(ctx context.Context, source string, entityIDs [
 			WHERE b.source = $1 AND b.date > $2 AND b.date <= $3 AND b.ingested_at <= $5
 			ORDER BY b.symbol_id, b.date, b.ingested_at DESC
 		),
+		adj AS (
+			SELECT DISTINCT ON (entity_id, ex_date) entity_id, ex_date, ratio::float8 AS ratio
+			FROM adjustments
+			WHERE entity_id = ANY($4) AND ex_date > $2 AND ex_date <= $3 AND ingested_at <= $5
+			ORDER BY entity_id, ex_date, ingested_at DESC
+		),
 		ent AS (
-			SELECT mem.entity_id, l.date, l.close::float8 AS close
+			-- Back-adjusted onto one share basis. A split inside the window
+			-- puts a -80% session into the raw series, and a standard
+			-- deviation over that reads the arithmetic of the split rather
+			-- than the volatility of the company. exp(sum(ln)) because
+			-- Postgres has no product aggregate and every ratio is positive.
+			SELECT mem.entity_id, l.date,
+			       l.close::float8 * COALESCE((
+			           SELECT exp(sum(ln(a.ratio))) FROM adj a
+			           WHERE a.entity_id = mem.entity_id AND a.ex_date <= l.date
+			       ), 1) AS close
 			FROM latest l JOIN mem ON mem.symbol_id = l.symbol_id
 			WHERE l.close > 0
 		),
