@@ -100,7 +100,31 @@ The report, either way. A null result is the expected outcome and is worth as
 much as a positive one; it is also the outcome this whole apparatus was built to
 be able to believe.
 
-## Verdict: H1 REJECTED (in-sample, 2026-09-08)
+## CORRECTION (2026-09-09): the numbers below were computed with a bug
+
+Corporate actions were never applied to held positions, so a bonus issue halved
+a holding instead of doubling its share count. See experiment 002's correction
+for the whole account; it cost roughly 5.6 points a year here.
+
+| | published below | corrected |
+|---|---|---|
+| H1, with the 200-DMA filter | −5.73% | **−0.13%** |
+| control, no filter | +6.35% (N50) / +5.45% (N500) | **+9.23%** (N500) |
+
+**The verdict does not change and its reasoning is strengthened.** H1's excess is
+−0.13%, which is not positive, so the kill criterion still fires and the holdout
+was still not spent on it. And the gap between the filtered rule and the same
+rule unfiltered widens from about 12 points to **9.4 points of pure cost** with
+none of the drawdown protection it promised — 47.6% filtered against 43.7%
+unfiltered, so the filter now looks slightly WORSE on drawdown as well as on
+return.
+
+Being right for a wrong-sized reason is still being wrong about the size, which
+is why this correction is here rather than left implicit.
+
+---
+
+## SUPERSEDED — Verdict: H1 REJECTED (in-sample, 2026-09-08)
 
 **In-sample net excess: −5.73% against the Nifty 50, −6.63% against the Nifty
 500.** The kill criterion registered above fires. **The holdout was not spent

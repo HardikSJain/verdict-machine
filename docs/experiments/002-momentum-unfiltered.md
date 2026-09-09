@@ -105,7 +105,82 @@ All six from experiment 001 apply unchanged. Two are worse here and one is new:
 The report, either way. If the holdout says no, that is the answer and it goes in
 this file next to everything above it.
 
-## Verdict: H2 NOT SUPPORTED (2026-09-08)
+## CORRECTION (2026-09-09): the verdict below was computed with a bug
+
+**Everything from here to the end of this file is superseded.** It is kept
+rather than rewritten, because a record that quietly replaces a wrong answer
+with a right one teaches nobody anything, and because the size of the error is
+the most useful thing this experiment produced.
+
+### The bug
+
+**Corporate actions were never applied to held positions.** NSE's archive of
+record prints the price actually traded, so a 1:1 bonus halves it overnight. A
+real holder wakes with twice the shares and the same money; this backtest woke
+with the same shares at half the price and had silently lost half that position.
+
+Reliance did this in 2017 and again in 2024. HDFC Bank in 2025. Infosys three
+times. HCL Tech twice, Bajaj Finance twice. Every name a liquid Indian momentum
+book holds. There are 15 to 83 such events a year in liquid names, so a
+twenty-name portfolio met several annually and each one destroyed roughly a
+percent of it.
+
+The design listed an `adjustments` table from the beginning and framed it as a
+signal problem -- a return computed across a split reads -90%. That framing was
+wrong about where the damage was. The signal fence was built and the book was
+left broken, and the book is where the money is.
+
+### The corrected result
+
+| | published below | corrected |
+|---|---|---|
+| in-sample 2013–21 excess | +5.45% | **+9.23%** |
+| **holdout 2022–26 excess** | **+0.78%** | **+9.14%** |
+| holdout max drawdown | 34.8% | 31.4% |
+
+Against the bar this experiment registered in advance -- Nifty 500, minus 1.2
+points for the price index, at 10 bps of slippage per leg -- the corrected
+holdout reads **+8.67%**. It clears. Drawdown is inside the 50% disqualifier.
+
+**By its own pre-registered criteria, H2 is supported.** The verdict below is
+withdrawn.
+
+### Four reasons that is not yet a finding
+
+1. **5.3 points are unexplained.** The equal-weight control in experiment 003 --
+   fifty liquid stocks, no signal at all -- still lags the index by 5.3 points
+   after this repair. A control that cannot track is a harness that is not
+   understood, and every number here carries an error bar of that size until it
+   is closed.
+2. **Against the benchmark this file itself called fairest, the excess is
+   marginal.** Versus the Nifty Midcap 100, closest to what the book actually
+   holds, the corrected holdout excess is +2.09%, or about +0.9% after the
+   dividend adjustment. The Nifty 500 was the registered primary and stays the
+   primary; preferring it now that it flatters the result would be exactly the
+   move this document was written to prevent.
+3. **The holdout has now been read twice.** Once through a bug and once
+   repaired. Re-running after a correctness fix is repair rather than a second
+   attempt -- a number computed with a known defect was never evidence -- but the
+   evidential value of this period is lower than a single clean reading, and
+   pretending otherwise would be dishonest.
+4. **This change turned a null into a strong positive**, which is the exact shape
+   of motivated reasoning. What guards it: the direction and rough size (3 to 8
+   points) were predicted in writing before any corrected number was produced;
+   the twelve largest corrections are verifiable against public record; each
+   action must be independently corroborated by the price move it caused, which
+   rejected 183 of 892 candidates; and the fix moved the control 4 points toward
+   the index rather than only moving the strategy. That is not sufficient. It
+   needs someone hostile to it.
+
+### Status
+
+H2 is **not rejected and not established**. It is a corrected measurement with a
+known unexplained gap, which is a different thing from a result, and nothing
+should be traded on it.
+
+---
+
+## SUPERSEDED — Verdict: H2 NOT SUPPORTED (2026-09-08)
 
 **The holdout is spent.** One run, recorded as `fde17ff7-3e4c-48c0-80db-8c72155e6ea6`
 against snapshot `7a59dbf0…`. `verdict` will report any further reading of this

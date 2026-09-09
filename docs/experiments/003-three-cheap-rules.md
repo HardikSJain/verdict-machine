@@ -124,6 +124,72 @@ The six declared in experiment 001 apply unchanged. Three more apply here:
 3. **The choice of rules was informed by seeing this market.** Not by fitting,
    but not by ignorance either.
 
-## Verdict
+## Verdict: all three REJECTED (2026-09-09)
 
-Not yet run. None of the three is implemented at this commit.
+Run over 2013-01-01 to 2026-09-08 **after** the corporate-action repair described
+below. The numbers from the first attempt are superseded and are kept in the
+history rather than deleted.
+
+| rule | net CAGR | excess vs Nifty 500 | max drawdown | turnover |
+|---|---|---|---|---|
+| **H3 low volatility, annual** | 9.84% | **−2.38%** | 16.5% | 0.9x/yr |
+| **H4 short-term reversal, monthly** | −6.07% | **−18.28%** | 76.4% | 14.0x/yr |
+| **H5 equal weight, annual (yardstick)** | 6.92% | **−5.29%** | 49.5% | 0.5x/yr |
+
+Benchmark: Nifty 500 at 12.21% over the same period.
+
+The registered bar required a positive excess after all three adjustments
+together -- Nifty 500, minus 1.2 points for the price index, at 10 bps of
+slippage. Nothing here is positive before any of them. **All three are
+rejected.**
+
+### What each one says
+
+**H3 is the interesting failure.** Low volatility beat the yardstick by 2.9
+points and did it with a third of the drawdown -- 16.5% against 49.5%. The
+signal works as a signal: sorting on volatility genuinely picked better names
+than not sorting at all. It still lost to the index by 2.4 points, so it is
+rejected, but it is the only rule in this repository whose signal has
+demonstrably contributed anything.
+
+**H4 is the clean confirmation of the cost thesis.** Buying last month's losers
+turned over 14 times a year, paid for it, and lost 18 points to the index with a
+76% drawdown. The per-trade edge was approximately zero and the costs did the
+rest. This is the outcome the whole cost model was built to be able to measure,
+and it measured it.
+
+**H5, the yardstick, is the finding that matters most and it is not a result
+about strategies at all.** Holding fifty of the most-traded Indian stocks equal
+weighted should roughly track a broad index. It lags by 5.3 points, and **that
+gap is not yet explained.** Until it is, every number in this table and in
+experiments 001 and 002 carries an error bar of that size. Candidate causes,
+none confirmed: the 681 entities with no adjusted series, whose corporate
+actions remain unrecoverable; the residual ~10% cash; and the genuine drag of
+equal-weighting a turnover-ranked universe that included RCOM, UNITECH,
+JPASSOCIAT and other eventual zeros while rebalancing into them as they fell.
+
+### Two defects these rules exposed
+
+**The universe contained fund units.** NSE lists ETFs in the same cash segment as
+shares with the same series, so 361 of 2,884 tradeable entities were funds. "Hold
+the twenty least volatile names" selected six money-market ETFs and some gold: at
+the first attempt H3 tested nothing about equities and returned 1.53%. Momentum
+never noticed because a cash fund has no twelve-month momentum. Fixed by
+filtering on the ISIN prefix.
+
+**The rebalance leaked cash.** It traded the difference between target and
+holding; the sell side always executed and the buy side was refused for falling
+under the minimum notional, so one half of every rebalance completed. A symmetric
+band fixed it.
+
+### And the one that invalidated everything
+
+Corporate actions were never applied to held positions. That is documented in
+experiment 002's correction; it cost these three rules between 3 and 4 points
+each, and it is why the first run of this experiment is superseded.
+
+### Verdict
+
+**All three rejected.** The low-volatility signal is the only one worth
+remembering, and only as a direction: low volatility plus something else, at low
+turnover, is the shape that has come closest.
