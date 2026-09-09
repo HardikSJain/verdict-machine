@@ -3,40 +3,73 @@
 A research system for testing whether a stock-trading rule actually works, built
 for the Indian market (NSE).
 
-It was built to answer one question about one strategy. **The answer was no**,
-and the interesting part is why that answer can be believed.
+It was built to answer one question about one strategy, and its most useful
+output so far has been **finding a bug in itself that made every earlier answer
+wrong**.
 
 Nothing here is financial advice, and nothing here is running with money.
 
 ---
 
-## The result
+## Where it stands
 
-Two hypotheses were registered in advance, with their kill criteria and their
-limitations written down **before** any number existed. Both were rejected.
+Three hypotheses were registered in advance — rules, kill criteria and
+limitations written down before any number existed. Then a defect was found that
+invalidated all of their numbers, they were corrected, and the corrections are
+recorded beside the originals rather than replacing them.
 
-| | in-sample 2013–21 | holdout 2022–26 |
+| | first answer | corrected |
 |---|---|---|
-| 12-1 momentum **with** a 200-day trend filter | **−5.73%** vs Nifty 50 | never run — killed in-sample |
-| 12-1 momentum **without** the filter | +5.45% vs Nifty 500 | **+0.78%** |
+| 12-1 momentum **with** a 200-day trend filter | −5.73% | **−0.13%** — rejected |
+| 12-1 momentum **without** the filter, out-of-sample | +0.78% | **+9.14%** — withdrawn rejection |
+| Low volatility, annual | −5.78% | **−2.38%** — rejected |
+| Short-term reversal, monthly | −22.71% | **−18.28%** — rejected |
+| Equal weight, annual (the control) | −9.47% | **−5.29%** |
 
-That +0.78% is not an excess return, by a limitation declared before the run: the
-benchmark is a price index, it excludes roughly 1.2% a year of dividends, and an
-excess smaller than that is not an excess. Against a total-return benchmark the
-strategy returned about **−0.4%**. Ten basis points of slippage a leg — modest
-for a book turning over 7.4 times a year — takes it to **−1.44%**. Against the
-Nifty Midcap 100, which is closer to what the book actually holds, it loses by
-**6.27%**.
+All excesses are against the Nifty 500 after every modelled cost.
 
-The full reasoning, including everything declared before the result, is in
-[docs/experiments](docs/experiments/).
+**The one that matters is the second row.** Against the bar registered in advance
+— Nifty 500, minus 1.2 points for the benchmark being a price index, at 10 basis
+points of slippage — it now reads +8.67% and clears. That is *not* being reported
+as a finding, for reasons kept in
+[docs/experiments](docs/experiments/002-momentum-unfiltered.md): the control
+still lags the index by 5.3 points that nobody has explained, so every number
+carries that error bar; against the Midcap 100, which is closer to what the book
+actually holds, the excess is about +0.9% after dividends; and turning a null
+into a positive is the exact shape of motivated reasoning, so the guards are
+listed and declared insufficient.
 
-**The holdout is spent.** 2022–2026 got exactly one reading, it is recorded in
-the `runs` table, and any further reading is reported as the repetition it is.
+## The bug that changed all of it
 
-## Why the null is believable
+NSE's archive of record prints the price actually traded, so a 1:1 bonus halves
+it overnight. A real holder wakes up with **twice the shares and the same money**.
+This backtest woke up with the same shares at half the price and had silently
+lost half that position.
 
-Getting a negative result is easy. Getting one you can trust is the work.
+Reliance did this in 2017 and again in 2024. HDFC Bank in 2025. Infosys three
+times. HCL Tech twice, Bajaj Finance twice — every name a liquid Indian portfolio
+holds. Fifteen to eighty-three such events a year occur in liquid names, so a
+twenty-name book met several annually and each destroyed roughly a percent of it.
+
+The design had listed an `adjustments` table from the start, and framed it as a
+*signal* problem: a return computed across a split reads −90%. That framing was
+wrong about where the damage was. The fence protecting signals was built, the
+book was left broken, and the book is where the money is.
+
+The repair derives the factors rather than guessing them. bhavcopy is unadjusted
+and eod2 is adjusted, so the ratio between them is the cumulative corporate
+action — flat between events, stepping at each one. Two filters keep it honest:
+eod2 also adjusts for dividends, which pay cash rather than changing a share
+count, so a step must match a ratio of small whole numbers; and the **price must
+corroborate** it, which rejected 183 of 892 candidates where the two sources
+disagreed about which day the action landed. 709 verified actions, and the
+control moved four points toward the index.
+
+## Why the numbers are worth reading anyway
+
+
+Getting a number is easy. Getting one you can trust is the work, and the bug
+above is the argument for every check below it.
 
 **No survivorship bias.** The convenient data source silently drops companies
 that died. Ask this system for the top 500 stocks of June 2015 and it returns Jet
@@ -66,7 +99,7 @@ versioned table at its own ingest pin, a `config_hash` including the entity
 roster actually applied, and the git commit. A replay that reproduces all three
 and gets a different number has found a bug.
 
-## Four bugs that would have made the answer wrong
+## Four more bugs that would have made the answer wrong
 
 Each was found by running against real data, and each would have flattered or
 distorted the result silently.
@@ -182,7 +215,16 @@ change to STT fails the build.
 
 ## Status
 
-Milestones 0 and 1 are complete: the data foundation, and a first honest verdict.
+Milestones 0 and 1 are complete: the data foundation, and a first honest verdict
+— which then had to be corrected, which is the more useful half of the story.
+
+**Open and unresolved:** the equal-weight control lags a broad index by 5.3
+points and nobody knows why. Candidates are the 681 entities with no adjusted
+series and therefore no recoverable corporate actions, the residual cash a
+rebalance band leaves undeployed, and the genuine drag of equal-weighting a
+turnover-ranked universe that held RCOM, UNITECH and other eventual zeros while
+buying more of them as they fell. Until that is closed, no result here is worth
+more than its error bar.
 
 Milestones 2 through 5 — a hash-chained ledger, an evening alert pipeline, a
 supervised alert phase, and limited autonomy — were designed to *trade* a
