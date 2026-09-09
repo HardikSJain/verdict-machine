@@ -64,7 +64,7 @@ ones that fail cannot be read as the whole story.
 
 ## Verdict
 
-Not yet run.
+Registered above, before any attack was run. The outcome is below the rule.
 
 ---
 
@@ -77,9 +77,9 @@ and both are reported before the scores because both change how to read them.
 measurement of the holdout.** A4 asked me to count unexplained drops in the
 momentum book. There were three, and all three were traced rather than counted.
 One of them, Ami Organics falling 51.4% in one session, was a 1:2 split the
-adjustment layer had missed: Ami Organics reissued
-its ISIN at the split, as NSE always does, and then renamed itself to Acutaas
-Chemicals. Symbols are labelled by their latest ticker, so the pre-split
+adjustment layer had missed: it reissued its ISIN at the split, as NSE always
+does, and then renamed itself to Acutaas Chemicals.
+Symbols are labelled by their latest ticker, so the pre-split
 unadjusted bars read AMIORG and the whole adjusted series read ACUTAAS, and the
 join that was supposed to span the ISIN seam never brought them together.
 
