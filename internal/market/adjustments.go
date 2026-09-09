@@ -135,30 +135,56 @@ func (s *Store) DetectAdjustments(ctx context.Context, minStep, fracTol float64,
 	if minStep <= 0 || minStep >= 1 {
 		return nil, sum, fmt.Errorf("adjustments: minStep must be in (0,1), got %g", minStep)
 	}
+	// The two series are joined by TICKER, not by entity, and that choice is the
+	// difference between catching Yes Bank's 2017 split and missing it.
+	//
+	// eod2 files a ticker's whole history under ONE symbol -- its current ISIN --
+	// while the unadjusted archive splits that history across every ISIN the
+	// company ever had. Joining on entity therefore breaks wherever the roster
+	// has not linked two ISINs together, and the factor series is cut in two at
+	// exactly the boundary where the corporate action lives. Yes Bank holds
+	// three ISINs across two entities because the roster linked two and
+	// quarantined the third, so its 1:5 split fell across the seam and vanished.
+	//
+	// A ticker spans that seam by construction. The risk it introduces is ticker
+	// REUSE -- one label meaning two companies at different times -- and the
+	// price corroboration below is what makes that safe: a reused ticker
+	// produces a ratio the price does not confirm, and is dropped.
+	//
+	// The action is then attributed back to whichever entity holds that ticker
+	// on the ex-date, because that is what the engine's book is keyed on.
 	rows, err := s.pool.Query(ctx, `WITH `+entityMapCTE("$1")+`,
+		lbl AS (
+			SELECT DISTINCT ON (symbol_id) symbol_id, ticker
+			FROM symbols WHERE ingested_at <= $1
+			ORDER BY symbol_id, ingested_at DESC
+		),
 		bhav AS (
-			SELECT DISTINCT ON (m.entity_id, b.date) m.entity_id, b.date, b.close::float8 AS close
-			FROM bars b JOIN entity_map m ON m.symbol_id = b.symbol_id
+			SELECT DISTINCT ON (l.ticker, b.date) l.ticker, b.date,
+			       b.close::float8 AS close, m.entity_id
+			FROM bars b
+			JOIN lbl l ON l.symbol_id = b.symbol_id
+			JOIN entity_map m ON m.symbol_id = b.symbol_id
 			WHERE b.source = $2 AND b.ingested_at <= $1 AND b.close > 0
-			ORDER BY m.entity_id, b.date, b.ingested_at DESC
+			ORDER BY l.ticker, b.date, b.ingested_at DESC
 		),
 		adj AS (
-			SELECT DISTINCT ON (m.entity_id, b.date) m.entity_id, b.date, b.close::float8 AS close
-			FROM bars b JOIN entity_map m ON m.symbol_id = b.symbol_id
+			SELECT DISTINCT ON (l.ticker, b.date) l.ticker, b.date, b.close::float8 AS close
+			FROM bars b
+			JOIN lbl l ON l.symbol_id = b.symbol_id
 			WHERE b.source = $3 AND b.ingested_at <= $1 AND b.close > 0
-			ORDER BY m.entity_id, b.date, b.ingested_at DESC
+			ORDER BY l.ticker, b.date, b.ingested_at DESC
 		),
 		f AS (
-			SELECT bhav.entity_id, bhav.date,
-			       bhav.close AS bhav_close, adj.close AS adj_close,
-			       bhav.close / adj.close AS factor
-			FROM bhav JOIN adj USING (entity_id, date)
+			SELECT bhav.ticker, bhav.date, bhav.entity_id,
+			       bhav.close AS bhav_close, bhav.close / adj.close AS factor
+			FROM bhav JOIN adj USING (ticker, date)
 		),
 		stepped AS (
-			SELECT entity_id, date, bhav_close, adj_close, factor,
-			       lag(factor)     OVER (PARTITION BY entity_id ORDER BY date) AS prev_factor,
-			       lag(bhav_close) OVER (PARTITION BY entity_id ORDER BY date) AS prev_bhav,
-			       lag(date)       OVER (PARTITION BY entity_id ORDER BY date) AS prev_date
+			SELECT ticker, date, entity_id, bhav_close, factor,
+			       lag(factor)     OVER (PARTITION BY ticker ORDER BY date) AS prev_factor,
+			       lag(bhav_close) OVER (PARTITION BY ticker ORDER BY date) AS prev_bhav,
+			       lag(date)       OVER (PARTITION BY ticker ORDER BY date) AS prev_date
 			FROM f
 		)
 		SELECT entity_id, date, prev_date, prev_factor / factor AS ratio,

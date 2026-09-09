@@ -134,9 +134,15 @@ left broken, and the book is where the money is.
 
 | | published below | corrected |
 |---|---|---|
-| in-sample 2013–21 excess | +5.45% | **+9.23%** |
-| **holdout 2022–26 excess** | **+0.78%** | **+9.14%** |
+| in-sample 2013–21 excess | +5.45% | **+10.64%** |
+| **holdout 2022–26 excess** | **+0.78%** | **+8.27%** |
 | holdout max drawdown | 34.8% | 31.4% |
+
+(An earlier revision of this correction read +9.23% and +9.14%. The detector was
+then changed to join the two sources by TICKER rather than by entity, which
+recovers corporate actions that fall across an unlinked ISIN boundary -- Yes
+Bank's 2017 1:5 split among them -- and moved both figures. The numbers above
+are the current ones.)
 
 Against the bar this experiment registered in advance -- Nifty 500, minus 1.2
 points for the price index, at 10 bps of slippage per leg -- the corrected
@@ -147,11 +153,20 @@ withdrawn.
 
 ### Four reasons that is not yet a finding
 
-1. **5.3 points are unexplained.** The equal-weight control in experiment 003 --
-   fifty liquid stocks, no signal at all -- still lags the index by 5.3 points
-   after this repair. A control that cannot track is a harness that is not
-   understood, and every number here carries an error bar of that size until it
-   is closed.
+1. **The control's lag is now decomposed, and about two points of it are still
+   artefact.** The equal-weight control -- fifty liquid stocks, no signal at all
+   -- lags the index by 5.25 points. Measured: **1.34 points** of that is
+   re-selection, since buying the first basket and never trading returns 8.27%
+   against 6.97% rebalanced annually, so ranking by turnover each year actively
+   picks worse names; roughly **1.2 points** is cash the rebalance band leaves
+   undeployed; **half a point to a point** is corporate actions still not
+   recovered, chiefly demergers, which this layer cannot express because the
+   holder receives shares in a NEW company; and the remainder is a static
+   equal-weighted basket of turnover-ranked names genuinely trailing a
+   continuously refreshed cap-weighted index. Most of it is real. The roughly two
+   points that are not run AGAINST the strategy, so this result is more likely
+   understated than overstated -- which is the direction to prefer, and still an
+   error bar.
 2. **Against the benchmark this file itself called fairest, the excess is
    marginal.** Versus the Nifty Midcap 100, closest to what the book actually
    holds, the corrected holdout excess is +2.09%, or about +0.9% after the
