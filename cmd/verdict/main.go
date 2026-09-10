@@ -204,12 +204,18 @@ func newBackfillCmd() *cobra.Command {
 				return err
 			}
 			defer pool.Close()
-			sum, err := bhavcopy.Backfill(cmd.Context(), market.NewStore(pool), bhavcopy.NewFetcher(), from, to, delay, cmd.ErrOrStderr())
+			run := bhavcopy.Backfill
+			if refetch, _ := cmd.Flags().GetBool("refetch"); refetch {
+				run = bhavcopy.Refetch
+			}
+			sum, err := run(cmd.Context(), market.NewStore(pool), bhavcopy.NewFetcher(), from, to, delay, cmd.ErrOrStderr())
 			fmt.Fprintf(cmd.OutOrStdout(), "backfill: fetched %d, no-file %d, errors %d, skipped %d, inserted %d bars\n",
 				sum.Fetched, sum.NoFile, sum.Errors, sum.Skipped, sum.Inserted)
 			return err
 		},
 	}
+	cmd.Flags().Bool("refetch", false,
+		"read every session again, ignoring ingest_log; needed when a parser change makes an old file mean more than it did")
 	cmd.Flags().String("from", "2011-09-01", "first session date (YYYY-MM-DD)")
 	cmd.Flags().String("to", "", "last session date (default today)")
 	cmd.Flags().Duration("delay", 750*time.Millisecond, "pause between requests")

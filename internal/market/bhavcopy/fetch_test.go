@@ -51,7 +51,7 @@ func TestFetch_UnzipsAndParses_And404MeansNoFile(t *testing.T) {
 	bars, found, err := f.Fetch(context.Background(), market.Day(2015, 6, 30))
 	require.NoError(t, err)
 	require.True(t, found)
-	require.Len(t, bars, 1447)
+	require.Len(t, bars, 1487, "1447 EQ plus 40 BE")
 	require.Equal(t, "verdict-machine-test", gotUA)
 
 	bars, found, err = f.Fetch(context.Background(), market.Day(2015, 6, 28))

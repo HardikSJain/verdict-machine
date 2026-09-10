@@ -11,6 +11,16 @@ import (
 	"github.com/HardikSJain/verdict-machine/internal/market"
 )
 
+func countSeries(bars []market.Bar, series string) int {
+	n := 0
+	for _, b := range bars {
+		if b.Series == series {
+			n++
+		}
+	}
+	return n
+}
+
 func find(bars []market.Bar, ticker string) (market.Bar, bool) {
 	for _, b := range bars {
 		if b.Ticker == ticker {
@@ -27,7 +37,12 @@ func TestParseLegacy_2015KeepsEQAndCarriesTurnover(t *testing.T) {
 
 	bars, err := Parse("cm30JUN2015bhav.csv", f)
 	require.NoError(t, err)
-	require.Len(t, bars, 1447, "only series EQ rows are kept")
+	require.Len(t, bars, 1487, "1447 EQ plus 40 BE; the N2/N6/BZ rows are other instruments and stay out")
+	require.Equal(t, 40, countSeries(bars, "BE"),
+		"BE is the same company under trade-for-trade settlement, and dropping it punched multi-month holes in the archive")
+	for _, b := range bars {
+		require.True(t, Segments[b.Series], "%s came in as series %s", b.Ticker, b.Series)
+	}
 
 	dhfl, ok := find(bars, "DHFL")
 	require.True(t, ok, "DHFL was listed in 2015 and is absent from eod2 today")
@@ -47,7 +62,7 @@ func TestParseLegacy_2020TwoDigitYearParses(t *testing.T) {
 
 	bars, err := Parse("cm13JUL2020bhav.csv", f)
 	require.NoError(t, err)
-	require.Len(t, bars, 4, "only series EQ rows are kept; the two BE rows are filtered out")
+	require.Len(t, bars, 6, "4 EQ and 2 BE; BE is kept now")
 
 	for _, b := range bars {
 		require.Equal(t, market.Day(2020, 7, 13), b.Date, "TIMESTAMP %q must parse to the two-digit-year session", "13-Jul-20")
@@ -72,9 +87,11 @@ func TestParseUDiFF_2026KeepsEQAndCarriesTurnover(t *testing.T) {
 
 	bars, err := Parse("BhavCopy_NSE_CM_0_0_0_20260828_F_0000.csv", f)
 	require.NoError(t, err)
-	require.NotEmpty(t, bars)
+	require.Len(t, bars, 198, "180 EQ plus 18 BE")
+	require.Equal(t, 18, countSeries(bars, "BE"))
 	for _, b := range bars {
-		require.Equal(t, "EQ", b.Series)
+		require.True(t, Segments[b.Series],
+			"%s came in as series %s; GB, SM and ST are other instruments", b.Ticker, b.Series)
 	}
 
 	ts, ok := find(bars, "TATASTEEL")
@@ -174,12 +191,12 @@ func TestParsePreISINArchive(t *testing.T) {
 
 		bars, err := Parse("cm01OCT2007bhav.csv", f)
 		require.NoError(t, err)
-		require.Len(t, bars, 36, "the 3 BE rows in this sample must be dropped")
+		require.Len(t, bars, 39, "36 EQ and 3 BE")
 		require.Equal(t, "3IINFOTECH", bars[0].Ticker)
 		require.Equal(t, market.Day(2007, 10, 1), bars[0].Date)
 		require.InDelta(t, 150.25, bars[0].Close, 1e-9)
 		for _, b := range bars {
-			require.Equal(t, "EQ", b.Series)
+			require.True(t, Segments[b.Series])
 			require.Empty(t, b.ISIN)
 		}
 	})
@@ -219,4 +236,44 @@ func TestArchiveStartIsTheDayTheExchangeOpened(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, ArchiveStart, bars[0].Date,
 		"the constant and the exchange's first session must be the same day")
+}
+
+// TestBlockDealsWouldShadowTheRealSessionAndAreRefused is why Segments is an
+// allowlist rather than a blocklist.
+//
+// bars is keyed on (symbol_id, date, source, ingested_at). SERIES IS NOT IN
+// THE KEY. So two rows for one security on one session are indistinguishable
+// from a corrected bar, and the store keeps the later one -- a block deal,
+// which is a single negotiated trade, would silently replace that session's
+// real open, high, low and close, and no reader downstream could tell.
+//
+// It is not hypothetical: SFCL on 2015-06-30 and FAIRCHEM on 2018-10-01 each
+// appear under BL and EQ with the same ISIN on the same date in NSE's own
+// files. EQ and BE never collide that way, which is exactly why those two are
+// the list.
+//
+// The guard lives in the parser so widening Segments fails loudly at the point
+// of entry instead of quietly rewriting a price.
+func TestBlockDealsWouldShadowTheRealSessionAndAreRefused(t *testing.T) {
+	const csv = "SYMBOL,SERIES,OPEN,HIGH,LOW,CLOSE,LAST,PREVCLOSE,TOTTRDQTY,TOTTRDVAL,TIMESTAMP,TOTALTRADES,ISIN\n" +
+		"SFCL,EQ,10,11,9,10.5,10.5,10,1000,10500,30-JUN-2015,50,INE935O01010\n" +
+		"SFCL,BL,10.4,10.4,10.4,10.4,10.4,10,500000,5200000,30-JUN-2015,1,INE935O01010\n"
+
+	// As shipped, BL is not in Segments, so only the real session survives.
+	bars, err := Parse("collision", strings.NewReader(csv))
+	require.NoError(t, err)
+	require.Len(t, bars, 1)
+	require.Equal(t, "EQ", bars[0].Series)
+	require.Equal(t, 10.5, bars[0].Close, "the real close, not the block deal's")
+
+	// Widen the allowlist and the guard must stop it rather than let one row
+	// overwrite the other.
+	Segments["BL"] = true
+	defer delete(Segments, "BL")
+
+	_, err = Parse("collision", strings.NewReader(csv))
+	require.Error(t, err, "a security appearing twice in one session must be refused, not stored twice")
+	require.ErrorContains(t, err, "SFCL")
+	require.ErrorContains(t, err, "2015-06-30")
+	require.ErrorContains(t, err, "revision")
 }

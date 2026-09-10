@@ -57,6 +57,31 @@ func has(col map[string]int, names ...string) bool {
 	return true
 }
 
+// Segments are the series this archive keeps, and the list is short for a
+// reason that is structural rather than editorial.
+//
+// EQ is normal rolling settlement. BE is trade-for-trade -- NSE's surveillance
+// segment -- and it is the SAME instrument under a stricter settlement rule,
+// not a different security. Keeping only EQ made companies disappear: Aplab and
+// Gufic Bio traded EQ on 2011-06-09, BE from 07-04 and EQ again in September,
+// never missing a session, and this archive showed a three-month hole. BE runs
+// 2% to 17% of the EQ population depending on era, so those holes are common.
+//
+// Everything else stays out, and BL is the reason the list is an allowlist
+// rather than "not the obviously-weird ones". BL is block deals, and a block
+// deal is a SECOND row for a security that already has an ordinary one:
+// SFCL on 2015-06-30 and FAIRCHEM on 2018-10-01 each appear under BL and EQ
+// with the SAME ISIN on the SAME date. bars is keyed on
+// (symbol_id, date, source, ingested_at) -- series is NOT in the key -- so
+// storing both would file the block deal as a REVISION of the real session and
+// the reader would take whichever landed last. Measured across four sample
+// dates, EQ and BE never collide that way and BL does.
+//
+// duplicateIdentity below enforces that invariant at the point of entry, so
+// widening this list to something that collides fails loudly instead of
+// quietly rewriting a close.
+var Segments = map[string]bool{"EQ": true, "BE": true}
+
 // layout maps the fields we need onto a format's column names. dateFmts is
 // tried in order; the first layout that parses the column value wins.
 type layout struct {
@@ -128,7 +153,8 @@ func parseRows(name string, cr *csv.Reader, l layout, col map[string]int) ([]mar
 		if err != nil {
 			return nil, fmt.Errorf("bhavcopy %s line %d: %w", name, line, err)
 		}
-		if field(rec, l.series) != "EQ" {
+		series := field(rec, l.series)
+		if !Segments[series] {
 			continue
 		}
 		dateVal := field(rec, l.date)
@@ -142,7 +168,7 @@ func parseRows(name string, cr *csv.Reader, l layout, col map[string]int) ([]mar
 		if err != nil {
 			return nil, fmt.Errorf("bhavcopy %s line %d: date %q: %w", name, line, dateVal, err)
 		}
-		b := market.Bar{Ticker: field(rec, l.ticker), Series: "EQ",
+		b := market.Bar{Ticker: field(rec, l.ticker), Series: series,
 			Date: market.Day(d.Year(), d.Month(), d.Day())}
 		if l.isin != "" {
 			b.ISIN = field(rec, l.isin)
@@ -174,7 +200,48 @@ func parseRows(name string, cr *csv.Reader, l layout, col map[string]int) ([]mar
 		}
 		bars = append(bars, b)
 	}
+	if dup, ok := duplicateIdentity(bars); ok {
+		return nil, fmt.Errorf(
+			"bhavcopy %s: %s appears twice on %s (series %s and %s); bars is keyed without series, so storing both would file one as a revision of the other",
+			name, dup.who, dup.date.Format(time.DateOnly), dup.a, dup.b)
+	}
 	return bars, nil
+}
+
+type identityClash struct {
+	who  string
+	date time.Time
+	a, b string
+}
+
+// duplicateIdentity finds any security appearing twice for one session.
+//
+// It guards the bars primary key, which is (symbol_id, date, source,
+// ingested_at) and does NOT include series. Two rows for one security on one
+// date are therefore indistinguishable from a corrected bar, and the store
+// would keep the later one -- so a block-deal row would silently replace the
+// session's real open, high, low and close. Catching it here, in the parser,
+// means the failure is a build-stopping error naming both series rather than a
+// wrong price nobody can trace.
+func duplicateIdentity(bars []market.Bar) (identityClash, bool) {
+	type key struct {
+		id   string
+		date time.Time
+	}
+	seen := make(map[key]string, len(bars))
+	for _, b := range bars {
+		id := b.ISIN
+		if id == "" {
+			// The pre-ISIN era has no other identity to check against.
+			id = b.Ticker
+		}
+		k := key{id: id, date: b.Date}
+		if prev, ok := seen[k]; ok {
+			return identityClash{who: b.Ticker, date: b.Date, a: prev, b: b.Series}, true
+		}
+		seen[k] = b.Series
+	}
+	return identityClash{}, false
 }
 
 // udiffStart is the first session NSE published in the UDiFF layout.

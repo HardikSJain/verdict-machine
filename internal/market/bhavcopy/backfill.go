@@ -78,10 +78,37 @@ var ArchiveStart = market.Day(1994, 11, 3)
 // cheap 404, and the benefit is a set of session dates decided by NSE rather
 // than by time.Weekday.
 func Backfill(ctx context.Context, store *market.Store, f *Fetcher, from, to time.Time, delay time.Duration, log io.Writer) (Summary, error) {
+	return backfill(ctx, store, f, from, to, delay, false, log)
+}
+
+// Refetch is Backfill without the ingest_log skip: every date in the range is
+// requested again, whatever it settled as before.
+//
+// It exists because a PARSER change can make an old file mean more than it did.
+// Keeping only series EQ meant a company moving to the BE surveillance segment
+// vanished from this archive for months at a time; once BE is kept, every
+// session already ingested is missing rows that its file always contained. The
+// dates are settled, so an ordinary backfill would skip all of them and the
+// archive would stay wrong until someone noticed.
+//
+// It is safe to run because bars is insert-only and content-addressed:
+// unchanged rows insert nothing, and genuinely new ones arrive as new rows
+// rather than overwriting anything. It is a separate entry point rather than a
+// default so that re-reading the whole archive is always a decision somebody
+// made.
+func Refetch(ctx context.Context, store *market.Store, f *Fetcher, from, to time.Time, delay time.Duration, log io.Writer) (Summary, error) {
+	return backfill(ctx, store, f, from, to, delay, true, log)
+}
+
+func backfill(ctx context.Context, store *market.Store, f *Fetcher, from, to time.Time, delay time.Duration, refetch bool, log io.Writer) (Summary, error) {
 	var sum Summary
 	done, err := store.LoggedDates(ctx, market.SourceBhavcopy)
 	if err != nil {
 		return sum, err
+	}
+	if refetch {
+		fmt.Fprintf(log, "refetch: ignoring %d settled dates and reading every session again\n", len(done))
+		done = map[time.Time]bool{}
 	}
 	if from.Before(ArchiveStart) {
 		fmt.Fprintf(log, "note: NSE's equity archive starts %s (the day the segment opened); %s..%s will not be probed\n",
