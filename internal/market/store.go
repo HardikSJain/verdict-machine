@@ -483,3 +483,54 @@ func (s *Store) Sessions(ctx context.Context, source string, from, to, asOfInges
 	}
 	return out, rows.Err()
 }
+
+// TickerFirstISIN is the earliest session a ticker appears in the archive that
+// prints ISINs, and the ISIN printed for it there.
+type TickerFirstISIN struct {
+	Ticker string
+	ISIN   string
+	Date   time.Time
+}
+
+// PreISINBridge is the ticker to ISIN map that NSE itself published, used to
+// give identity to bars from the era when it published none.
+//
+// It reads the archive rather than a security master on purpose. NSE's
+// EQUITY_L.csv lists what is listed TODAY, so it answers only for survivors --
+// and 46% of the companies trading in October 2008 are not in it. The archive
+// answers for everything that ever traded, which is the entire reason the raw
+// files are the source of record here and the adjusted feed is only a
+// cross-check.
+//
+// Per ticker it takes the ISIN whose bars appear EARLIEST under that label, so
+// a company that later renamed or reissued its ISIN still bridges to the
+// identity it actually held at the boundary rather than to a successor.
+func (s *Store) PreISINBridge(ctx context.Context, source string, asOfIngest time.Time) (map[string]TickerFirstISIN, error) {
+	rows, err := s.pool.Query(ctx, `
+		WITH obs AS (
+			SELECT DISTINCT ON (symbol_id, ticker) symbol_id, ticker, isin
+			FROM symbols WHERE ingested_at <= $1
+		),
+		firsts AS (
+			SELECT o.ticker, o.isin, min(b.date) AS first_date
+			FROM obs o JOIN bars b ON b.symbol_id = o.symbol_id
+			WHERE b.source = $2 AND b.ingested_at <= $1
+			GROUP BY o.ticker, o.isin
+		)
+		SELECT DISTINCT ON (ticker) ticker, isin, first_date
+		FROM firsts ORDER BY ticker, first_date`, asOfIngest, source)
+	if err != nil {
+		return nil, fmt.Errorf("pre-isin bridge: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]TickerFirstISIN{}
+	for rows.Next() {
+		var t TickerFirstISIN
+		if err := rows.Scan(&t.Ticker, &t.ISIN, &t.Date); err != nil {
+			return nil, err
+		}
+		t.Date = Day(t.Date.Year(), t.Date.Month(), t.Date.Day())
+		out[t.Ticker] = t
+	}
+	return out, rows.Err()
+}

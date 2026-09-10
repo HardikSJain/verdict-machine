@@ -48,6 +48,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newIndexCmd())
 	root.AddCommand(newBacktestCmd())
 	root.AddCommand(newAdjustmentsCmd())
+	root.AddCommand(newPreISINCmd())
 	return root
 }
 
