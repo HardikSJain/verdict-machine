@@ -126,3 +126,97 @@ func TestParse_RejectsNonFiniteNumbers(t *testing.T) {
 		})
 	}
 }
+
+// TestParsePreISINArchive reads NSE's archive from before it printed ISINs.
+//
+// The column appeared between 2011-06-01 and 2011-07-04, and this project's
+// own archive starts 2011-09-02 -- not by choice but because everything here
+// keys on ISIN, so the era before it could not be stored. Seventeen years of
+// the source of record, including the 2000 and 2008 bear markets this project
+// has never tested against, sat behind one missing column.
+//
+// The fixtures are real NSE files, not constructed ones. cm03NOV1994 is the
+// exchange's FIRST session: 135 EQ rows, ABB and ACC among them, PREVCLOSE 0
+// because there was no previous close to have.
+func TestParsePreISINArchive(t *testing.T) {
+	t.Run("the exchange's first session, 1994-11-03", func(t *testing.T) {
+		f, err := os.Open("testdata/cm03NOV1994bhav.csv")
+		require.NoError(t, err)
+		defer f.Close()
+
+		bars, err := Parse("cm03NOV1994bhav.csv", f)
+		require.NoError(t, err)
+		require.Len(t, bars, 135, "every row in the first session is series EQ")
+
+		first := bars[0]
+		require.Equal(t, "ABB", first.Ticker)
+		require.Equal(t, "EQ", first.Series)
+		// The day is NOT zero-padded in the older files ("3-NOV-1994"), which
+		// the four-digit padded format string rejects outright.
+		require.Equal(t, market.Day(1994, 11, 3), first.Date)
+		require.Equal(t, 715.0, first.Close)
+		require.Equal(t, int64(100), first.Volume)
+		require.NotNil(t, first.Turnover)
+		require.Equal(t, 71500.0, *first.Turnover)
+
+		// The truthful reading of a file with no ISIN column is no ISIN, and
+		// every bar has to say so. Inventing one here is what would make a
+		// later identity decision unauditable.
+		for _, b := range bars {
+			require.Empty(t, b.ISIN, "%s must carry no ISIN, not a fabricated one", b.Ticker)
+		}
+	})
+
+	t.Run("2007, mid-era, with non-EQ series to filter", func(t *testing.T) {
+		f, err := os.Open("testdata/cm01OCT2007bhav.csv")
+		require.NoError(t, err)
+		defer f.Close()
+
+		bars, err := Parse("cm01OCT2007bhav.csv", f)
+		require.NoError(t, err)
+		require.Len(t, bars, 36, "the 3 BE rows in this sample must be dropped")
+		require.Equal(t, "3IINFOTECH", bars[0].Ticker)
+		require.Equal(t, market.Day(2007, 10, 1), bars[0].Date)
+		require.InDelta(t, 150.25, bars[0].Close, 1e-9)
+		for _, b := range bars {
+			require.Equal(t, "EQ", b.Series)
+			require.Empty(t, b.ISIN)
+		}
+	})
+}
+
+// TestParseStillPrefersTheISINLayoutWhereBothCouldMatch pins the dispatch
+// order. The pre-ISIN header is a strict SUBSET of the legacy one -- SYMBOL,
+// SERIES and TIMESTAMP are in both -- so a switch that tested the shorter
+// header first would read every modern file as identity-less and throw away
+// fifteen years of ISINs without erroring once.
+func TestParseStillPrefersTheISINLayoutWhereBothCouldMatch(t *testing.T) {
+	f, err := os.Open("testdata/cm30JUN2015bhav.csv")
+	require.NoError(t, err)
+	defer f.Close()
+
+	bars, err := Parse("cm30JUN2015bhav.csv", f)
+	require.NoError(t, err)
+	require.NotEmpty(t, bars)
+	for _, b := range bars {
+		require.NotEmpty(t, b.ISIN, "%s lost its ISIN to the pre-ISIN layout", b.Ticker)
+	}
+}
+
+// TestArchiveStartIsTheDayTheExchangeOpened records a measured constant.
+//
+// Every other loader here carries one; bhavcopy was the only one without, so
+// a backfill from an optimistic date would have probed roughly 1,800 dead
+// dates before reaching real data. Probed 2026-09-10: 1994-11-03 serves a zip
+// with 135 EQ rows and every date before it 404s.
+func TestArchiveStartIsTheDayTheExchangeOpened(t *testing.T) {
+	require.Equal(t, market.Day(1994, 11, 3), ArchiveStart)
+
+	f, err := os.Open("testdata/cm03NOV1994bhav.csv")
+	require.NoError(t, err)
+	defer f.Close()
+	bars, err := Parse("first", f)
+	require.NoError(t, err)
+	require.Equal(t, ArchiveStart, bars[0].Date,
+		"the constant and the exchange's first session must be the same day")
+}

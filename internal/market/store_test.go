@@ -338,3 +338,32 @@ func TestInsertBars_RevisesANonCloseField(t *testing.T) {
 	require.NotNil(t, after[0].DeliveryQty)
 	require.EqualValues(t, correctedQty, *after[0].DeliveryQty)
 }
+
+// TestEnsureSymbolsRefusesPreISINBars is the guard that keeps a parser change
+// from becoming a data disaster.
+//
+// NSE printed no ISIN column before July 2011, so bars parsed from that era
+// arrive with none -- which is the file telling the truth, not a fault. The
+// danger is what happens next. isin is the identity key: symbols is unique on
+// it, and every entity, roster link and universe read resolves through it. The
+// column is NOT NULL, and "" is not NULL, so storing these would not fail. It
+// would quietly file EVERY pre-ISIN ticker of EVERY session under one symbol
+// row -- a single company with thousands of contradictory prices per day --
+// and nothing downstream would notice, because nothing downstream checks.
+//
+// So the refusal is here, at the one place identity is assigned, and it names
+// the era rather than only the symptom.
+func TestEnsureSymbolsRefusesPreISINBars(t *testing.T) {
+	ctx := context.Background()
+	store := market.NewStore(testutil.Pool(t))
+
+	_, err := store.EnsureSymbols(ctx, []market.Bar{
+		{Ticker: "ABB", Series: "EQ", Date: market.Day(1994, 11, 3),
+			Open: 715, High: 715, Low: 715, Close: 715, Volume: 100},
+	})
+	require.Error(t, err, "a bar with no identity must be refused, not filed under the empty string")
+	require.ErrorContains(t, err, "ABB")
+	require.ErrorContains(t, err, "1994-11-03")
+	require.ErrorContains(t, err, "before July 2011",
+		"the error must name the era, so whoever hits it knows this is the identity problem and not a corrupt file")
+}

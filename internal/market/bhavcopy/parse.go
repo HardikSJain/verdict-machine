@@ -31,8 +31,14 @@ func Parse(name string, r io.Reader) ([]market.Bar, error) {
 	switch {
 	case has(col, "TradDt", "TckrSymb", "SctySrs"):
 		return parseRows(name, cr, udiffLayout, col)
-	case has(col, "SYMBOL", "SERIES", "TIMESTAMP"):
+	case has(col, "SYMBOL", "SERIES", "TIMESTAMP", "ISIN"):
 		return parseRows(name, cr, legacyLayout, col)
+	case has(col, "SYMBOL", "SERIES", "TIMESTAMP"):
+		// Same header minus ISIN: NSE's archive before July 2011. Order
+		// matters here -- the pre-ISIN header is a strict subset of the legacy
+		// one, so the ISIN-bearing case has to be tested first or every modern
+		// file would be read as an identity-less one.
+		return parseRows(name, cr, preISINLayout, col)
 	default:
 		return nil, fmt.Errorf("bhavcopy %s: unrecognised header %v", name, header)
 	}
@@ -65,11 +71,42 @@ type layout struct {
 var legacyLayout = layout{date: "TIMESTAMP", dateFmts: []string{"02-Jan-2006", "02-Jan-06"}, isin: "ISIN", ticker: "SYMBOL", series: "SERIES",
 	open: "OPEN", high: "HIGH", low: "LOW", close: "CLOSE", volume: "TOTTRDQTY", turnover: "TOTTRDVAL"}
 
+// preISINLayout is NSE's archive before it began printing ISINs, which is
+// every session from the exchange's first (1994-11-03) to some day between
+// 1 June and 4 July 2011. Measured by probing: 2011-06-01 has no ISIN column
+// and 2011-07-04 does.
+//
+// That column is why this project's own archive starts 2011-09-02. The start
+// date was never written down as a decision and reads like an arbitrary flag
+// default, but it is exactly where identity became available -- everything
+// here keys on ISIN, so the era before it could not be stored at all. Seventeen
+// years of the source of record sat behind one missing column.
+//
+// The DAY is not zero-padded in the older files -- "3-NOV-1994" against
+// "03-JAN-2011" -- so the unpadded form is tried after the padded one. The
+// month is upper case throughout and needs no special handling, because Go
+// matches month names case-insensitively.
+//
+// isin is deliberately EMPTY rather than pointing at a column that is not
+// there. Bars from this layout come back with no ISIN, which is the truthful
+// reading of the file, and they cannot be stored until something assigns them
+// an identity. market.Store rejects an empty ISIN outright so that state is
+// loud rather than silent: without that guard every pre-ISIN ticker would
+// collapse into a single symbol row keyed on the empty string.
+var preISINLayout = layout{date: "TIMESTAMP", dateFmts: []string{"02-Jan-2006", "2-Jan-2006", "02-Jan-06"},
+	isin: "", ticker: "SYMBOL", series: "SERIES",
+	open: "OPEN", high: "HIGH", low: "LOW", close: "CLOSE", volume: "TOTTRDQTY", turnover: "TOTTRDVAL"}
+
 var udiffLayout = layout{date: "TradDt", dateFmts: []string{"2006-01-02"}, isin: "ISIN", ticker: "TckrSymb", series: "SctySrs",
 	open: "OpnPric", high: "HghPric", low: "LwPric", close: "ClsPric", volume: "TtlTradgVol", turnover: "TtlTrfVal"}
 
 func parseRows(name string, cr *csv.Reader, l layout, col map[string]int) ([]market.Bar, error) {
 	for _, need := range []string{l.date, l.isin, l.ticker, l.series, l.open, l.high, l.low, l.close, l.volume, l.turnover} {
+		if need == "" {
+			// The layout declares this field absent from the era, not missing
+			// from the file. Only isin is ever empty; see preISINLayout.
+			continue
+		}
 		if _, ok := col[need]; !ok {
 			return nil, fmt.Errorf("bhavcopy %s: missing column %q", name, need)
 		}
@@ -105,8 +142,11 @@ func parseRows(name string, cr *csv.Reader, l layout, col map[string]int) ([]mar
 		if err != nil {
 			return nil, fmt.Errorf("bhavcopy %s line %d: date %q: %w", name, line, dateVal, err)
 		}
-		b := market.Bar{ISIN: field(rec, l.isin), Ticker: field(rec, l.ticker), Series: "EQ",
+		b := market.Bar{Ticker: field(rec, l.ticker), Series: "EQ",
 			Date: market.Day(d.Year(), d.Month(), d.Day())}
+		if l.isin != "" {
+			b.ISIN = field(rec, l.isin)
+		}
 		nums := [6]float64{}
 		for i, c := range []string{l.open, l.high, l.low, l.close, l.volume, l.turnover} {
 			v, err := strconv.ParseFloat(field(rec, c), 64)
@@ -127,7 +167,9 @@ func parseRows(name string, cr *csv.Reader, l layout, col map[string]int) ([]mar
 		b.Volume = vol
 		turnover := nums[5]
 		b.Turnover = &turnover
-		if b.ISIN == "" {
+		if l.isin != "" && b.ISIN == "" {
+			// The file claims to carry ISINs and this row's is blank, which is
+			// a defect in the row rather than a property of the era.
 			return nil, fmt.Errorf("bhavcopy %s line %d: %s has no ISIN", name, line, b.Ticker)
 		}
 		bars = append(bars, b)

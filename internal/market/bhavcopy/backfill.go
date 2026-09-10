@@ -41,6 +41,25 @@ func noFileSettled(d, now time.Time) bool {
 	return !now.Before(endOfSession.Add(noFileSettleLag))
 }
 
+// ArchiveStart is the earliest session NSE's equity archive serves, and it is
+// the day the exchange's capital market segment opened.
+//
+// Measured 2026-09-10 by probing: 1994-11-03 returns a zip with 135 EQ rows,
+// and every date before it -- 11-02, 11-01, and spot checks back to 1993 --
+// returns a 404. ABB and ACC are in that first file.
+//
+// It exists for the reason the index loader's equivalent does: without a floor
+// a backfill from an optimistic date spends thousands of requests learning what
+// one constant records. Until now bhavcopy was the only loader without one, so
+// `--from 1990-01-01` would have probed roughly 1,800 dead dates before
+// reaching real data.
+//
+// Note that the early archive is genuinely sparse rather than merely
+// weekday-shaped: 1994-11-04 has no file while 11-07 does. The exchange did
+// not trade every weekday in its first weeks, which is exactly why the walk
+// below settles absences through ingest_log instead of assuming a calendar.
+var ArchiveStart = market.Day(1994, 11, 3)
+
 // Backfill walks every calendar date from `from` to `to` inclusive, skipping
 // dates already settled in ingest_log, fetching the rest with `delay` between
 // requests. Errors are logged and retried on the next run; five consecutive
@@ -63,6 +82,12 @@ func Backfill(ctx context.Context, store *market.Store, f *Fetcher, from, to tim
 	done, err := store.LoggedDates(ctx, market.SourceBhavcopy)
 	if err != nil {
 		return sum, err
+	}
+	if from.Before(ArchiveStart) {
+		fmt.Fprintf(log, "note: NSE's equity archive starts %s (the day the segment opened); %s..%s will not be probed\n",
+			ArchiveStart.Format(time.DateOnly), from.Format(time.DateOnly),
+			ArchiveStart.AddDate(0, 0, -1).Format(time.DateOnly))
+		from = ArchiveStart
 	}
 	// One clock reading for the whole run: a long backfill must not settle a
 	// date it started too early to judge just because it is still going.

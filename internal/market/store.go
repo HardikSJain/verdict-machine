@@ -115,7 +115,15 @@ func (s *Store) EnsureSymbols(ctx context.Context, bars []Bar) (map[string]int64
 	want := map[string]observation{}
 	for _, b := range bars {
 		if b.ISIN == "" {
-			return nil, fmt.Errorf("bar %s %s has no ISIN", b.Ticker, b.Date.Format("2006-01-02"))
+			// NSE's archive printed no ISIN column before July 2011, so bars
+			// parsed from that era arrive here with none. That is the file
+			// telling the truth, not a parser fault -- but it cannot be stored
+			// as-is, because isin is the identity key and an empty one would
+			// collapse every pre-ISIN ticker into a single symbol row. Such
+			// bars need an identity assigned first.
+			return nil, fmt.Errorf(
+				"bar %s %s has no ISIN; NSE printed none before July 2011, and these bars need an identity assigned before they can be stored",
+				b.Ticker, b.Date.Format("2006-01-02"))
 		}
 		// A bar with no date would be registered at valid_from 0001-01-01,
 		// which is not a date -- it is the sentinel migration 0002 gave the
