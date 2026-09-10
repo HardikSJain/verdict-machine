@@ -135,3 +135,64 @@ func TestSessionGapFuncCountsSessionsNotDays(t *testing.T) {
 	// And time must not run backwards into a bridge either.
 	require.Greater(t, gap(market.Day(2011, 6, 21), market.Day(2011, 6, 9)), 1000)
 }
+
+// TestMatchRenamesFindsInfosys uses the real event. Infosys Technologies became
+// Infosys Limited and NSE moved the ticker INFOSYSTCH -> INFY at the same
+// boundary where ISINs appeared. Without this, the largest software company on
+// the exchange is recorded as having died in June 2011 and its pre-2011 history
+// is severed -- the same failure that once made renamed holdings unsellable in
+// the engine, arriving through a different door.
+func TestMatchRenamesFindsInfosys(t *testing.T) {
+	c := cal(
+		market.Day(2011, 6, 28), market.Day(2011, 6, 29), market.Day(2011, 6, 30),
+		market.Day(2011, 7, 1), market.Day(2011, 7, 4), market.Day(2011, 7, 5),
+	)
+	gap := preisin.SessionGapFunc(c)
+
+	vanished := []preisin.Observation{
+		{Ticker: "INFOSYSTCH", LastPreISIN: market.Day(2011, 6, 28), LastClose: 2865.30},
+	}
+	newcomers := []preisin.Newcomer{
+		{Ticker: "INFY", ISIN: "INE009A01021", First: market.Day(2011, 7, 4), Close: 2938.95},
+		// A decoy at a completely different price must not be paired.
+		{Ticker: "SOMETHINGELSE", ISIN: "INE999A01011", First: market.Day(2011, 7, 4), Close: 42.10},
+	}
+
+	got := preisin.MatchRenames(vanished, newcomers, gap, preisin.MaxBridgeGapSessions, preisin.RenameTolerance)
+	require.Len(t, got, 1, "INFOSYSTCH -> INFY must be found")
+	require.Equal(t, "INFY", got["INFOSYSTCH"].Ticker)
+	require.Equal(t, "INE009A01021", got["INFOSYSTCH"].ISIN)
+
+	// And it must flow through to a real ISIN, not a synthetic one.
+	assignments, sum := preisin.ResolveWithRenames(vanished, got, gap, preisin.MaxBridgeGapSessions)
+	require.Equal(t, 1, sum.Renamed)
+	require.Equal(t, 0, sum.Dead)
+	require.Equal(t, "INE009A01021", assignments[0].ISIN)
+	require.False(t, assignments[0].Synthetic)
+}
+
+// TestMatchRenamesRefusesAmbiguity. Two candidates at plausible prices is not a
+// coin flip: guessing produces a welded price series that looks exactly like a
+// company with an eventful history and is undetectable afterwards.
+func TestMatchRenamesRefusesAmbiguity(t *testing.T) {
+	c := cal(market.Day(2011, 6, 28), market.Day(2011, 7, 4))
+	gap := preisin.SessionGapFunc(c)
+
+	vanished := []preisin.Observation{
+		{Ticker: "OLD", LastPreISIN: market.Day(2011, 6, 28), LastClose: 100},
+	}
+	got := preisin.MatchRenames(vanished, []preisin.Newcomer{
+		{Ticker: "NEWA", ISIN: "INE111A01011", First: market.Day(2011, 7, 4), Close: 101},
+		{Ticker: "NEWB", ISIN: "INE222A01011", First: market.Day(2011, 7, 4), Close: 99},
+	}, gap, preisin.MaxBridgeGapSessions, preisin.RenameTolerance)
+	require.Empty(t, got, "two plausible successors means no answer, not a guess")
+
+	// Two vanished tickers competing for ONE newcomer is equally unresolvable.
+	got = preisin.MatchRenames([]preisin.Observation{
+		{Ticker: "OLDA", LastPreISIN: market.Day(2011, 6, 28), LastClose: 100},
+		{Ticker: "OLDB", LastPreISIN: market.Day(2011, 6, 28), LastClose: 102},
+	}, []preisin.Newcomer{
+		{Ticker: "NEW", ISIN: "INE111A01011", First: market.Day(2011, 7, 4), Close: 101},
+	}, gap, preisin.MaxBridgeGapSessions, preisin.RenameTolerance)
+	require.Empty(t, got)
+}

@@ -3,6 +3,7 @@ package market
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -533,4 +534,26 @@ func (s *Store) PreISINBridge(ctx context.Context, source string, asOfIngest tim
 		out[t.Ticker] = t
 	}
 	return out, rows.Err()
+}
+
+// CloseOn is one ticker's close on one session, or zero if it did not trade.
+// Used to corroborate a rename: an administrative name change must not move
+// the price, so the two sides of one have to agree.
+func (s *Store) CloseOn(ctx context.Context, source, ticker string, date, asOfIngest time.Time) (float64, error) {
+	var c float64
+	err := s.pool.QueryRow(ctx, `
+		WITH lbl AS (
+			SELECT DISTINCT ON (symbol_id) symbol_id, ticker
+			FROM symbols WHERE ingested_at <= $4 ORDER BY symbol_id, ingested_at DESC
+		)
+		SELECT b.close::float8 FROM bars b JOIN lbl l ON l.symbol_id = b.symbol_id
+		WHERE l.ticker = $2 AND b.date = $3 AND b.source = $1 AND b.ingested_at <= $4
+		ORDER BY b.ingested_at DESC LIMIT 1`, source, ticker, date, asOfIngest).Scan(&c)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("close for %s on %s: %w", ticker, date.Format(time.DateOnly), err)
+	}
+	return c, nil
 }

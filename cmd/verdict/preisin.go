@@ -88,7 +88,12 @@ func newPreISINCmd() *cobra.Command {
 			// not stored here: identity has to be decided before anything can
 			// be, which is the whole reason this command exists.
 			f := bhavcopy.NewFetcher()
-			lastSeen := map[string]time.Time{}
+			type sighting struct {
+				date  time.Time
+				close float64
+			}
+			lastSeen := map[string]sighting{}
+			firstSeen := map[string]sighting{}
 			var preSessions []time.Time
 			fetched, absent := 0, 0
 			for d := market.Day(from.Year(), from.Month(), from.Day()); !d.After(to); d = d.AddDate(0, 0, 1) {
@@ -104,8 +109,11 @@ func newPreISINCmd() *cobra.Command {
 				fetched++
 				preSessions = append(preSessions, d)
 				for _, b := range bars {
-					if prev, ok := lastSeen[b.Ticker]; !ok || b.Date.After(prev) {
-						lastSeen[b.Ticker] = b.Date
+					if prev, ok := lastSeen[b.Ticker]; !ok || b.Date.After(prev.date) {
+						lastSeen[b.Ticker] = sighting{date: b.Date, close: b.Close}
+					}
+					if prev, ok := firstSeen[b.Ticker]; !ok || b.Date.Before(prev.date) {
+						firstSeen[b.Ticker] = sighting{date: b.Date, close: b.Close}
 					}
 				}
 				if fetched%100 == 0 {
@@ -125,27 +133,74 @@ func newPreISINCmd() *cobra.Command {
 			calendar := append(append([]time.Time{}, preSessions...), isinSessions...)
 			sort.Slice(calendar, func(i, j int) bool { return calendar[i].Before(calendar[j]) })
 
+			gapFn := preisin.SessionGapFunc(calendar)
+
 			obs := make([]preisin.Observation, 0, len(lastSeen))
+			var vanished []preisin.Observation
 			for ticker, last := range lastSeen {
-				o := preisin.Observation{Ticker: ticker, LastPreISIN: last}
+				o := preisin.Observation{Ticker: ticker, LastPreISIN: last.date, LastClose: last.close}
 				if b, ok := bridge[ticker]; ok {
 					o.FirstISINEra, o.ISINEraISIN = b.Date, b.ISIN
+				} else {
+					vanished = append(vanished, o)
 				}
 				obs = append(obs, o)
 			}
-			assignments, sum := preisin.Resolve(obs, preisin.SessionGapFunc(calendar), maxGap)
+
+			// A ticker whose first session comes AFTER another's last is what a
+			// renamed company looks like from the far side.
+			//
+			// The obvious version of this -- look for new labels in the ISIN
+			// era -- was written first and found nothing, because renames do
+			// not wait for the boundary. Infosys Technologies became Infosys
+			// Limited on 2011-06-29: INFOSYSTCH closed 2865.30 on the 28th and
+			// INFY appeared the next session at 2881.75, five days BEFORE NSE
+			// started printing ISINs. So candidates are drawn from both eras.
+			//
+			// A ticker first seen on the scan's own opening session is
+			// excluded. Everything trading that day looks new to a window that
+			// starts there, and pairing on that is an artefact of where the
+			// scan began rather than evidence about a company.
+			var newcomers []preisin.Newcomer
+			scanStart := preSessions[0]
+			for ticker, f := range firstSeen {
+				if !f.date.After(scanStart) {
+					continue
+				}
+				b, ok := bridge[ticker]
+				if !ok {
+					// Itself unidentified; a rename cannot resolve into one
+					// unknown from another.
+					continue
+				}
+				newcomers = append(newcomers, preisin.Newcomer{
+					Ticker: ticker, ISIN: b.ISIN, First: f.date, Close: f.close})
+			}
+			for ticker, b := range bridge {
+				if _, seenInScan := firstSeen[ticker]; seenInScan {
+					continue
+				}
+				c, err := store.CloseOn(cmd.Context(), market.SourceBhavcopy, ticker, b.Date, pin)
+				if err != nil {
+					return err
+				}
+				newcomers = append(newcomers, preisin.Newcomer{
+					Ticker: ticker, ISIN: b.ISIN, First: b.Date, Close: c})
+			}
+			renames := preisin.MatchRenames(vanished, newcomers, gapFn, maxGap, preisin.RenameTolerance)
+			assignments, sum := preisin.ResolveWithRenames(obs, renames, gapFn, maxGap)
 
 			fmt.Fprintf(w, "  bridged      %5d  (traded across the boundary; take NSE's own ISIN)\n", sum.Bridged)
+			fmt.Fprintf(w, "  renamed      %5d  (vanished and reappeared under a new ticker at a matching price)\n", sum.Renamed)
 			fmt.Fprintf(w, "  dead         %5d  (never traded once ISINs existed; synthetic identity)\n", sum.Dead)
 			fmt.Fprintf(w, "  quarantined  %5d  (gap too wide to tell suspension from reassignment)\n", sum.Quarantined)
 			fmt.Fprintf(w, "  total        %5d\n\n", sum.Total())
 
 			if sum.Quarantined > 0 {
 				fmt.Fprintf(w, "quarantined, widest gaps first -- these are NOT merged and need a human.\n")
-				fmt.Fprintf(w, "Most are probably SERIES MIGRATIONS rather than reassigned tickers: this\n")
-				fmt.Fprintf(w, "archive keeps only EQ rows, and NSE moves stocks to the BE surveillance\n")
-				fmt.Fprintf(w, "segment and back, so a company trading every day can vanish from it for\n")
-				fmt.Fprintf(w, "months. Ingesting BE would resolve most of these; see package preisin.\n")
+				fmt.Fprintf(w, "Series migrations already account for most of what used to land here --\n")
+				fmt.Fprintf(w, "ingesting BE cut this list from 28 to 9 over 2011-05..07 -- so what is\n")
+				fmt.Fprintf(w, "left is a genuine identity question rather than a segment change.\n")
 				q := make([]preisin.Assignment, 0, sum.Quarantined)
 				for _, a := range assignments {
 					if a.Status == preisin.Quarantined {

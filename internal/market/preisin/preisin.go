@@ -58,6 +58,7 @@ package preisin
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -105,11 +106,25 @@ const (
 	// Bridged: the ticker was still trading across the boundary, so it takes
 	// the ISIN NSE printed for it in the first session where one exists.
 	Bridged Status = "bridged"
-	// Dead: the ticker never appears in the ISIN era at all. It is a company
-	// that stopped trading before July 2011 -- which is the population that
-	// makes this archive worth having, since every adjusted-price source drops
-	// them -- and it gets a synthetic identifier.
+	// Dead: the ticker never appears in the ISIN era at all AND no later
+	// ticker looks like the same company under a new name. A company that
+	// stopped trading before July 2011 -- the population that makes this
+	// archive worth having, since every adjusted-price source drops them --
+	// and it gets a synthetic identifier.
 	Dead Status = "dead"
+	// Renamed: the ticker vanished at the boundary and another appeared in its
+	// place at a matching price, so it is the same company under a new label
+	// and takes that company's real ISIN.
+	//
+	// This case exists because leaving it out is not a small error. Infosys
+	// Technologies became Infosys Limited and its ticker went INFOSYSTCH ->
+	// INFY in mid-2011: INFOSYSTCH closed 2865.30 on its last session and INFY
+	// appears at the boundary at 2938.95 under INE009A01021, a 2.6% drift.
+	// Without this, one of the largest companies on the exchange is recorded as
+	// having died in June 2011 and its pre-2011 history is severed from the
+	// rest -- which is the same failure that once made renamed holdings
+	// unsellable in the engine, arriving by a different door.
+	Renamed Status = "renamed"
 	// Quarantined: the ticker appears in both eras but with a gap too wide to
 	// call. Treated as a separate instrument and flagged for review, because
 	// the alternative is a silent merge.
@@ -119,12 +134,82 @@ const (
 // Observation is everything known about one ticker across the two eras.
 type Observation struct {
 	Ticker string
-	// LastPreISIN is its final session in the archive that has no ISIN column.
+	// LastPreISIN is its final session in the archive that has no ISIN column,
+	// and LastClose the price on it.
 	LastPreISIN time.Time
+	LastClose   float64
 	// FirstISINEra and ISINEraISIN are its first session in the era that does,
 	// and the ISIN printed there. Zero and empty when it never reappears.
 	FirstISINEra time.Time
 	ISINEraISIN  string
+}
+
+// Newcomer is a ticker that appears in the ISIN era with no history before it.
+// One of these is what a renamed company looks like from the far side.
+type Newcomer struct {
+	Ticker string
+	ISIN   string
+	First  time.Time
+	Close  float64
+}
+
+// RenameTolerance is how far a newcomer's first close may sit from the
+// vanished ticker's last close and still be called the same company.
+//
+// Fifteen percent. A rename is an administrative event, not an economic one --
+// the shares do not change, so the price should only drift by whatever the
+// market did across the gap. Infosys drifted 2.6% over four sessions. The
+// allowance is wide enough for a volatile small cap across a couple of weeks
+// and far too narrow to pair two unrelated companies except by coincidence,
+// which is what AmbiguousRename exists to catch.
+const RenameTolerance = 0.15
+
+// MatchRenames pairs each vanished ticker with the newcomer that replaced it.
+//
+// Two independent conditions have to hold, which is the same shape as the
+// corporate-action detector: a candidate must match on TIMING and be
+// corroborated by PRICE. Timing alone would pair any two tickers that happened
+// to change around the boundary, and price alone would pair every stock
+// trading near the same rupee value.
+//
+// A vanished ticker matching more than one newcomer is left unpaired. Guessing
+// between two candidates is exactly the decision that produces a welded price
+// series, and there is no way to notice afterwards.
+func MatchRenames(vanished []Observation, newcomers []Newcomer,
+	gapSessions func(from, to time.Time) int, maxGap int, tol float64) map[string]Newcomer {
+	if tol <= 0 {
+		tol = RenameTolerance
+	}
+	out := map[string]Newcomer{}
+	claimed := map[string]int{}
+	cand := map[string][]Newcomer{}
+	for _, v := range vanished {
+		if v.LastClose <= 0 {
+			continue
+		}
+		for _, n := range newcomers {
+			if n.Close <= 0 || n.First.Before(v.LastPreISIN) {
+				continue
+			}
+			if g := gapSessions(v.LastPreISIN, n.First); g < 0 || g > maxGap {
+				continue
+			}
+			if math.Abs(n.Close/v.LastClose-1) > tol {
+				continue
+			}
+			cand[v.Ticker] = append(cand[v.Ticker], n)
+			claimed[n.Ticker]++
+		}
+	}
+	for ticker, cs := range cand {
+		if len(cs) != 1 || claimed[cs[0].Ticker] != 1 {
+			// Ambiguous in either direction: two names for one company, or two
+			// companies for one name. Not resolvable from prices and dates.
+			continue
+		}
+		out[ticker] = cs[0]
+	}
+	return out
 }
 
 // Assignment is one identity decision, carrying the evidence for it.
@@ -141,10 +226,10 @@ type Assignment struct {
 
 // Summary counts the decisions so a run reports its own shape.
 type Summary struct {
-	Bridged, Dead, Quarantined int
+	Bridged, Dead, Quarantined, Renamed int
 }
 
-func (s Summary) Total() int { return s.Bridged + s.Dead + s.Quarantined }
+func (s Summary) Total() int { return s.Bridged + s.Dead + s.Quarantined + s.Renamed }
 
 // Resolve decides an identity for every observed ticker.
 //
@@ -154,6 +239,12 @@ func (s Summary) Total() int { return s.Bridged + s.Dead + s.Quarantined }
 // arithmetic wrong, and here it would be wrong in the direction of bridging
 // things it should not.
 func Resolve(obs []Observation, gapSessions func(from, to time.Time) int, maxGap int) ([]Assignment, Summary) {
+	return ResolveWithRenames(obs, nil, gapSessions, maxGap)
+}
+
+// ResolveWithRenames is Resolve with the rename pairs MatchRenames found.
+func ResolveWithRenames(obs []Observation, renames map[string]Newcomer,
+	gapSessions func(from, to time.Time) int, maxGap int) ([]Assignment, Summary) {
 	if maxGap <= 0 {
 		maxGap = MaxBridgeGapSessions
 	}
@@ -168,6 +259,14 @@ func Resolve(obs []Observation, gapSessions func(from, to time.Time) int, maxGap
 		}
 		switch {
 		case o.ISINEraISIN == "":
+			if n, ok := renames[o.Ticker]; ok {
+				a.ISIN, a.Synthetic, a.Status = n.ISIN, false, Renamed
+				a.FirstISIN = n.First
+				a.GapSessions = gapSessions(o.LastPreISIN, n.First)
+				a.Note = fmt.Sprintf("became %s at %.2f against a last close of %.2f", n.Ticker, n.Close, o.LastClose)
+				sum.Renamed++
+				break
+			}
 			a.ISIN, a.Synthetic, a.Status = Synthetic(o.Ticker), true, Dead
 			a.Note = "never traded once NSE printed ISINs; delisted before July 2011"
 			sum.Dead++
